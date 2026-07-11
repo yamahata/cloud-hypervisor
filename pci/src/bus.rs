@@ -299,6 +299,7 @@ impl PciConfigIo {
             // Move the device's BAR if needed
             for params in &bar_reprogram {
                 if let Err(e) = pci_bus.device_reloc.move_bar(
+                    params.bar_idx,
                     params.old_base,
                     params.new_base,
                     params.len,
@@ -429,6 +430,7 @@ impl PciConfigMmio {
             // Move the device's BAR if needed
             for params in &bar_reprogram {
                 if let Err(e) = pci_bus.device_reloc.move_bar(
+                    params.bar_idx,
                     params.old_base,
                     params.new_base,
                     params.len,
@@ -534,6 +536,7 @@ mod unit_tests {
     impl DeviceRelocation for MockDeviceRelocation {
         fn move_bar(
             &self,
+            _bar_idx: usize,
             _old_base: u64,
             _new_base: u64,
             _len: u64,

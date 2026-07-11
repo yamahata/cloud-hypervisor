@@ -38,6 +38,13 @@ pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BarReprogrammingParams {
+    /// The BAR slot being reprogrammed (expansion ROM = ROM_BAR_IDX; the
+    /// low/primary slot for a 64-bit BAR). Identifies the BAR across the
+    /// whole relocation, unlike the addresses, which a later config write
+    /// can change again. Old snapshots (pre-index-keying) don't carry
+    /// this field; it only matters for in-flight moves.
+    #[serde(default)]
+    pub bar_idx: usize,
     pub old_base: u64,
     pub new_base: u64,
     pub len: u64,
@@ -90,7 +97,7 @@ pub trait PciDevice: Send {
         None
     }
     /// Relocates the BAR to a different address in guest address space.
-    fn move_bar(&mut self, _old_base: u64, _new_base: u64) -> result::Result<(), io::Error> {
+    fn move_bar(&mut self, _bar_idx: usize, _new_base: u64) -> result::Result<(), io::Error> {
         Ok(())
     }
     /// Restore BAR address in config space after a failed move_bar.
@@ -110,8 +117,10 @@ pub trait PciDevice: Send {
 pub trait DeviceRelocation: Send + Sync {
     /// The BAR needs to be moved to a different location in the guest address
     /// space. This follows a decision from the software running in the guest.
+    /// The BAR is identified by its slot index.
     fn move_bar(
         &self,
+        bar_idx: usize,
         old_base: u64,
         new_base: u64,
         len: u64,

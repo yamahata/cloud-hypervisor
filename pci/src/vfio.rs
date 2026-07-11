@@ -2228,9 +2228,14 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        let mut region_found = false;
         for region in self.common.mmio_regions.iter_mut() {
-            if region.start.raw_value() == old_base {
+            if region.index as usize == bar_idx {
+                region_found = true;
+                // The record still holds the address the BAR is currently
+                // mapped at.
+                let old_base = region.start.raw_value();
                 region.start = GuestAddress(new_base);
 
                 for user_memory_region in region.user_memory_regions.iter_mut() {
@@ -2315,6 +2320,8 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                 }
             }
         }
+
+        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (move to 0x{new_base:x})");
 
         Ok(())
     }
