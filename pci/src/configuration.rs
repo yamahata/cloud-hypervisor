@@ -467,7 +467,7 @@ pub struct PciConfiguration {
     // free-then-allocate overlap, the old location is released eagerly on the
     // address write and the new one installed later, once decode permits, so
     // every release precedes every install. Each BAR slot (ROM at ROM_BAR_IDX)
-    // is then in one of three states:
+    // is then in one of four states:
     //
     //   BOOT:        mapped_addr = None, pending_relocation = None
     //                -- the slot at construction, before add_pci_bar /
@@ -477,18 +477,23 @@ pub struct PciConfiguration {
     //   RELEASED(r): mapped_addr = None,    pending_relocation = Some(r)
     //                -- old range at r torn down, nothing mapped, awaiting
     //                   install at the address the guest last wrote.
+    //   RESTORED_INFLIGHT(r): mapped_addr = Some(r), pending_relocation = Some(r)
+    //                -- a snapshot restored mid-move: materialized at the old
+    //                   base r (ranges live) with the move still pending; the
+    //                   next decode edge replays it (release r, then install the
+    //                   target). Still mapped, so NOT "released".
     //
     // A BAR's address is recorded in four places that DIVERGE while a move is in
     // flight; `is_bar_released` reports the released state to teardown paths
     // (t = the new target the guest just wrote):
     //
-    //   structure               BOOT   MAPPED(A)   RELEASED(r)
-    //   ----------------------  -----  ----------  -----------
-    //   bars[slot].addr         0      A           t
-    //   bar_regions (device)    -      A           r
-    //   mapped_addr[slot]       None   Some(A)     None
-    //   pending_relocation      None   None        Some(r)
-    //   is_bar_released()       false  false       true
+    //   structure               BOOT   MAPPED(A)   RELEASED(r)  RESTORED_INFLIGHT(r)
+    //   ----------------------  -----  ----------  -----------  --------------------
+    //   bars[slot].addr         0      A           t            t
+    //   bar_regions (device)    -      A           r            r
+    //   mapped_addr[slot]       None   Some(A)     None         Some(r)
+    //   pending_relocation      None   None        Some(r)      Some(r)
+    //   is_bar_released()       false  false       true         false
     //
     //   * bars[slot].addr    -- config-space register shadow; follows the
     //     guest's request, so it jumps to the new target t the instant the
@@ -502,14 +507,17 @@ pub struct PciConfiguration {
     //     the BAR is not actually mapped at.
     //   * pending_relocation -- the released-from base r while a move is
     //     pending; it also pins the PCI segment the install must stay within.
-    //   * is_bar_released()  -- true in RELEASED (ranges torn down), so teardown
-    //     paths (`free_bars`) skip the slot.
+    //   * is_bar_released()  -- `pending.is_some() && mapped.is_none()`: true
+    //     only in RELEASED, so teardown (`free_bars`) skips a torn-down BAR.
+    //     RESTORED_INFLIGHT is pending yet still mapped, so it reports false and
+    //     is NOT skipped.
     //
     // `add_pci_bar` / `add_pci_rom_bar` seed BOOT -> MAPPED at fresh boot;
-    // `PciConfiguration::new` reseeds each declared BAR when restoring a
-    // snapshot. Runtime transitions live in `write_config_register` (release,
-    // plus the immediate move when decode is already on), the decode-edge drain
-    // (emits the deferred install) and `on_bar_relocation_status` (Applied
+    // `PciConfiguration::new` reseeds a restored snapshot (a mid-move BAR to
+    // RESTORED_INFLIGHT). Runtime transitions live in `write_config_register`
+    // (release, plus the immediate move when decode is already on), the
+    // decode-edge drain (emits the deferred install, replaying a
+    // RESTORED_INFLIGHT release first) and `on_bar_relocation_status` (Applied
     // advances `mapped_addr`; Pending leaves the slot RELEASED to retry). A
     // 64-bit BAR is tracked only on its low/primary slot.
     //
@@ -735,7 +743,8 @@ impl PciConfiguration {
             // which equals the config-space address except for BARs with an
             // in-flight move (the resource is only updated when a move
             // commits). Seed "every declared BAR mapped at its config
-            // address, nothing pending".
+            // address, nothing pending" first, then overlay the serialized
+            // in-flight moves.
             for bar_num in 0..NUM_BAR_REGS {
                 // A BAR's primary slot is the only one carrying `r#type`;
                 // the high half of a 64-bit BAR is `used` but stays `None`,
@@ -750,16 +759,42 @@ impl PciConfiguration {
 
             // A serialized in-flight move means the BAR was restored at the
             // address it was RELEASED from (`old_base`, the resource
-            // address), not at the config-space target the guest wrote.
-            // Replaying such a move across restore is added by the next
-            // change; until then the entry is dropped with a warning and
-            // the BAR stays where the restore materialized it.
+            // address), not at the config-space target the guest wrote. Seed
+            // `mapped_addr` with the released-from base and mark the slot
+            // pending, so the guest's decode-enable edge replays the move
+            // (release at old_base, install at the config target).
             for params in pending_bar_reprogram {
-                warn!("Dropping restored in-flight BAR move {params:x?}: replay not implemented");
+                if let Some(slot) = config.resolve_pending_slot(&params) {
+                    config.set_mapped_addr(slot, Some(params.old_base));
+                    config.pending_relocation[slot] = Some(params.old_base);
+                } else {
+                    warn!(
+                        "Dropping restored in-flight BAR move {params:x?}: no declared BAR \
+                         matches its config-space target"
+                    );
+                }
             }
         }
 
         config
+    }
+
+    /// Maps a restored `pending_bar_reprogram` entry to the BAR slot it
+    /// describes. Trust `bar_idx` when it is consistent with the entry;
+    /// legacy snapshots (pre-index-keying) default it to 0, so fall back to
+    /// scanning for the slot whose config-space target matches the recorded
+    /// move.
+    fn resolve_pending_slot(&self, params: &BarReprogrammingParams) -> Option<usize> {
+        let matches = |slot: usize| {
+            self.bar_region_type(slot) == Some(params.region_type)
+                && self.bar_target(slot) == params.new_base
+        };
+
+        if matches(params.bar_idx) {
+            return Some(params.bar_idx);
+        }
+
+        (0..NUM_BAR_REGS).chain([ROM_BAR_IDX]).find(|&s| matches(s))
     }
 
     fn state(&self) -> PciConfigurationState {
@@ -1185,8 +1220,23 @@ impl PciConfiguration {
             }
             let len = self.bar_len(slot).unwrap_or(0);
 
-            // The BAR belongs to the PCI segment.  Pass the base
-            // so that new BAR range should be in the same PCI segment.
+            // A restored in-flight move (see `PciConfiguration::new`) left
+            // the BAR mapped at its released-from address: replay the
+            // release first so the whole move runs here exactly as it would
+            // have run on the snapshot source.
+            if let Some(mapped) = self.mapped_addr(slot) {
+                reloc.release.push(ReleaseParams {
+                    bar_idx: slot,
+                    base: mapped,
+                    len,
+                    region_type,
+                });
+                self.set_mapped_addr(slot, None);
+            }
+
+            // The BAR belongs to the PCI segment whose MMIO window held the
+            // address it was released from; carry that base so the install
+            // confines the new range to the same segment window.
             let old_base = self.pending_relocation[slot].unwrap_or_else(|| self.bar_target(slot));
 
             reloc.install.push(InstallParams {
@@ -1222,8 +1272,13 @@ impl PciConfiguration {
     /// Returns true while the BAR is released awaiting install: its
     /// allocator range, bus range and guest-physical mappings are already
     /// torn down, so teardown paths (e.g. `free_bars`) must skip it.
+    ///
+    /// `pending_relocation` alone is not the right test: a restored
+    /// in-flight move is pending AND mapped (the restore path materializes
+    /// the BAR at its released-from base), so its ranges are live and
+    /// teardown must NOT skip it -- hence the `mapped_addr` check.
     pub fn is_bar_released(&self, bar_idx: usize) -> bool {
-        self.pending_relocation[bar_idx].is_some()
+        self.pending_relocation[bar_idx].is_some() && self.mapped_addr(bar_idx).is_none()
     }
 
     /// The COMMAND-register enabling bit for BAR's space: IOSE for IO
