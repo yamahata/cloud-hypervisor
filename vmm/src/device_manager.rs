@@ -783,7 +783,7 @@ impl AddressManager {
         }
     }
 
-    /// Allocator acquire: allocate the new address range for a single BAR.
+    /// Allocator install: allocate the new address range for a single BAR.
     /// The MMIO allocator is the window of the BAR's own PCI segment -- the
     /// one holding `old_base` (where the BAR was released from). The new
     /// base must fall inside that same window: a device cannot decode outside
@@ -991,7 +991,8 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(bar_idx, new_base)
+        pci_dev.move_bar_prepare(bar_idx)?;
+        pci_dev.move_bar_commit(bar_idx, new_base)
     }
 }
 

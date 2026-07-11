@@ -430,17 +430,12 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        info!("Releasing BAR {bar_idx}");
         let mut region_found = false;
         for mmio_region in self.common.mmio_regions.iter_mut() {
             if mmio_region.index as usize == bar_idx {
                 region_found = true;
-                // The record still holds the address the BAR is currently
-                // mapped at.
-                let old_base = mmio_region.start.raw_value();
-                mmio_region.start = GuestAddress(new_base);
-
                 for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                     // Remove old region
                     // SAFETY: only valid regions are in user_memory_regions
@@ -455,7 +450,27 @@ impl PciDevice for VfioUserPciDevice {
                         )
                     }
                     .map_err(io::Error::other)?;
+                }
+            }
+        }
 
+        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (release)");
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Acquiring BAR {bar_idx} -> 0x{new_base:x}");
+        let mut region_found = false;
+        for mmio_region in self.common.mmio_regions.iter_mut() {
+            if mmio_region.index as usize == bar_idx {
+                region_found = true;
+                // The record still holds the released-from base (the release
+                // side is forbidden to mutate it).
+                let old_base = mmio_region.start.raw_value();
+                mmio_region.start = GuestAddress(new_base);
+
+                for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
                         user_memory_region.start += new_base - old_base;
@@ -481,7 +496,10 @@ impl PciDevice for VfioUserPciDevice {
             }
         }
 
-        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (move to 0x{new_base:x})");
+        debug_assert!(
+            region_found,
+            "no MMIO region for BAR {bar_idx} (install at 0x{new_base:x})"
+        );
 
         Ok(())
     }

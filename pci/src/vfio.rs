@@ -2228,16 +2228,11 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
         let mut region_found = false;
         for region in self.common.mmio_regions.iter_mut() {
             if region.index as usize == bar_idx {
                 region_found = true;
-                // The record still holds the address the BAR is currently
-                // mapped at.
-                let old_base = region.start.raw_value();
-                region.start = GuestAddress(new_base);
-
                 for user_memory_region in region.user_memory_regions.iter_mut() {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
@@ -2273,6 +2268,28 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                         )
                     }
                     .map_err(io::Error::other)?;
+                }
+            }
+        }
+
+        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (release)");
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        let mut region_found = false;
+        for region in self.common.mmio_regions.iter_mut() {
+            if region.index as usize == bar_idx {
+                region_found = true;
+                // The record still holds the released-from base (the release
+                // side is forbidden to mutate it).
+                let old_base = region.start.raw_value();
+                region.start = GuestAddress(new_base);
+
+                for user_memory_region in region.user_memory_regions.iter_mut() {
+                    let len = user_memory_region.mapping.len();
+                    let host_addr = user_memory_region.mapping.addr();
 
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
@@ -2321,7 +2338,10 @@ iova 0x{:x}, size 0x{:x}: {}, ",
             }
         }
 
-        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (move to 0x{new_base:x})");
+        debug_assert!(
+            region_found,
+            "no MMIO region for BAR {bar_idx} (install at 0x{new_base:x})"
+        );
 
         Ok(())
     }

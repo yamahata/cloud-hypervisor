@@ -96,8 +96,26 @@ pub trait PciDevice: Send {
     fn write_bar(&mut self, _base: u64, _offset: u64, _data: &[u8]) -> Option<Arc<Barrier>> {
         None
     }
-    /// Relocates the BAR to a different address in guest address space.
-    fn move_bar(&mut self, _bar_idx: usize, _new_base: u64) -> result::Result<(), io::Error> {
+    /// Relocation release side: tear down the device's host-side state
+    /// backing the BAR (KVM memslots, VFIO DMA maps) at its OLD address.
+    /// Must NOT mutate the recorded base -- it stays keyed by index so
+    /// `move_bar_commit` can still derive per-region offsets from it.
+    ///
+    /// The default no-op suits pure trap-emulated BARs; a device with KVM
+    /// memslots, VFIO DMA or userspace mappings MUST implement this, or it
+    /// silently reintroduces the overlap this split prevents.
+    fn move_bar_prepare(&mut self, _bar_idx: usize) -> result::Result<(), io::Error> {
+        Ok(())
+    }
+    /// Relocation install side: set up the device's host-side state at
+    /// `new_base` and update the recorded base. The BAR is identified by
+    /// slot index, not its current address (which mutates under the guest);
+    /// implementations derive the old address from their own records.
+    fn move_bar_commit(
+        &mut self,
+        _bar_idx: usize,
+        _new_base: u64,
+    ) -> result::Result<(), io::Error> {
         Ok(())
     }
     /// Restore BAR address in config space after a failed move_bar.
