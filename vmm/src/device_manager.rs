@@ -789,12 +789,14 @@ impl DeviceRelocation for AddressManager {
                 };
 
                 // Find the specific allocator that this BAR was allocated from and use it for a new one
+                let mut window_found = false;
                 for pci_mmio_allocator_mutex in pci_mmio_allocators {
                     let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
 
                     if old_base >= pci_mmio_allocator.base().0
                         && old_base <= pci_mmio_allocator.end().0
                     {
+                        window_found = true;
                         // Free old_base first so allocate(new_base) sees it
                         // as available; restore old_base on failure to keep
                         // the allocator in sync with the MMIO bus.
@@ -820,6 +822,14 @@ impl DeviceRelocation for AddressManager {
 
                         break;
                     }
+                }
+                // Falling through without a matching window would update the
+                // bus and the device tree for a range the allocators have
+                // never heard of, silently desyncing them.
+                if !window_found {
+                    return Err(io::Error::other(format!(
+                        "no MMIO allocator window contains BAR range 0x{old_base:x}"
+                    )));
                 }
 
                 // Update MMIO bus
