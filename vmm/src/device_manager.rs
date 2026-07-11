@@ -82,8 +82,9 @@ use libc::{
 };
 use log::{debug, error, info, warn};
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
-    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, InstallParams, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf,
+    PciDevice, ReleaseParams, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
+    VfioUserPciDeviceError,
 };
 use rate_limiter::group;
 use rate_limiter::group::RateLimiterGroup;
@@ -857,20 +858,91 @@ impl AddressManager {
 }
 
 impl DeviceRelocation for AddressManager {
-    fn move_bar(
+    fn move_bar_prepare(
         &self,
-        bar_idx: usize,
-        old_base: u64,
-        new_base: u64,
-        len: u64,
+        params: &ReleaseParams,
         pci_dev: &mut dyn PciDevice,
-        region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
-        // Free the old range first so allocate(new_base) sees it as
-        // available. On failure re-reserve the old range so the allocator
-        // stays consistent with the caller's config-space rollback,
-        // preserving the previous failure behavior.
-        self.allocator_free(old_base, len, region_type);
+        let &ReleaseParams {
+            bar_idx,
+            base,
+            len,
+            region_type,
+        } = params;
+
+        // Step 1: free the old allocator range.
+        self.allocator_free(base, len, region_type);
+
+        // Step 2: remove the trap-emulated bus range (handle stays in the
+        // PciBus pair; the install re-inserts it). Must precede any other
+        // BAR's install so a swap/shift can't collide.
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                self.io_bus.remove(base, len).map_err(io::Error::other)?;
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                self.mmio_bus.remove(base, len).map_err(io::Error::other)?;
+            }
+        }
+
+        // Step 3: virtio old-side teardown, keyed by BAR slot: settings BAR
+        // carries the ioeventfds, shared-memory BAR is a KVM memslot.
+        let any_dev = pci_dev.as_any_mut();
+        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
+            if bar_idx == virtio_pci_dev.config_bar_index() {
+                // ioeventfd path: unregister the events at the old base.
+                for (event, addr) in virtio_pci_dev.ioeventfds(base) {
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
+                        io::Error::other(format!("failed to unregister ioevent: {e:?}"))
+                    })?;
+                }
+            } else if bar_idx == virtio_pci_dev.shm_bar_index() {
+                // virtio shm path: remove the old KVM memslot.
+                let virtio_dev = virtio_pci_dev.virtio_device();
+                let virtio_dev = virtio_dev.lock().unwrap();
+                if let Some(shm_regions) = virtio_dev.get_shm_regions() {
+                    // SAFETY: guaranteed by MmapRegion invariants
+                    unsafe {
+                        self.vm.remove_user_memory_region(
+                            shm_regions.mem_slot,
+                            base,
+                            shm_regions.mapping.len(),
+                            shm_regions.mapping.as_ptr(),
+                            false,
+                            false,
+                        )
+                    }
+                    .map_err(|e| {
+                        io::Error::other(format!("failed to remove user memory region: {e:?}"))
+                    })?;
+                }
+            }
+        }
+
+        // Step 4: device-side release (e.g. VFIO KVM memslot remove + DMA
+        // unmap).
+        pci_dev.move_bar_prepare(bar_idx)
+    }
+
+    fn move_bar_commit(
+        &self,
+        params: &InstallParams,
+        pci_dev: &mut dyn PciDevice,
+        bus_device: &Arc<dyn BusDeviceSync>,
+    ) -> result::Result<(), io::Error> {
+        let &InstallParams {
+            bar_idx,
+            old_base,
+            new_base,
+            len,
+            region_type,
+        } = params;
+
+        // Step 1: allocate the new allocator range. On failure re-reserve
+        // the old range (the release half freed it) so the allocator stays
+        // consistent with the caller's config-space rollback, preserving
+        // the pre-split failure behavior.
         if let Err(e) = self.allocator_allocate(old_base, new_base, len, region_type) {
             if self
                 .allocator_allocate(old_base, old_base, len, region_type)
@@ -881,21 +953,69 @@ impl DeviceRelocation for AddressManager {
             return Err(e);
         }
 
-        // Update the trap-emulated bus range.
+        // Step 2: re-insert the device's bus handle at the new address.
         match region_type {
             PciBarRegionType::IoRegion => {
                 self.io_bus
-                    .update_range(old_base, len, new_base, len)
+                    .insert(bus_device.clone(), new_base, len)
                     .map_err(io::Error::other)?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
                 self.mmio_bus
-                    .update_range(old_base, len, new_base, len)
+                    .insert(bus_device.clone(), new_base, len)
                     .map_err(io::Error::other)?;
             }
         }
 
-        // Update the device_tree resources associated with the device
+        // Step 3: device-side commit (e.g. VFIO KVM memslot create + DMA
+        // map).
+        pci_dev.move_bar_commit(bar_idx, new_base)?;
+
+        // Step 4: virtio new-side setup, keyed by the BAR slot exactly like
+        // the release side.
+        let any_dev = pci_dev.as_any_mut();
+        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
+            if bar_idx == virtio_pci_dev.config_bar_index() {
+                // ioeventfd path: register the events at the new base.
+                for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm
+                        .register_ioevent(event, &io_addr, None)
+                        .map_err(|e| {
+                            io::Error::other(format!("failed to register ioevent: {e:?}"))
+                        })?;
+                }
+            } else if bar_idx == virtio_pci_dev.shm_bar_index() {
+                // virtio shm path: create the new KVM memslot.
+                let virtio_dev = virtio_pci_dev.virtio_device();
+                let mut virtio_dev = virtio_dev.lock().unwrap();
+                if let Some(mut shm_regions) = virtio_dev.get_shm_regions() {
+                    // SAFETY: guaranteed by MmapRegion invariants
+                    unsafe {
+                        self.vm.create_user_memory_region(
+                            shm_regions.mem_slot,
+                            new_base,
+                            shm_regions.mapping.len(),
+                            shm_regions.mapping.as_ptr(),
+                            false,
+                            false,
+                        )
+                    }
+                    .map_err(|e| {
+                        io::Error::other(format!("failed to create user memory regions: {e:?}"))
+                    })?;
+
+                    // Update shared memory regions to reflect the new mapping.
+                    shm_regions.addr = GuestAddress(new_base);
+                    virtio_dev.set_shm_regions(shm_regions).map_err(|e| {
+                        io::Error::other(format!("failed to update shared memory regions: {e:?}"))
+                    })?;
+                }
+            }
+        }
+
+        // Step 5: update the device_tree resource associated with the BAR,
+        // matched by its index.
         if let Some(id) = pci_dev.id() {
             if let Some(node) = self.device_tree.lock().unwrap().get_mut(&id) {
                 let mut resource_updated = false;
@@ -921,78 +1041,7 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        let any_dev = pci_dev.as_any_mut();
-        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
-            // The BAR decides the follow-on mapping work: the settings BAR
-            // carries the ioeventfds, the shared-memory BAR is a KVM
-            // memslot. Discriminate by the BAR index -- comparing addresses
-            // breaks down as soon as one BAR moves onto another one's old
-            // location.
-            if bar_idx == virtio_pci_dev.config_bar_index() {
-                for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
-                    let io_addr = IoEventAddress::Mmio(addr);
-                    self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
-                        io::Error::other(format!("failed to unregister ioevent: {e:?}"))
-                    })?;
-                }
-                for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
-                    let io_addr = IoEventAddress::Mmio(addr);
-                    self.vm
-                        .register_ioevent(event, &io_addr, None)
-                        .map_err(|e| {
-                            io::Error::other(format!("failed to register ioevent: {e:?}"))
-                        })?;
-                }
-            } else if bar_idx == virtio_pci_dev.shm_bar_index() {
-                let virtio_dev = virtio_pci_dev.virtio_device();
-                let mut virtio_dev = virtio_dev.lock().unwrap();
-                if let Some(mut shm_regions) = virtio_dev.get_shm_regions() {
-                    // SAFETY: guaranteed by MmapRegion invariants
-                    unsafe {
-                        // Remove old mapping
-                        self.vm
-                            .remove_user_memory_region(
-                                shm_regions.mem_slot,
-                                old_base,
-                                shm_regions.mapping.len(),
-                                shm_regions.mapping.as_ptr(),
-                                false,
-                                false,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(format!(
-                                    "failed to remove user memory region: {e:?}"
-                                ))
-                            })?;
-
-                        // Create new mapping by inserting new region to KVM.
-                        self.vm
-                            .create_user_memory_region(
-                                shm_regions.mem_slot,
-                                new_base,
-                                shm_regions.mapping.len(),
-                                shm_regions.mapping.as_ptr(),
-                                false,
-                                false,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(format!(
-                                    "failed to create user memory regions: {e:?}"
-                                ))
-                            })?;
-                    }
-
-                    // Update shared memory regions to reflect the new mapping.
-                    shm_regions.addr = GuestAddress(new_base);
-                    virtio_dev.set_shm_regions(shm_regions).map_err(|e| {
-                        io::Error::other(format!("failed to update shared memory regions: {e:?}"))
-                    })?;
-                }
-            }
-        }
-
-        pci_dev.move_bar_prepare(bar_idx)?;
-        pci_dev.move_bar_commit(bar_idx, new_base)
+        Ok(())
     }
 }
 

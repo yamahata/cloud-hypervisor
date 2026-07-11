@@ -11,7 +11,7 @@ use std::{io, result};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
-use vm_device::Resource;
+use vm_device::{BusDeviceSync, Resource};
 
 use crate::PciBarConfiguration;
 use crate::configuration::{self, PciBarRegionType};
@@ -44,6 +44,36 @@ pub struct BarReprogrammingParams {
     /// can change again. Old snapshots (pre-index-keying) don't carry
     /// this field; it only matters for in-flight moves.
     #[serde(default)]
+    pub bar_idx: usize,
+    pub old_base: u64,
+    pub new_base: u64,
+    pub len: u64,
+    pub region_type: PciBarRegionType,
+}
+
+/// Describes a BAR mapping that must be released (its old guest-physical
+/// location torn down) as the release half of a BAR relocation.
+#[derive(Clone, Copy, Debug)]
+pub struct ReleaseParams {
+    /// The BAR slot being released (the low/primary slot for a 64-bit BAR,
+    /// ROM_BAR_IDX for the expansion ROM).
+    pub bar_idx: usize,
+    /// The address the BAR is currently materialized at.
+    pub base: u64,
+    pub len: u64,
+    pub region_type: PciBarRegionType,
+}
+
+/// Describes a BAR mapping that must be installed at its new guest-physical
+/// location. `old_base` (the address the mapping was released
+/// from) rides along solely for the install-failure fallback that
+/// re-reserves the released allocator range; the device-side commit
+/// derives the old address from its own records, which the release is
+/// forbidden to mutate.
+#[derive(Clone, Copy, Debug)]
+pub struct InstallParams {
+    /// The BAR slot being installed (the low/primary slot for a 64-bit BAR,
+    /// ROM_BAR_IDX for the expansion ROM).
     pub bar_idx: usize,
     pub old_base: u64,
     pub new_base: u64,
@@ -133,16 +163,27 @@ pub trait PciDevice: Send {
 /// This trait defines a set of functions which can be triggered whenever a
 /// PCI device is modified in any way.
 pub trait DeviceRelocation: Send + Sync {
-    /// The BAR needs to be moved to a different location in the guest address
-    /// space. This follows a decision from the software running in the guest.
-    /// The BAR is identified by its slot index.
-    fn move_bar(
+    /// Release the OLD guest-physical mapping of a BAR being relocated.
+    ///
+    /// This frees the allocator range, removes the trap-emulated bus range,
+    /// tears down the virtio shm / ioeventfd old-side mapping and runs the
+    /// device-side `move_bar_prepare`. The bus handle itself stays stored in
+    /// the `PciBus` device pair; the matching install re-inserts it at the
+    /// new address.
+    fn move_bar_prepare(
         &self,
-        bar_idx: usize,
-        old_base: u64,
-        new_base: u64,
-        len: u64,
+        params: &ReleaseParams,
         pci_dev: &mut dyn PciDevice,
-        region_type: PciBarRegionType,
+    ) -> result::Result<(), io::Error>;
+
+    /// Install the NEW guest-physical mapping of a BAR previously released
+    /// by `move_bar_prepare`: allocator range, bus insertion (using
+    /// `bus_device`, the MMIO/IO bus handle the PCI bus stores alongside the
+    /// device), the device-side commit and the follow-on mappings.
+    fn move_bar_commit(
+        &self,
+        params: &InstallParams,
+        pci_dev: &mut dyn PciDevice,
+        bus_device: &Arc<dyn BusDeviceSync>,
     ) -> result::Result<(), io::Error>;
 }
