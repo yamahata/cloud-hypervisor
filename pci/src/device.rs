@@ -9,7 +9,6 @@ use std::sync::{Arc, Barrier};
 use std::{io, result};
 
 use log::warn;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::{BusDeviceSync, Resource};
@@ -36,21 +35,6 @@ pub enum Error {
     InvalidResource(Resource),
 }
 pub type Result<T> = result::Result<T, Error>;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct BarReprogrammingParams {
-    /// The BAR slot being reprogrammed (expansion ROM = ROM_BAR_IDX; the
-    /// low/primary slot for a 64-bit BAR). Identifies the BAR across the
-    /// whole relocation, unlike the addresses, which a later config write
-    /// can change again. Old snapshots (pre-index-keying) don't carry
-    /// this field; it only matters for in-flight moves.
-    #[serde(default)]
-    pub bar_idx: usize,
-    pub old_base: u64,
-    pub new_base: u64,
-    pub len: u64,
-    pub region_type: PciBarRegionType,
-}
 
 /// Describes a BAR mapping that must be released (its old guest-physical
 /// location torn down) because the guest reprogrammed the BAR address while
