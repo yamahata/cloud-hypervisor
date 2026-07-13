@@ -4,8 +4,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::result;
 use std::sync::{Arc, Mutex};
-use std::{mem, result};
 
 use byteorder::{ByteOrder, LittleEndian};
 use log::{info, warn};
@@ -14,7 +14,7 @@ use thiserror::Error;
 use vm_device::PciBarType;
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
-use crate::device::BarReprogrammingParams;
+use crate::device::{BarRelocation, BarReprogrammingParams, InstallParams, ReleaseParams};
 use crate::{MsixConfig, PciInterruptPin};
 
 // The number of 32bit registers in the config space, 4096 bytes.
@@ -903,9 +903,9 @@ impl PciConfiguration {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> Vec<BarReprogrammingParams> {
+    ) -> BarRelocation {
         if offset as usize + data.len() > 4 {
-            return Vec::new();
+            return BarRelocation::default();
         }
 
         // Handle potential write to MSI-X message control register
@@ -939,31 +939,44 @@ impl PciConfiguration {
             self.pending_bar_reprogram.push(param);
         }
 
-        self.drain_pending_bar_reprogram()
+        let mut reloc = BarRelocation::default();
+        self.drain_pending_relocation(&mut reloc);
+        reloc
     }
 
-    /// Drain the pending BAR reprogrammings, returning them only when the
-    /// memory-space decode (MSE) bit is enabled; otherwise the moves stay
-    /// queued for a later config write.
-    pub(crate) fn drain_pending_bar_reprogram(&mut self) -> Vec<BarReprogrammingParams> {
+    /// Drain the pending BAR relocation into `reloc`, each as its
+    /// release/install pair, but only when the memory-space decode (MSE) bit
+    /// is enabled; otherwise the moves stay queued for a later config write.
+    pub(crate) fn drain_pending_relocation(&mut self, reloc: &mut BarRelocation) {
         if !self.pending_bar_reprogram.is_empty() {
-            // Return bar reprogramming only if the MSE bit is enabled;
+            // Emit the pending reprogrammings only if the MSE bit is
+            // enabled, each as its release/install pair.
             if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
                 == COMMAND_REG_MEMORY_SPACE_MASK
             {
+                for params in self.pending_bar_reprogram.drain(..) {
+                    reloc.release.push(ReleaseParams {
+                        bar_idx: params.bar_idx,
+                        base: params.old_base,
+                        len: params.len,
+                        region_type: params.region_type,
+                    });
+                    reloc.install.push(InstallParams {
+                        bar_idx: params.bar_idx,
+                        old_base: params.old_base,
+                        new_base: params.new_base,
+                        len: params.len,
+                        region_type: params.region_type,
+                    });
+                }
+                info!("BAR relocation plan: {reloc:x?}");
+            } else {
                 info!(
-                    "BAR reprogramming parameter is returned: {:x?}",
+                    "MSE bit is disabled. No BAR relocation plan is returned: {:x?}",
                     self.pending_bar_reprogram
                 );
-                return mem::take(&mut self.pending_bar_reprogram);
             }
-            info!(
-                "MSE bit is disabled. No BAR reprogramming parameter is returned: {:x?}",
-                self.pending_bar_reprogram
-            );
         }
-
-        Vec::new()
     }
 
     pub fn read_config_register(&self, reg_idx: usize) -> u32 {
