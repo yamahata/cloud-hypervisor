@@ -23,6 +23,7 @@ use crate::{MsixConfig, PciInterruptPin};
 const NUM_CONFIGURATION_REGISTERS: usize = 1024;
 
 pub(crate) const COMMAND_REG: usize = 1;
+pub(crate) const COMMAND_REG_IO_SPACE_MASK: u32 = 0x0000_0001;
 pub(crate) const COMMAND_REG_MEMORY_SPACE_MASK: u32 = 0x0000_0002;
 const STATUS_REG: usize = 1;
 const STATUS_REG_CAPABILITIES_USED_MASK: u32 = 0x0010_0000;
@@ -506,12 +507,10 @@ pub struct PciConfiguration {
     // Same as `mapped_addr` but for the expansion ROM BAR.
     rom_mapped_addr: Option<u64>,
     // BAR slots that were released and not yet re-installed, mapped to the
-    // address they were released from. Drained (installed) whenever a config
-    // write leaves the memory-space decode (MSE) bit set, for every region
-    // type -- the same gate the old pending queue used. Indexed by slot (ROM at
-    // ROM_BAR_IDX), `None` where no move is pending, so iteration is
-    // deterministic (ascending slot). Serialized through
-    // `PciConfigurationState::pending_bar_reprogram`.
+    // address they were released from. Installed on the 0->1 transition of
+    // the enable bit for each BAR's space (IOSE for IO
+    // BARs, MSE for memory BARs and the ROM). Indexed by slot (ROM at
+    // ROM_BAR_IDX), `None` where no move is pending.
     pending_relocation: [Option<u64>; NUM_BAR_REGS + 1],
 }
 
@@ -612,10 +611,6 @@ pub type Result<T> = result::Result<T, Error>;
 /// released-from address from `mapped_addr`, so no old_base travels here.
 struct BarReprogramming {
     bar_idx: usize,
-    #[expect(
-        dead_code,
-        reason = "read by the immediate-install push the next change adds"
-    )]
     new_base: u64,
     len: u64,
     region_type: PciBarRegionType,
@@ -1078,6 +1073,10 @@ impl PciConfiguration {
             }
         }
 
+        // Capture the COMMAND register before the write so decode-enable
+        // (IOSE/MSE 0->1) edges can be detected below.
+        let command_before = self.registers[COMMAND_REG];
+
         match data.len() {
             1 => self.write_byte(reg_idx * 4 + offset as usize, data[0]),
             2 => self.write_word(
@@ -1095,13 +1094,10 @@ impl PciConfiguration {
             let slot = params.bar_idx;
 
             if let Some(mapped) = self.mapped_addr(slot) {
-                // The BAR is currently mapped: release the old location
-                // eagerly and mark the slot pending. The install is emitted
-                // by the drain below when the decode bit is on (immediate
-                // move) or by a later drain-triggering write otherwise.
-                // Either way `mapped_addr` moves to the new address only
-                // when the install reports success (see
-                // `on_bar_relocation_status`).
+                // Mapped: release the old BAR range eagerly and mark the
+                // slot pending. Install is in the same plan if decode is on
+                // (immediate move), else the decode-enable edge. mapped_addr
+                // advances only on a successful install outcome.
                 reloc.release.push(ReleaseParams {
                     bar_idx: slot,
                     base: mapped,
@@ -1110,55 +1106,43 @@ impl PciConfiguration {
                 });
                 self.set_mapped_addr(slot, None);
                 self.pending_relocation[slot] = Some(mapped);
+
+                if self.decode_enabled(params.region_type) {
+                    reloc.install.push(InstallParams {
+                        bar_idx: slot,
+                        // Released from `mapped`; confines the install to the
+                        // PCI segment that address belongs to.
+                        old_base: mapped,
+                        new_base: params.new_base,
+                        len: params.len,
+                        region_type: params.region_type,
+                    });
+                }
             }
             // else: already released. Nothing to emit; the install target
             // is read from the live registers at drain time, and the
             // recorded released-from base stays intact.
         }
 
-        self.drain_pending_relocation(&mut reloc);
+        // Case 2: commit each space whose decode bit rose 0->1 (shared with the
+        // VFIO mirror). A non-COMMAND write sees no space enabling,
+        // so this is a no-op.
+        self.drain_command_decode_edge(command_before, &mut reloc);
 
         reloc
     }
 
-    /// Case 2: drain the pending BARs into `reloc` whenever the write leaves
-    /// MSE on -- the exact gate the old pending queue used (any config write
-    /// while MSE is on, every region type). A BAR address write with decode on
-    /// is therefore released and re-installed within this same plan. A later
-    /// change narrows the trigger to the decode-enable edge and gates IO BARs
-    /// on IOSE.
-    ///
-    /// Installs are emitted in ascending slot order (deterministic, from the
-    /// array). Pending entries are not removed here: only a successful
-    /// install outcome (`on_bar_relocation_status`) unpends a slot, so a
-    /// failed install is retried at the guest's next drain-triggering write.
-    pub(crate) fn drain_pending_relocation(&mut self, reloc: &mut BarRelocation) {
-        if self.pending_relocation.iter().any(|e| e.is_some())
-            && self.registers[COMMAND_REG] & COMMAND_REG_MEMORY_SPACE_MASK != 0
-        {
-            let pending: Vec<usize> = (0..self.pending_relocation.len())
-                .filter(|&slot| self.pending_relocation[slot].is_some())
-                .collect();
-
-            for slot in pending {
-                let Some(region_type) = self.bar_region_type(slot) else {
-                    continue;
-                };
-                let len = self.bar_len(slot).unwrap_or(0);
-
-                // The BAR belongs to the PCI segment whose MMIO window held the
-                // address it was released from; carry that base so the install
-                // confines the new range to the same segment window.
-                let old_base =
-                    self.pending_relocation[slot].unwrap_or_else(|| self.bar_target(slot));
-
-                reloc.install.push(InstallParams {
-                    bar_idx: slot,
-                    old_base,
-                    new_base: self.bar_target(slot),
-                    len,
-                    region_type,
-                });
+    /// Drain the BAR unblocked by a COMMAND enable (IOSE/MSE 0->1) into
+    /// `reloc`.
+    pub(crate) fn drain_command_decode_edge(
+        &mut self,
+        command_before: u32,
+        reloc: &mut BarRelocation,
+    ) {
+        let command_after = self.registers[COMMAND_REG];
+        for space_mask in [COMMAND_REG_IO_SPACE_MASK, COMMAND_REG_MEMORY_SPACE_MASK] {
+            if command_before & space_mask == 0 && command_after & space_mask != 0 {
+                self.drain_pending_relocation(space_mask, reloc);
             }
         }
 
@@ -1167,10 +1151,41 @@ impl PciConfiguration {
         }
     }
 
-    /// Reconciles the mapping bookkeeping with an install outcome.
+    /// Emits the deferred installs for every pending BAR of the space whose
+    /// enable bit is set. Only a successful install unpends a slot, so a failed one
+    /// is retried at the guest's next decode-enable edge.
+    fn drain_pending_relocation(&mut self, space_mask: u32, reloc: &mut BarRelocation) {
+        let pending: Vec<usize> = (0..self.pending_relocation.len())
+            .filter(|&slot| self.pending_relocation[slot].is_some())
+            .collect();
+
+        for slot in pending {
+            let Some(region_type) = self.bar_region_type(slot) else {
+                continue;
+            };
+            if Self::decode_mask(region_type) != space_mask {
+                continue;
+            }
+            let len = self.bar_len(slot).unwrap_or(0);
+
+            // The BAR belongs to the PCI segment.  Pass the base
+            // so that new BAR range should be in the same PCI segment.
+            let old_base = self.pending_relocation[slot].unwrap_or_else(|| self.bar_target(slot));
+
+            reloc.install.push(InstallParams {
+                bar_idx: slot,
+                old_base,
+                new_base: self.bar_target(slot),
+                len,
+                region_type,
+            });
+        }
+    }
+
+    /// Reconciles the mapping bookkeeping with an install status.
     /// `mapped_addr` advances ONLY here, on success. A failed install leaves
     /// the slot pending and unmapped -- nothing lies about being mapped --
-    /// and it is re-emitted at the guest's next drain-triggering write.
+    /// and it is re-emitted at the guest's next enabling the space.
     pub fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
         match status {
             BarRelocationStatus::Applied { base } => {
@@ -1192,6 +1207,19 @@ impl PciConfiguration {
     /// torn down, so teardown paths (e.g. `free_bars`) must skip it.
     pub fn is_bar_released(&self, bar_idx: usize) -> bool {
         self.pending_relocation[bar_idx].is_some()
+    }
+
+    /// The COMMAND-register enabling bit for BAR's space: IOSE for IO
+    /// BARs, MSE for 32/64-bit memory BARs and the expansion ROM.
+    fn decode_mask(region_type: PciBarRegionType) -> u32 {
+        match region_type {
+            PciBarRegionType::IoRegion => COMMAND_REG_IO_SPACE_MASK,
+            _ => COMMAND_REG_MEMORY_SPACE_MASK,
+        }
+    }
+
+    fn decode_enabled(&self, region_type: PciBarRegionType) -> bool {
+        self.registers[COMMAND_REG] & Self::decode_mask(region_type) != 0
     }
 
     /// Returns the currently-mapped address for a BAR slot (ROM_BAR_IDX for
