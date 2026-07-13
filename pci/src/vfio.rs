@@ -45,7 +45,7 @@ use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsiz
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::configuration::{COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK};
+use crate::configuration::COMMAND_REG;
 use crate::mmap::MmapRegion;
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
@@ -1487,23 +1487,7 @@ impl VfioCommon {
                 .write_reg(reg_idx, LittleEndian::read_u32(data)),
             _ => {}
         }
-
-        // Return pending BAR repgrogramming if MSE bit is set
-        let mut ret_param = self.configuration.pending_bar_reprogram();
-        if !ret_param.is_empty() {
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                info!("BAR reprogramming parameter is returned: {ret_param:x?}");
-                self.configuration.clear_pending_bar_reprogram();
-            } else {
-                info!(
-                    "MSE bit is disabled. No BAR reprogramming parameter is returned: {ret_param:x?}"
-                );
-
-                ret_param = Vec::new();
-            }
-        }
+        let ret_param = self.configuration.drain_pending_bar_reprogram();
 
         (ret_param, None)
     }
