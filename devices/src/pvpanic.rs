@@ -11,7 +11,7 @@ use anyhow::anyhow;
 use event_monitor::event;
 use log::{debug, info};
 use pci::{
-    BarRelocation, BarReprogrammingParams, PCI_CONFIGURATION_ID, PciBarConfiguration,
+    BarRelocation, BarRelocationStatus, PCI_CONFIGURATION_ID, PciBarConfiguration,
     PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciDevice,
     PciDeviceError, PciHeaderType, PciSubclass,
 };
@@ -215,6 +215,12 @@ impl PciDevice for PvPanicDevice {
         _mmio64_allocator: &mut AddressAllocator,
     ) -> result::Result<(), PciDeviceError> {
         for bar in self.bar_regions.drain(..) {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(bar.idx()) {
+                continue;
+            }
             mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
         }
 
@@ -231,8 +237,8 @@ impl PciDevice for PvPanicDevice {
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn read_bar(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {

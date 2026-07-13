@@ -8,6 +8,7 @@ use std::any::Any;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
+use log::warn;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
@@ -52,7 +53,9 @@ pub struct BarReprogrammingParams {
 }
 
 /// Describes a BAR mapping that must be released (its old guest-physical
-/// location torn down) as the release half of a BAR relocation.
+/// location torn down) because the guest reprogrammed the BAR address while
+/// the decode bit of its space was off, or as the release half of an
+/// immediate (decode-on) relocation.
 #[derive(Clone, Copy, Debug)]
 pub struct ReleaseParams {
     /// The BAR slot being released (the low/primary slot for a 64-bit BAR,
@@ -65,27 +68,30 @@ pub struct ReleaseParams {
 }
 
 /// Describes a BAR mapping that must be installed at its new guest-physical
-/// location. `old_base` (the address the mapping was released
-/// from) rides along solely for the install-failure fallback that
-/// re-reserves the released allocator range; the device-side commit
-/// derives the old address from its own records, which the release is
-/// forbidden to mutate.
+/// location. The device-side commit derives the released-from
+/// address from its own records, which the release is forbidden to mutate;
+/// `old_base` travels here only to anchor the *allocator* to the BAR's
+/// PCI segment (see the field doc) and is not consumed by the device side.
 #[derive(Clone, Copy, Debug)]
 pub struct InstallParams {
     /// The BAR slot being installed (the low/primary slot for a 64-bit BAR,
     /// ROM_BAR_IDX for the expansion ROM).
     pub bar_idx: usize,
+    /// The address the BAR was released from. Its MMIO allocator window is
+    /// the device's PCI segment aperture: a device cannot decode outside its
+    /// own segment, so the install must allocate `new_base` from that same
+    /// window and reject a target that falls outside it.
     pub old_base: u64,
     pub new_base: u64,
     pub len: u64,
     pub region_type: PciBarRegionType,
 }
 
-/// A relocation plan emitted by `write_config_register`: the old locations
-/// to release and the new locations to install. Today every entry pairs one
-/// release with one install describing a whole BAR move; the two Vecs exist
-/// so a later change can decouple the phases in time, where a single write
-/// emits releases, installs, or both.
+/// A relocation plan emitted by `write_config_register`. Because release and
+/// install happen on *different* config-register writes when the decode bit
+/// is off (release on the BAR address change, install on the decode-enable
+/// edge), a single write can produce releases, installs, or both (the
+/// immediate decode-on case).
 #[derive(Clone, Debug, Default)]
 pub struct BarRelocation {
     pub release: Vec<ReleaseParams>,
@@ -96,6 +102,17 @@ impl BarRelocation {
     pub fn is_empty(&self) -> bool {
         self.release.is_empty() && self.install.is_empty()
     }
+}
+
+/// Outcome of an attempted BAR install, reported back to the device so its
+/// config-space bookkeeping can follow what actually happened.
+#[derive(Clone, Copy, Debug)]
+pub enum BarRelocationStatus {
+    /// The BAR is now mapped at `base`.
+    Applied { base: u64 },
+    /// The install failed and the BAR is currently not mapped anywhere. It
+    /// stays pending and is retried at the guest's next decode-enable edge.
+    Pending,
 }
 
 pub trait PciDevice: Send {
@@ -165,10 +182,11 @@ pub trait PciDevice: Send {
     ) -> result::Result<(), io::Error> {
         Ok(())
     }
-    /// Restore BAR address in config space after a failed move_bar.
-    /// This rolls back the address update made by detect_bar_reprogramming()
-    /// so that the config register stays consistent with the MMIO bus mapping.
-    fn restore_bar_addr(&mut self, _params: &BarReprogrammingParams) {}
+    /// Reports the outcome of an attempted BAR install so the device can
+    /// reconcile its config-space bookkeeping with what actually happened.
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        warn!("BAR {bar_idx} relocation status dropped: {status:?}");
+    }
     /// Provides a mutable reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the trait.
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -180,13 +198,11 @@ pub trait PciDevice: Send {
 /// This trait defines a set of functions which can be triggered whenever a
 /// PCI device is modified in any way.
 pub trait DeviceRelocation: Send + Sync {
-    /// Release the OLD guest-physical mapping of a BAR being relocated.
-    ///
-    /// This frees the allocator range, removes the trap-emulated bus range,
-    /// tears down the virtio shm / ioeventfd old-side mapping and runs the
-    /// device-side `move_bar_prepare`. The bus handle itself stays stored in
-    /// the `PciBus` device pair; the matching install re-inserts it at the
-    /// new address.
+    /// Release the OLD guest-physical mapping of a BAR: frees the allocator
+    /// range, removes the trap-emulated bus range, tears down the virtio
+    /// shm / ioeventfd old-side mapping and runs the device-side
+    /// `move_bar_prepare`. The bus handle stays stored in the `PciBus`
+    /// device pair; the matching install re-inserts it.
     fn move_bar_prepare(
         &self,
         params: &ReleaseParams,

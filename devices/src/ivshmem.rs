@@ -12,7 +12,7 @@ use std::{io, result};
 use anyhow::anyhow;
 use log::{debug, error, warn};
 use pci::{
-    BarRelocation, BarReprogrammingParams, PCI_CONFIGURATION_ID, PciBarConfiguration,
+    BarRelocation, BarRelocationStatus, PCI_CONFIGURATION_ID, PciBarConfiguration,
     PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciDevice,
     PciDeviceError, PciHeaderType, PciSubclass,
 };
@@ -388,8 +388,8 @@ impl PciDevice for IvshmemDevice {
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

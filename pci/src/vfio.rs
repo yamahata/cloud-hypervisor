@@ -50,8 +50,8 @@ use crate::mmap::MmapRegion;
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
-    BarRelocation, BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap,
-    MsiConfig, MsixCap, MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
+    BarRelocation, BarRelocationStatus, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig,
+    MsixCap, MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
     PciBarRegionType, PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice,
     PciDeviceError, PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_enabled_vectors,
 };
@@ -967,6 +967,12 @@ impl VfioCommon {
         mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for region in self.mmio_regions.iter() {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(region.index as usize) {
+                continue;
+            }
             match region.type_ {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
@@ -2331,8 +2337,10 @@ iova 0x{:x}, size 0x{:x}: {}, ",
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.common
+            .configuration
+            .on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

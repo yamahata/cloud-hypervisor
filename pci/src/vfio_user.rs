@@ -31,7 +31,7 @@ use crate::vfio::{
     UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError,
 };
 use crate::{
-    BarRelocation, BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError,
+    BarRelocation, BarRelocationStatus, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError,
     PciSubclass, VfioPciError,
 };
 
@@ -401,10 +401,6 @@ impl PciDevice for VfioUserPciDevice {
             .free_bars(allocator, mmio32_allocator, mmio64_allocator)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -502,6 +498,12 @@ impl PciDevice for VfioUserPciDevice {
         );
 
         Ok(())
+    }
+
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.common
+            .configuration
+            .on_bar_relocation_status(bar_idx, status);
     }
 
     fn id(&self) -> Option<String> {

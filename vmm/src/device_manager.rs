@@ -939,33 +939,49 @@ impl DeviceRelocation for AddressManager {
             region_type,
         } = params;
 
-        // Step 1: allocate the new allocator range. On failure re-reserve
-        // the old range (the release half freed it) so the allocator stays
-        // consistent with the caller's config-space rollback, preserving
-        // the pre-split failure behavior.
-        if let Err(e) = self.allocator_allocate(old_base, new_base, len, region_type) {
-            if self
-                .allocator_allocate(old_base, old_base, len, region_type)
-                .is_err()
-            {
-                error!("Failed to restore old range 0x{old_base:x} after rejected BAR move");
+        // Step 1: allocate the new allocator range.
+        self.allocator_allocate(old_base, new_base, len, region_type)?;
+
+        // Step 2: re-insert the device's bus handle at the new address. On
+        // failure unwind step 1, so a failed install leaves the exact
+        // released state behind and the retry at the guest's next
+        // decode-enable edge starts clean.
+        let bus = match region_type {
+            PciBarRegionType::IoRegion => &self.io_bus,
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                &self.mmio_bus
             }
+        };
+        if let Err(e) = bus.insert(bus_device.clone(), new_base, len) {
+            self.allocator_free(new_base, len, region_type);
+            return Err(io::Error::other(e));
+        }
+
+        // Steps 3-5: device-side commit and follow-on mappings. On failure
+        // unwind steps 1-2 for the same reason.
+        if let Err(e) = self.move_bar_commit_device(params, pci_dev) {
+            if let Err(remove_err) = bus.remove(new_base, len) {
+                error!("Failed unwinding bus range for BAR {bar_idx}: {remove_err}");
+            }
+            self.allocator_free(new_base, len, region_type);
             return Err(e);
         }
 
-        // Step 2: re-insert the device's bus handle at the new address.
-        match region_type {
-            PciBarRegionType::IoRegion => {
-                self.io_bus
-                    .insert(bus_device.clone(), new_base, len)
-                    .map_err(io::Error::other)?;
-            }
-            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                self.mmio_bus
-                    .insert(bus_device.clone(), new_base, len)
-                    .map_err(io::Error::other)?;
-            }
-        }
+        Ok(())
+    }
+}
+
+impl AddressManager {
+    /// Steps 3-5 of `move_bar_commit`: the device-side commit and the
+    /// follow-on mappings that depend on it.
+    fn move_bar_commit_device(
+        &self,
+        params: &InstallParams,
+        pci_dev: &mut dyn PciDevice,
+    ) -> result::Result<(), io::Error> {
+        let &InstallParams {
+            bar_idx, new_base, ..
+        } = params;
 
         // Step 3: device-side commit (e.g. VFIO KVM memslot create + DMA
         // map).

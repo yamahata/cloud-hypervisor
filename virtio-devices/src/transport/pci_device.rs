@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
 use log::{error, info, warn};
 use pci::{
-    BarRelocation, BarReprogrammingParams, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig,
+    BarRelocation, BarRelocationStatus, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig,
     PciBarConfiguration, PciBarRegionType, PciCapability, PciCapabilityId, PciClassCode,
     PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciMassStorageSubclass,
     PciNetworkControllerSubclass, PciSubclass,
@@ -1157,6 +1157,12 @@ impl PciDevice for VirtioPciDevice {
         mmio64_allocator: &mut AddressAllocator,
     ) -> result::Result<(), PciDeviceError> {
         for bar in self.bar_regions.drain(..) {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(bar.idx()) {
+                continue;
+            }
             match bar.region_type() {
                 PciBarRegionType::Memory32BitRegion => {
                     mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
@@ -1183,8 +1189,8 @@ impl PciDevice for VirtioPciDevice {
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn read_bar(&mut self, _base: u64, offset: u64, data: &mut [u8]) {

@@ -12,9 +12,8 @@ use std::{fmt, io, mem, ptr, result};
 use log::{debug, warn};
 use num_enum::TryFromPrimitive;
 use pci::{
-    BarRelocation, BarReprogrammingParams, PciBarConfiguration, PciBarPrefetchable,
-    PciBarRegionType, PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType,
-    PciSubclass,
+    BarRelocation, BarRelocationStatus, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
+    PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
 use thiserror::Error;
 use vm_allocator::page_size::get_page_size;
@@ -714,8 +713,8 @@ impl PciDevice for PvmemcontrolPciDevice {
         self.configuration.read_config_register(reg_idx)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -767,6 +766,12 @@ impl PciDevice for PvmemcontrolPciDevice {
         _mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for bar in self.bar_regions.drain(..) {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(bar.idx()) {
+                continue;
+            }
             mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
         }
         Ok(())

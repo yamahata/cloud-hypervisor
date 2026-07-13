@@ -6,20 +6,18 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::io;
 use std::ops::DerefMut;
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::warn;
+use log::error;
 use thiserror::Error;
 use vm_device::{BusDevice, BusDeviceSync};
 
 use crate::configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType};
 use crate::device::{
-    BarRelocation, BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError,
-    InstallParams, PciDevice, ReleaseParams,
+    BarRelocation, BarRelocationStatus, DeviceRelocation, Error as PciDeviceError, PciDevice,
 };
 
 /// Denotes the PCI device ID of a bus' root bridge device.
@@ -453,61 +451,59 @@ impl PciConfigMmio {
     }
 }
 
-/// Drives a `BarRelocation` plan against a `DeviceRelocation` implementor.
-/// Today the plan pairs each release with the install of the same BAR move
-/// (equal-length Vecs by construction), applied back to back per pair so
-/// the single-phase behavior is preserved; a later change decouples the
-/// two phases in time.
+/// Drives a `BarRelocation` plan: all releases first (tearing down old
+/// mappings), then each install, feeding its outcome back into the device's
+/// config-space bookkeeping. The caller holds both the PciBus lock and the
+/// device lock, so the plan, its application and the feedback are one atomic
+/// step for every other observer.
 ///
-/// A failed move is logged and the config-space address update is rolled
-/// back via restore_bar_addr() so device state stays consistent with the
-/// bus mapping.
+/// Release errors are logged and skipped so one failed BAR does not abort
+/// the plan. A failed install leaves its BAR pending (unmapped) and retried
+/// at the guest's next decode-enable edge.
 fn apply_bar_relocation(
     device_reloc: &dyn DeviceRelocation,
     device: &mut dyn PciDevice,
     bus_device: Option<&Arc<dyn BusDeviceSync>>,
     reloc: &BarRelocation,
 ) {
-    for (release, install) in reloc.release.iter().zip(&reloc.install) {
-        if let Err(e) = relocate_bar(device_reloc, device, bus_device, release, install) {
-            warn!(
-                "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}); BAR left unmapped, config rolled back to old",
-                e, install.old_base, install.new_base, install.len
+    for r in &reloc.release {
+        if let Err(e) = device_reloc.move_bar_prepare(r, device) {
+            error!(
+                "Failed releasing BAR {}: {}: 0x{:x}(0x{:x})",
+                r.bar_idx, e, r.base, r.len
             );
-            // The config register was already updated to new_base by
-            // detect_bar_reprogramming(); roll it back to old. The release
-            // phase already tore the old mapping down, so nothing is mapped
-            // at old until the guest retries -- the BAR is left unmapped.
-            device.restore_bar_addr(&BarReprogrammingParams {
-                bar_idx: install.bar_idx,
-                old_base: install.old_base,
-                new_base: install.new_base,
-                len: install.len,
-                region_type: install.region_type,
-            });
         }
     }
-}
 
-/// Relocates one BAR as its two phases invoked back to back: release the
-/// old guest-physical mapping, then install the new one with the device's
-/// stored bus handle.
-fn relocate_bar(
-    device_reloc: &dyn DeviceRelocation,
-    device: &mut dyn PciDevice,
-    bus_device: Option<&Arc<dyn BusDeviceSync>>,
-    release: &ReleaseParams,
-    install: &InstallParams,
-) -> io::Result<()> {
-    device_reloc.move_bar_prepare(release, device)?;
+    for a in &reloc.install {
+        let Some(bus_device) = bus_device else {
+            // Only the host bridge has no bus handle, and it has no BARs; a
+            // plan for it means the device was registered wrong.
+            error!(
+                "BAR {} install at 0x{:x} for a device with no bus handle",
+                a.bar_idx, a.new_base
+            );
+            device.on_bar_relocation_status(a.bar_idx, BarRelocationStatus::Pending);
+            continue;
+        };
 
-    // Only the host bridge has no bus handle, and it has no BARs; a relocation
-    // for it means the device was registered wrong.
-    let handle = bus_device.ok_or_else(|| {
-        io::Error::other(format!("no bus handle for BAR {} install", install.bar_idx))
-    })?;
-
-    device_reloc.move_bar_commit(install, device, handle)
+        match device_reloc.move_bar_commit(a, device, bus_device) {
+            Ok(()) => {
+                device.on_bar_relocation_status(
+                    a.bar_idx,
+                    BarRelocationStatus::Applied { base: a.new_base },
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed installing BAR {}: {}: at 0x{:x}(0x{:x}); BAR left unmapped \
+until the guest's next decode-enable edge",
+                    a.bar_idx, e, a.new_base, a.len
+                );
+                device.on_bar_relocation_status(a.bar_idx, BarRelocationStatus::Pending);
+            }
+        }
+    }
 }
 
 impl BusDevice for PciConfigMmio {
