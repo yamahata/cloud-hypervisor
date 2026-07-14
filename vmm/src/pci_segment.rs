@@ -564,13 +564,19 @@ mod unit_tests {
     #[derive(Debug)]
     struct MockDeviceRelocation;
     impl DeviceRelocation for MockDeviceRelocation {
-        fn move_bar(
+        fn move_bar_prepare(
             &self,
-            _old_base: u64,
-            _new_base: u64,
-            _len: u64,
+            _params: &pci::ReleaseParams,
             _pci_dev: &mut dyn pci::PciDevice,
-            _region_type: pci::PciBarRegionType,
+        ) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn move_bar_commit(
+            &self,
+            _params: &pci::InstallParams,
+            _pci_dev: &mut dyn pci::PciDevice,
+            _bus_device: &Arc<dyn vm_device::BusDeviceSync>,
         ) -> Result<(), io::Error> {
             Ok(())
         }

@@ -12,7 +12,7 @@ use std::{fmt, io, mem, ptr, result};
 use log::{debug, warn};
 use num_enum::TryFromPrimitive;
 use pci::{
-    BarReprogrammingParams, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
+    BarRelocation, BarRelocationStatus, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
     PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
 use thiserror::Error;
@@ -701,7 +701,7 @@ impl PciDevice for PvmemcontrolPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         (
             self.configuration
                 .write_config_register(reg_idx, offset, data),
@@ -713,8 +713,8 @@ impl PciDevice for PvmemcontrolPciDevice {
         self.configuration.read_config_register(reg_idx)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -766,14 +766,20 @@ impl PciDevice for PvmemcontrolPciDevice {
         _mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for bar in self.bar_regions.drain(..) {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(bar.idx()) {
+                continue;
+            }
             mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
         }
         Ok(())
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> io::Result<()> {
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         for bar in self.bar_regions.iter_mut() {
-            if bar.addr() == old_base {
+            if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
             }
         }

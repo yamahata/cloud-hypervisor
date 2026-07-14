@@ -31,8 +31,8 @@ use crate::vfio::{
     UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError,
 };
 use crate::{
-    BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
-    VfioPciError,
+    BarRelocation, BarRelocationStatus, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError,
+    PciSubclass, VfioPciError,
 };
 
 pub struct VfioUserPciDevice {
@@ -401,10 +401,6 @@ impl PciDevice for VfioUserPciDevice {
             .free_bars(allocator, mmio32_allocator, mmio64_allocator)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -414,7 +410,7 @@ impl PciDevice for VfioUserPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         self.common.write_config_register(reg_idx, offset, data)
     }
 
@@ -430,12 +426,12 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR 0x{old_base:x} -> 0x{new_base:x}");
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        info!("Releasing BAR {bar_idx}");
+        let mut region_found = false;
         for mmio_region in self.common.mmio_regions.iter_mut() {
-            if mmio_region.start.raw_value() == old_base {
-                mmio_region.start = GuestAddress(new_base);
-
+            if mmio_region.index as usize == bar_idx {
+                region_found = true;
                 for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                     // Remove old region
                     // SAFETY: only valid regions are in user_memory_regions
@@ -450,7 +446,27 @@ impl PciDevice for VfioUserPciDevice {
                         )
                     }
                     .map_err(io::Error::other)?;
+                }
+            }
+        }
 
+        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (release)");
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Acquiring BAR {bar_idx} -> 0x{new_base:x}");
+        let mut region_found = false;
+        for mmio_region in self.common.mmio_regions.iter_mut() {
+            if mmio_region.index as usize == bar_idx {
+                region_found = true;
+                // The record still holds the released-from base (the release
+                // side is forbidden to mutate it).
+                let old_base = mmio_region.start.raw_value();
+                mmio_region.start = GuestAddress(new_base);
+
+                for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
                         user_memory_region.start += new_base - old_base;
@@ -476,7 +492,18 @@ impl PciDevice for VfioUserPciDevice {
             }
         }
 
+        debug_assert!(
+            region_found,
+            "no MMIO region for BAR {bar_idx} (install at 0x{new_base:x})"
+        );
+
         Ok(())
+    }
+
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.common
+            .configuration
+            .on_bar_relocation_status(bar_idx, status);
     }
 
     fn id(&self) -> Option<String> {

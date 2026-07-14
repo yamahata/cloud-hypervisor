@@ -4,8 +4,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::result;
 use std::sync::{Arc, Mutex};
-use std::{mem, result};
 
 use byteorder::{ByteOrder, LittleEndian};
 use log::{info, warn};
@@ -14,13 +14,14 @@ use thiserror::Error;
 use vm_device::PciBarType;
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
-use crate::device::BarReprogrammingParams;
+use crate::device::{BarRelocation, BarRelocationStatus, InstallParams, ReleaseParams};
 use crate::{MsixConfig, PciInterruptPin};
 
 // The number of 32bit registers in the config space, 4096 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 1024;
 
 pub(crate) const COMMAND_REG: usize = 1;
+pub(crate) const COMMAND_REG_IO_SPACE_MASK: u32 = 0x0000_0001;
 pub(crate) const COMMAND_REG_MEMORY_SPACE_MASK: u32 = 0x0000_0002;
 const STATUS_REG: usize = 1;
 const STATUS_REG_CAPABILITIES_USED_MASK: u32 = 0x0010_0000;
@@ -416,9 +417,32 @@ pub struct PciConfigurationState {
     rom_bar_used: bool,
     last_capability: Option<(usize, usize)>,
     msix_cap_reg_idx: Option<usize>,
-    // Preserve deferred BAR moves across snapshot and restore.
+    // Preserve deferred BAR moves across snapshot and restore. Each entry
+    // records a BAR that was released (old_base) and not yet re-installed at
+    // its config-space target (new_base). The field predates this fix
+    // (db93c6fdc), so snapshots cross both directions: old snapshots restore
+    // on this code, and snapshots taken here replay on old binaries.
     #[serde(default)]
     pending_bar_reprogram: Vec<BarReprogrammingParams>,
+}
+
+/// Legacy wire shape of an in-flight BAR move in
+/// [`PciConfigurationState::pending_bar_reprogram`], kept for cross-version
+/// snapshots (an old binary replays it as `old_base` -> `new_base`), and
+/// confined here so nothing outside the snapshot path depends on it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct BarReprogrammingParams {
+    /// The BAR slot being reprogrammed (expansion ROM = ROM_BAR_IDX; the
+    /// low/primary slot for a 64-bit BAR). Identifies the BAR across the
+    /// whole relocation, unlike the addresses, which a later config write
+    /// can change again. Old snapshots (pre-index-keying) don't carry
+    /// this field; it only matters for in-flight moves.
+    #[serde(default)]
+    bar_idx: usize,
+    old_base: u64,
+    new_base: u64,
+    len: u64,
+    region_type: PciBarRegionType,
 }
 
 /// Contains the configuration space of a PCI node.
@@ -436,7 +460,83 @@ pub struct PciConfiguration {
     last_capability: Option<(usize, usize)>,
     msix_cap_reg_idx: Option<usize>,
     msix_config: Option<Arc<Mutex<MsixConfig>>>,
-    pending_bar_reprogram: Vec<BarReprogrammingParams>,
+    // BAR relocation state machine.
+    //
+    // A guest relocates a BAR by rewriting its address register(s) and then
+    // toggling the COMMAND decode bit. To keep a multi-BAR swap from hitting a
+    // free-then-allocate overlap, the old location is released eagerly on the
+    // address write and the new one installed later, once decode permits, so
+    // every release precedes every install. Each BAR slot (ROM at ROM_BAR_IDX)
+    // is then in one of four states:
+    //
+    //   BOOT:        mapped_addr = None, pending_relocation = None
+    //                -- the slot at construction, before add_pci_bar /
+    //                   add_pci_rom_bar seeds it (also an unused BAR slot).
+    //   MAPPED(A):   mapped_addr = Some(A), pending_relocation = None
+    //                -- live at A (allocator + bus + guest-physical mapping).
+    //   RELEASED(r): mapped_addr = None,    pending_relocation = Some(r)
+    //                -- old range at r torn down, nothing mapped, awaiting
+    //                   install at the address the guest last wrote.
+    //   RESTORED_INFLIGHT(r): mapped_addr = Some(r), pending_relocation = Some(r)
+    //                -- a snapshot restored mid-move: materialized at the old
+    //                   base r (ranges live) with the move still pending; the
+    //                   next decode edge replays it (release r, then install the
+    //                   target). Still mapped, so NOT "released".
+    //
+    // A BAR's address is recorded in four places that DIVERGE while a move is in
+    // flight; `is_bar_released` reports the released state to teardown paths
+    // (t = the new target the guest just wrote):
+    //
+    //   structure               BOOT   MAPPED(A)   RELEASED(r)  RESTORED_INFLIGHT(r)
+    //   ----------------------  -----  ----------  -----------  --------------------
+    //   bars[slot].addr         0      A           t            t
+    //   bar_regions (device)    -      A           r            r
+    //   mapped_addr[slot]       None   Some(A)     None         Some(r)
+    //   pending_relocation      None   None        Some(r)      Some(r)
+    //   is_bar_released()       false  false       true         false
+    //
+    //   * bars[slot].addr    -- config-space register shadow; follows the
+    //     guest's request, so it jumps to the new target t the instant the
+    //     guest writes, ahead of the actual mapping.
+    //   * bar_regions        -- the device's own record of where the BAR is
+    //     installed (per-device `bar_regions`, VFIO `mmio_regions[].start`, the
+    //     device_tree PciBar resource base); kept at the old base r, its ranges
+    //     torn down, until the install commits.
+    //   * mapped_addr[slot]  -- this layer's copy of the installed address,
+    //     advanced ONLY on a successful install, so it never names an address
+    //     the BAR is not actually mapped at.
+    //   * pending_relocation -- the released-from base r while a move is
+    //     pending; it also pins the PCI segment the install must stay within.
+    //   * is_bar_released()  -- `pending.is_some() && mapped.is_none()`: true
+    //     only in RELEASED, so teardown (`free_bars`) skips a torn-down BAR.
+    //     RESTORED_INFLIGHT is pending yet still mapped, so it reports false and
+    //     is NOT skipped.
+    //
+    // `add_pci_bar` / `add_pci_rom_bar` seed BOOT -> MAPPED at fresh boot;
+    // `PciConfiguration::new` reseeds a restored snapshot (a mid-move BAR to
+    // RESTORED_INFLIGHT). Runtime transitions live in `write_config_register`
+    // (release, plus the immediate move when decode is already on), the
+    // decode-edge drain (emits the deferred install, replaying a
+    // RESTORED_INFLIGHT release first) and `on_bar_relocation_status` (Applied
+    // advances `mapped_addr`; Pending leaves the slot RELEASED to retry). A
+    // 64-bit BAR is tracked only on its low/primary slot.
+    //
+    // `mapped_addr[slot]` is the guest-physical address the BAR is currently
+    // mapped at (allocator + bus + guest-physical mapping), or `None` while
+    // the BAR is released awaiting install. For a 64-bit BAR the bookkeeping
+    // lives only on the LOW/primary slot (the one carrying `r#type`), exactly
+    // as seeded by `add_pci_bar`; the high slot stays `None`. `mapped_addr`
+    // follows relocation *outcomes*: it is updated to a new address only when
+    // an install actually succeeded (see `on_bar_relocation_status`).
+    mapped_addr: [Option<u64>; NUM_BAR_REGS],
+    // Same as `mapped_addr` but for the expansion ROM BAR.
+    rom_mapped_addr: Option<u64>,
+    // BAR slots that were released and not yet re-installed, mapped to the
+    // address they were released from. Installed on the 0->1 transition of
+    // the enable bit for each BAR's space (IOSE for IO
+    // BARs, MSE for memory BARs and the ROM). Indexed by slot (ROM at
+    // ROM_BAR_IDX), `None` where no move is pending.
+    pending_relocation: [Option<u64>; NUM_BAR_REGS + 1],
 }
 
 /// See pci_regs.h in kernel
@@ -530,6 +630,17 @@ pub enum Error {
 }
 pub type Result<T> = result::Result<T, Error>;
 
+/// A BAR address change detected on a config-register write: the slot, the
+/// new target read from the just-written registers, and the BAR's size and
+/// type. Purely an internal detection result -- the release side takes the
+/// released-from address from `mapped_addr`, so no old_base travels here.
+struct BarReprogramming {
+    bar_idx: usize,
+    new_base: u64,
+    len: u64,
+    region_type: PciBarRegionType,
+}
+
 impl PciConfiguration {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -565,7 +676,7 @@ impl PciConfiguration {
                 state.rom_bar_used,
                 state.last_capability,
                 state.msix_cap_reg_idx,
-                state.pending_bar_reprogram,
+                Some(state.pending_bar_reprogram),
             )
         } else {
             let mut registers = [0u32; NUM_CONFIGURATION_REGISTERS];
@@ -605,11 +716,11 @@ impl PciConfiguration {
                 false,
                 None,
                 None,
-                Vec::new(),
+                None,
             )
         };
 
-        PciConfiguration {
+        let mut config = PciConfiguration {
             registers,
             writable_bits,
             bars,
@@ -619,8 +730,71 @@ impl PciConfiguration {
             last_capability,
             msix_cap_reg_idx,
             msix_config,
-            pending_bar_reprogram,
+            // Seeded below when restoring; empty at fresh boot (the
+            // `add_pci_bar`/`add_pci_rom_bar` calls that follow seed these).
+            mapped_addr: [None; NUM_BAR_REGS],
+            rom_mapped_addr: None,
+            pending_relocation: [None; NUM_BAR_REGS + 1],
+        };
+
+        // Restoring from a snapshot: reconstruct the mapping bookkeeping.
+        if let Some(pending_bar_reprogram) = pending_bar_reprogram {
+            // Restore maps every BAR at its device-tree resource address,
+            // which equals the config-space address except for BARs with an
+            // in-flight move (the resource is only updated when a move
+            // commits). Seed "every declared BAR mapped at its config
+            // address, nothing pending" first, then overlay the serialized
+            // in-flight moves.
+            for bar_num in 0..NUM_BAR_REGS {
+                // A BAR's primary slot is the only one carrying `r#type`;
+                // the high half of a 64-bit BAR is `used` but stays `None`,
+                // matching `add_pci_bar`'s boot-time seeding.
+                if config.bars[bar_num].r#type.is_some() {
+                    config.mapped_addr[bar_num] = Some(config.get_bar_addr(bar_num));
+                }
+            }
+            if config.rom_bar_used {
+                config.rom_mapped_addr = Some(u64::from(config.rom_bar_addr & ROM_BAR_ADDR_MASK));
+            }
+
+            // A serialized in-flight move means the BAR was restored at the
+            // address it was RELEASED from (`old_base`, the resource
+            // address), not at the config-space target the guest wrote. Seed
+            // `mapped_addr` with the released-from base and mark the slot
+            // pending, so the guest's decode-enable edge replays the move
+            // (release at old_base, install at the config target).
+            for params in pending_bar_reprogram {
+                if let Some(slot) = config.resolve_pending_slot(&params) {
+                    config.set_mapped_addr(slot, Some(params.old_base));
+                    config.pending_relocation[slot] = Some(params.old_base);
+                } else {
+                    warn!(
+                        "Dropping restored in-flight BAR move {params:x?}: no declared BAR \
+                         matches its config-space target"
+                    );
+                }
+            }
         }
+
+        config
+    }
+
+    /// Maps a restored `pending_bar_reprogram` entry to the BAR slot it
+    /// describes. Trust `bar_idx` when it is consistent with the entry;
+    /// legacy snapshots (pre-index-keying) default it to 0, so fall back to
+    /// scanning for the slot whose config-space target matches the recorded
+    /// move.
+    fn resolve_pending_slot(&self, params: &BarReprogrammingParams) -> Option<usize> {
+        let matches = |slot: usize| {
+            self.bar_region_type(slot) == Some(params.region_type)
+                && self.bar_target(slot) == params.new_base
+        };
+
+        if matches(params.bar_idx) {
+            return Some(params.bar_idx);
+        }
+
+        (0..NUM_BAR_REGS).chain([ROM_BAR_IDX]).find(|&s| matches(s))
     }
 
     fn state(&self) -> PciConfigurationState {
@@ -633,7 +807,25 @@ impl PciConfiguration {
             rom_bar_used: self.rom_bar_used,
             last_capability: self.last_capability,
             msix_cap_reg_idx: self.msix_cap_reg_idx,
-            pending_bar_reprogram: self.pending_bar_reprogram.clone(),
+            // Serialize the in-flight moves in the legacy wire shape:
+            // released-from base (old_base) to current config-space target
+            // (new_base). Old binaries replay these entries as-is.
+            pending_bar_reprogram: self
+                .pending_relocation
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &released_from)| {
+                    released_from.map(|released_from| BarReprogrammingParams {
+                        bar_idx: slot,
+                        old_base: released_from,
+                        new_base: self.bar_target(slot),
+                        len: self.bar_len(slot).unwrap_or(0),
+                        region_type: self
+                            .bar_region_type(slot)
+                            .unwrap_or(PciBarRegionType::Memory32BitRegion),
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -785,6 +977,10 @@ impl PciConfiguration {
         self.bars[bar_idx].used = true;
         self.bars[bar_idx].r#type = Some(config.region_type);
 
+        // The BAR is mapped (allocator/bus/guest-physical mapping) at its
+        // initial address.
+        self.mapped_addr[bar_idx] = Some(config.addr);
+
         Ok(())
     }
 
@@ -820,6 +1016,10 @@ impl PciConfiguration {
         self.rom_bar_size =
             encode_32_bits_bar_size(config.size as u32).ok_or(Error::Encode32BarSize)?;
         self.rom_bar_used = true;
+
+        // The ROM BAR is mapped (allocator/bus/guest-physical mapping) at
+        // its initial address.
+        self.rom_mapped_addr = Some(config.addr);
 
         Ok(())
     }
@@ -903,9 +1103,9 @@ impl PciConfiguration {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> Vec<BarReprogrammingParams> {
+    ) -> BarRelocation {
         if offset as usize + data.len() > 4 {
-            return Vec::new();
+            return BarRelocation::default();
         }
 
         // Handle potential write to MSI-X message control register
@@ -925,6 +1125,10 @@ impl PciConfiguration {
             }
         }
 
+        // Capture the COMMAND register before the write so decode-enable
+        // (IOSE/MSE 0->1) edges can be detected below.
+        let command_before = self.registers[COMMAND_REG];
+
         match data.len() {
             1 => self.write_byte(reg_idx * 4 + offset as usize, data[0]),
             2 => self.write_word(
@@ -935,28 +1139,220 @@ impl PciConfiguration {
             _ => (),
         }
 
-        if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
-            self.pending_bar_reprogram.push(param);
-        }
+        let mut reloc = BarRelocation::default();
 
-        if !self.pending_bar_reprogram.is_empty() {
-            // Return bar reprogramming only if the MSE bit is enabled;
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                info!(
-                    "BAR reprogramming parameter is returned: {:x?}",
-                    self.pending_bar_reprogram
-                );
-                return mem::take(&mut self.pending_bar_reprogram);
+        // Case 1: a BAR address was reprogrammed by this write.
+        if let Some(params) = self.detect_bar_reprogramming(reg_idx, data) {
+            let slot = params.bar_idx;
+
+            if let Some(mapped) = self.mapped_addr(slot) {
+                // Mapped: release the old BAR range eagerly and mark the
+                // slot pending. Install is in the same plan if decode is on
+                // (immediate move), else the decode-enable edge. mapped_addr
+                // advances only on a successful install outcome.
+                reloc.release.push(ReleaseParams {
+                    bar_idx: slot,
+                    base: mapped,
+                    len: params.len,
+                    region_type: params.region_type,
+                });
+                self.set_mapped_addr(slot, None);
+                self.pending_relocation[slot] = Some(mapped);
+
+                if self.decode_enabled(params.region_type) {
+                    reloc.install.push(InstallParams {
+                        bar_idx: slot,
+                        // Released from `mapped`; confines the install to the
+                        // PCI segment that address belongs to.
+                        old_base: mapped,
+                        new_base: params.new_base,
+                        len: params.len,
+                        region_type: params.region_type,
+                    });
+                }
             }
-            info!(
-                "MSE bit is disabled. No BAR reprogramming parameter is returned: {:x?}",
-                self.pending_bar_reprogram
-            );
+            // else: already released. Nothing to emit; the install target
+            // is read from the live registers at drain time, and the
+            // recorded released-from base stays intact.
         }
 
-        Vec::new()
+        // Case 2: commit each space whose decode bit rose 0->1 (shared with the
+        // VFIO mirror). A non-COMMAND write sees no space enabling,
+        // so this is a no-op.
+        self.drain_command_decode_edge(command_before, &mut reloc);
+
+        reloc
+    }
+
+    /// Drain the BAR unblocked by a COMMAND enable (IOSE/MSE 0->1) into
+    /// `reloc`.
+    pub(crate) fn drain_command_decode_edge(
+        &mut self,
+        command_before: u32,
+        reloc: &mut BarRelocation,
+    ) {
+        let command_after = self.registers[COMMAND_REG];
+        for space_mask in [COMMAND_REG_IO_SPACE_MASK, COMMAND_REG_MEMORY_SPACE_MASK] {
+            if command_before & space_mask == 0 && command_after & space_mask != 0 {
+                self.drain_pending_relocation(space_mask, reloc);
+            }
+        }
+
+        if !reloc.is_empty() {
+            info!("BAR relocation plan: {reloc:x?}");
+        }
+    }
+
+    /// Emits the deferred installs for every pending BAR of the space whose
+    /// enable bit is set. Only a successful install unpends a slot, so a failed one
+    /// is retried at the guest's next decode-enable edge.
+    fn drain_pending_relocation(&mut self, space_mask: u32, reloc: &mut BarRelocation) {
+        let pending: Vec<usize> = (0..self.pending_relocation.len())
+            .filter(|&slot| self.pending_relocation[slot].is_some())
+            .collect();
+
+        for slot in pending {
+            let Some(region_type) = self.bar_region_type(slot) else {
+                continue;
+            };
+            if Self::decode_mask(region_type) != space_mask {
+                continue;
+            }
+            let len = self.bar_len(slot).unwrap_or(0);
+
+            // A restored in-flight move (see `PciConfiguration::new`) left
+            // the BAR mapped at its released-from address: replay the
+            // release first so the whole move runs here exactly as it would
+            // have run on the snapshot source.
+            if let Some(mapped) = self.mapped_addr(slot) {
+                reloc.release.push(ReleaseParams {
+                    bar_idx: slot,
+                    base: mapped,
+                    len,
+                    region_type,
+                });
+                self.set_mapped_addr(slot, None);
+            }
+
+            // The BAR belongs to the PCI segment whose MMIO window held the
+            // address it was released from; carry that base so the install
+            // confines the new range to the same segment window.
+            let old_base = self.pending_relocation[slot].unwrap_or_else(|| self.bar_target(slot));
+
+            reloc.install.push(InstallParams {
+                bar_idx: slot,
+                old_base,
+                new_base: self.bar_target(slot),
+                len,
+                region_type,
+            });
+        }
+    }
+
+    /// Reconciles the mapping bookkeeping with an install status.
+    /// `mapped_addr` advances ONLY here, on success. A failed install leaves
+    /// the slot pending and unmapped -- nothing lies about being mapped --
+    /// and it is re-emitted at the guest's next enabling the space.
+    pub fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        match status {
+            BarRelocationStatus::Applied { base } => {
+                self.set_mapped_addr(bar_idx, Some(base));
+                self.pending_relocation[bar_idx] = None;
+            }
+            BarRelocationStatus::Pending => {
+                // The slot was inserted into `pending_relocation` when its
+                // release was emitted and stays there; nothing is mapped.
+                if self.pending_relocation[bar_idx].is_none() {
+                    warn!("BAR {bar_idx} install reported pending but no release was recorded");
+                }
+            }
+        }
+    }
+
+    /// Returns true while the BAR is released awaiting install: its
+    /// allocator range, bus range and guest-physical mappings are already
+    /// torn down, so teardown paths (e.g. `free_bars`) must skip it.
+    ///
+    /// `pending_relocation` alone is not the right test: a restored
+    /// in-flight move is pending AND mapped (the restore path materializes
+    /// the BAR at its released-from base), so its ranges are live and
+    /// teardown must NOT skip it -- hence the `mapped_addr` check.
+    pub fn is_bar_released(&self, bar_idx: usize) -> bool {
+        self.pending_relocation[bar_idx].is_some() && self.mapped_addr(bar_idx).is_none()
+    }
+
+    /// The COMMAND-register enabling bit for BAR's space: IOSE for IO
+    /// BARs, MSE for 32/64-bit memory BARs and the expansion ROM.
+    fn decode_mask(region_type: PciBarRegionType) -> u32 {
+        match region_type {
+            PciBarRegionType::IoRegion => COMMAND_REG_IO_SPACE_MASK,
+            _ => COMMAND_REG_MEMORY_SPACE_MASK,
+        }
+    }
+
+    fn decode_enabled(&self, region_type: PciBarRegionType) -> bool {
+        self.registers[COMMAND_REG] & Self::decode_mask(region_type) != 0
+    }
+
+    /// Returns the currently-mapped address for a BAR slot (ROM_BAR_IDX for
+    /// the ROM BAR), or `None` while the BAR is released.
+    fn mapped_addr(&self, slot: usize) -> Option<u64> {
+        if slot == ROM_BAR_IDX {
+            self.rom_mapped_addr
+        } else {
+            self.mapped_addr[slot]
+        }
+    }
+
+    fn set_mapped_addr(&mut self, slot: usize, addr: Option<u64>) {
+        if slot == ROM_BAR_IDX {
+            self.rom_mapped_addr = addr;
+        } else {
+            self.mapped_addr[slot] = addr;
+        }
+    }
+
+    /// The install target for a BAR slot, assembled from the live
+    /// guest-visible registers (masked by the writable bits, both dwords
+    /// for a 64-bit BAR). Deliberately NOT the `bars[].addr` shadow: the
+    /// shadow lags the registers when the guest writes the high dword of a
+    /// 64-bit BAR first, or rewrites an address while the BAR is released.
+    fn bar_target(&self, slot: usize) -> u64 {
+        if slot == ROM_BAR_IDX {
+            return u64::from(self.registers[ROM_BAR_REG] & self.writable_bits[ROM_BAR_REG]);
+        }
+
+        let reg_idx = BAR0_REG + slot;
+        let mut addr = u64::from(self.registers[reg_idx] & self.writable_bits[reg_idx]);
+        if self.bars[slot].r#type == Some(PciBarRegionType::Memory64BitRegion) {
+            addr |= u64::from(self.registers[reg_idx + 1] & self.writable_bits[reg_idx + 1]) << 32;
+        }
+
+        addr
+    }
+
+    fn bar_len(&self, slot: usize) -> Option<u64> {
+        if slot == ROM_BAR_IDX {
+            return decode_32_bits_bar_size(self.rom_bar_size).map(u64::from);
+        }
+
+        match self.bars[slot].r#type? {
+            PciBarRegionType::Memory64BitRegion => {
+                decode_64_bits_bar_size(self.bars[slot + 1].size, self.bars[slot].size)
+            }
+            _ => decode_32_bits_bar_size(self.bars[slot].size).map(u64::from),
+        }
+    }
+
+    fn bar_region_type(&self, slot: usize) -> Option<PciBarRegionType> {
+        if slot == ROM_BAR_IDX {
+            // The expansion ROM is a 32-bit memory region.
+            return self
+                .rom_bar_used
+                .then_some(PciBarRegionType::Memory32BitRegion);
+        }
+
+        self.bars.get(slot)?.r#type
     }
 
     pub fn read_config_register(&self, reg_idx: usize) -> u32 {
@@ -967,7 +1363,7 @@ impl PciConfiguration {
         &mut self,
         reg_idx: usize,
         data: &[u8],
-    ) -> Option<BarReprogrammingParams> {
+    ) -> Option<BarReprogramming> {
         if data.len() != 4 {
             return None;
         }
@@ -1002,7 +1398,6 @@ impl PciConfiguration {
                     "Detected BAR reprogramming: (BAR {}) 0x{:x}->0x{:x}",
                     bar_idx, self.bars[bar_idx].addr, value
                 );
-                let old_base = u64::from(self.bars[bar_idx].addr & mask);
                 let new_base = u64::from(value & mask);
                 let len = u64::from(
                     decode_32_bits_bar_size(self.bars[bar_idx].size)
@@ -1013,8 +1408,8 @@ impl PciConfiguration {
 
                 self.bars[bar_idx].addr = value;
 
-                return Some(BarReprogrammingParams {
-                    old_base,
+                return Some(BarReprogramming {
+                    bar_idx,
                     new_base,
                     len,
                     region_type,
@@ -1028,8 +1423,6 @@ impl PciConfiguration {
                     "Detected BAR reprogramming: (BAR {}) 0x{:x}->0x{:x}",
                     bar_idx, self.bars[bar_idx].addr, value
                 );
-                let old_base = (u64::from(self.bars[bar_idx].addr & mask) << 32)
-                    | u64::from(self.bars[bar_idx - 1].addr & self.writable_bits[reg_idx - 1]);
                 let new_base = (u64::from(value & mask) << 32)
                     | u64::from(self.registers[reg_idx - 1] & self.writable_bits[reg_idx - 1]);
                 let len =
@@ -1041,8 +1434,11 @@ impl PciConfiguration {
                 self.bars[bar_idx].addr = value;
                 self.bars[bar_idx - 1].addr = self.registers[reg_idx - 1];
 
-                return Some(BarReprogrammingParams {
-                    old_base,
+                // This branch fires on the HIGH-dword write; the BAR's
+                // canonical slot (the one carrying r#type) is the
+                // LOW/primary one.
+                return Some(BarReprogramming {
+                    bar_idx: bar_idx - 1,
                     new_base,
                     len,
                     region_type,
@@ -1058,7 +1454,6 @@ impl PciConfiguration {
                 "Detected ROM BAR reprogramming: (Expansion ROM BAR) 0x{:x}->0x{:x}",
                 self.rom_bar_addr, value
             );
-            let old_base = u64::from(self.rom_bar_addr & mask);
             let new_base = u64::from(value & mask);
             let len = u64::from(
                 decode_32_bits_bar_size(self.rom_bar_size)
@@ -1069,8 +1464,8 @@ impl PciConfiguration {
 
             self.rom_bar_addr = value;
 
-            return Some(BarReprogrammingParams {
-                old_base,
+            return Some(BarReprogramming {
+                bar_idx: ROM_BAR_IDX,
                 new_base,
                 len,
                 region_type,
@@ -1078,63 +1473,6 @@ impl PciConfiguration {
         }
 
         None
-    }
-
-    pub(crate) fn pending_bar_reprogram(&self) -> Vec<BarReprogrammingParams> {
-        self.pending_bar_reprogram.clone()
-    }
-
-    pub(crate) fn clear_pending_bar_reprogram(&mut self) {
-        self.pending_bar_reprogram = Vec::new();
-    }
-
-    /// Restore BAR address after a failed move. This undoes the premature
-    /// address update in detect_bar_reprogramming() so that config space
-    /// stays consistent with the actual MMIO mapping.
-    pub fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        match params.region_type {
-            PciBarRegionType::Memory64BitRegion => {
-                // 64-bit BAR spans two slots: bars[i] (low, type Memory64BitRegion)
-                // and bars[i+1] (high, type None). Mirror detect_bar_reprogramming
-                // by matching the combined address and restoring both halves.
-                for i in 0..NUM_BAR_REGS - 1 {
-                    if self.bars[i].r#type != Some(PciBarRegionType::Memory64BitRegion) {
-                        continue;
-                    }
-                    let low_mask = self.writable_bits[BAR0_REG + i];
-                    let high_mask = self.writable_bits[BAR0_REG + i + 1];
-                    let current = (u64::from(self.bars[i + 1].addr & high_mask) << 32)
-                        | u64::from(self.bars[i].addr & low_mask);
-                    if current == params.new_base {
-                        let old_low = params.old_base as u32;
-                        let old_high = (params.old_base >> 32) as u32;
-                        self.bars[i].addr = old_low;
-                        self.bars[i + 1].addr = old_high;
-                        self.registers[BAR0_REG + i] =
-                            (self.registers[BAR0_REG + i] & !low_mask) | (old_low & low_mask);
-                        self.registers[BAR0_REG + i + 1] = (self.registers[BAR0_REG + i + 1]
-                            & !high_mask)
-                            | (old_high & high_mask);
-                        return;
-                    }
-                }
-            }
-            _ => {
-                // 32-bit Memory or IO BAR
-                for i in 0..NUM_BAR_REGS {
-                    let mask = self.writable_bits[BAR0_REG + i];
-                    if self.bars[i].r#type == Some(params.region_type)
-                        && u64::from(self.bars[i].addr & mask) == params.new_base
-                    {
-                        let old = params.old_base as u32;
-                        self.bars[i].addr = old;
-                        self.registers[BAR0_REG + i] =
-                            (self.registers[BAR0_REG + i] & !mask) | (old & mask);
-                        return;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1335,5 +1673,489 @@ mod unit_tests {
         assert_eq!(class_code, 0x04);
         assert_eq!(subclass, 0x01);
         assert_eq!(prog_if, 0x5a);
+    }
+
+    // ---- Deferred BAR relocation state machine ---------------------------
+
+    const RELOC_BAR_SIZE: u64 = 0x1000;
+    const ADDR_A: u64 = 0x1000_0000;
+    const ADDR_B: u64 = 0x2000_0000;
+    const IOSE: u32 = COMMAND_REG_IO_SPACE_MASK;
+    const MSE: u32 = COMMAND_REG_MEMORY_SPACE_MASK;
+
+    fn reloc_test_config(state: Option<PciConfigurationState>) -> PciConfiguration {
+        PciConfiguration::new(
+            0x1234,
+            0x5678,
+            0x1,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            None,
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            None,
+            state,
+        )
+    }
+
+    fn add_mem32_bar(cfg: &mut PciConfiguration, idx: usize, addr: u64) {
+        cfg.add_pci_bar(
+            &PciBarConfiguration::default()
+                .set_index(idx)
+                .set_address(addr)
+                .set_size(RELOC_BAR_SIZE)
+                .set_region_type(PciBarRegionType::Memory32BitRegion)
+                .set_prefetchable(PciBarPrefetchable::NotPrefetchable),
+        )
+        .unwrap();
+    }
+
+    fn add_io_bar(cfg: &mut PciConfiguration, idx: usize, addr: u64, size: u64) {
+        cfg.add_pci_bar(
+            &PciBarConfiguration::default()
+                .set_index(idx)
+                .set_address(addr)
+                .set_size(size)
+                .set_region_type(PciBarRegionType::IoRegion)
+                .set_prefetchable(PciBarPrefetchable::NotPrefetchable),
+        )
+        .unwrap();
+    }
+
+    fn write_bar(cfg: &mut PciConfiguration, bar_idx: usize, addr: u32) -> BarRelocation {
+        cfg.write_config_register(BAR0_REG + bar_idx, 0, &addr.to_le_bytes())
+    }
+
+    fn write_command(cfg: &mut PciConfiguration, value: u32) -> BarRelocation {
+        cfg.write_config_register(COMMAND_REG, 0, &(value as u16).to_le_bytes())
+    }
+
+    /// Mirrors what pci::bus::apply_bar_relocation reports back on a
+    /// successful drive of the plan: one Applied outcome per install.
+    fn apply_ok(cfg: &mut PciConfiguration, reloc: &BarRelocation) {
+        for a in &reloc.install {
+            cfg.on_bar_relocation_status(
+                a.bar_idx,
+                BarRelocationStatus::Applied { base: a.new_base },
+            );
+        }
+    }
+
+    /// Regression test for the BAR-reprogramming overlap seen in the
+    /// field with GPU VFIO passthrough.
+    ///
+    /// A guest can rebalance two BARs by swapping their addresses while the
+    /// Memory-Space-Enable (MSE) bit is cleared, then re-enabling MSE.
+    /// Because BAR0's new address is BAR1's old address (and vice versa),
+    /// releasing and installing each BAR one-at-a-time would create a
+    /// transient overlap (the allocator / KVM memslot conflict this fix
+    /// addresses). Each BAR-address write performed while MSE is cleared
+    /// must ONLY release the old mapping (deferring the install), and the
+    /// later MSE 0->1 write must install BOTH BARs at once.
+    #[test]
+    fn test_bar_reprogram_swap_defers_until_mse() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+        add_mem32_bar(&mut cfg, 1, ADDR_B);
+
+        // A fresh device boots with COMMAND == 0: MSE starts cleared.
+        assert_eq!(cfg.read_config_register(COMMAND_REG) & MSE, 0);
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_A));
+        assert_eq!(cfg.mapped_addr[1], Some(ADDR_B));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+
+        // Step 1: SWAP the addresses while MSE is cleared. Each write must
+        // release exactly its own old mapping and install nothing.
+        let reloc0 = write_bar(&mut cfg, 0, ADDR_B as u32);
+        assert_eq!(reloc0.release.len(), 1);
+        assert_eq!(reloc0.release[0].bar_idx, 0);
+        assert_eq!(reloc0.release[0].base, ADDR_A);
+        assert_eq!(reloc0.release[0].len, RELOC_BAR_SIZE);
+        assert!(reloc0.install.is_empty(), "install must wait for MSE");
+        assert_eq!(cfg.mapped_addr[0], None);
+        assert_eq!(cfg.pending_relocation[0], Some(ADDR_A));
+        assert_eq!(cfg.mapped_addr[1], Some(ADDR_B));
+
+        let reloc1 = write_bar(&mut cfg, 1, ADDR_A as u32);
+        assert_eq!(reloc1.release.len(), 1);
+        assert_eq!(reloc1.release[0].bar_idx, 1);
+        assert_eq!(reloc1.release[0].base, ADDR_B);
+        assert!(reloc1.install.is_empty(), "install must wait for MSE");
+        assert_eq!(cfg.mapped_addr[1], None);
+        assert_eq!(cfg.pending_relocation[1], Some(ADDR_B));
+
+        // Step 2: enable MSE. Both pending BARs must be installed in one
+        // plan, in ascending slot order (deterministic array drain),
+        // with no further release.
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert!(reloc_mse.release.is_empty());
+        assert_eq!(reloc_mse.install.len(), 2);
+        assert_eq!(reloc_mse.install[0].bar_idx, 0);
+        assert_eq!(reloc_mse.install[0].new_base, ADDR_B);
+        assert_eq!(reloc_mse.install[1].bar_idx, 1);
+        assert_eq!(reloc_mse.install[1].new_base, ADDR_A);
+
+        // The plan does not update the bookkeeping by itself: only the
+        // install outcomes do.
+        assert_eq!(cfg.mapped_addr[0], None);
+        apply_ok(&mut cfg, &reloc_mse);
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_B));
+        assert_eq!(cfg.mapped_addr[1], Some(ADDR_A));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// Reprogramming a 64-bit memory BAR (the flavor virtio, VFIO and vDPA
+    /// devices actually use) while MSE is cleared, low dword first. The
+    /// 64-bit detection path fires on the HIGH-dword write while the
+    /// bookkeeping lives on the LOW/primary slot.
+    #[test]
+    fn test_bar_reprogram_64bit_defers_until_mse() {
+        const OLD_ADDR: u64 = 0x2_0000_0000;
+        const NEW_LOW: u32 = 0x3000_0000;
+        const NEW_HIGH: u32 = 0x3;
+        const NEW_ADDR: u64 = ((NEW_HIGH as u64) << 32) | NEW_LOW as u64;
+
+        let mut cfg = reloc_test_config(None);
+        cfg.add_pci_bar(
+            &PciBarConfiguration::default()
+                .set_index(0)
+                .set_address(OLD_ADDR)
+                .set_size(0x2000)
+                .set_region_type(PciBarRegionType::Memory64BitRegion)
+                .set_prefetchable(PciBarPrefetchable::Prefetchable),
+        )
+        .unwrap();
+
+        // Bookkeeping lives on the LOW slot; the HIGH slot has none.
+        assert_eq!(cfg.mapped_addr[0], Some(OLD_ADDR));
+        assert_eq!(cfg.mapped_addr[1], None);
+
+        // LOW dword write: the 64-bit path defers everything to the
+        // high-dword write, so the plan must be empty.
+        let reloc_low = write_bar(&mut cfg, 0, NEW_LOW);
+        assert!(reloc_low.is_empty());
+
+        // HIGH dword write: release fires, keyed to the LOW/primary slot.
+        let reloc_high = write_bar(&mut cfg, 1, NEW_HIGH);
+        assert_eq!(reloc_high.release.len(), 1);
+        assert_eq!(reloc_high.release[0].bar_idx, 0);
+        assert_eq!(reloc_high.release[0].base, OLD_ADDR);
+        assert_eq!(reloc_high.release[0].len, 0x2000);
+        assert_eq!(
+            reloc_high.release[0].region_type,
+            PciBarRegionType::Memory64BitRegion
+        );
+        assert!(reloc_high.install.is_empty());
+        assert_eq!(cfg.mapped_addr[0], None);
+        assert_eq!(cfg.pending_relocation[0], Some(OLD_ADDR));
+
+        // MSE enable: the install must target the full 64-bit address
+        // reassembled from both dwords.
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert!(reloc_mse.release.is_empty());
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(reloc_mse.install[0].bar_idx, 0);
+        assert_eq!(reloc_mse.install[0].new_base, NEW_ADDR);
+
+        apply_ok(&mut cfg, &reloc_mse);
+        assert_eq!(cfg.mapped_addr[0], Some(NEW_ADDR));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// A 64-bit BAR written HIGH dword first: detection fires on the high
+    /// write (releasing the BAR), the low dword lands afterwards, only in
+    /// the registers. The install target is assembled from the live
+    /// registers at drain time, so it must carry the full new address --
+    /// asserting on bar_target() reading the registers rather than the
+    /// bars[] shadow, which the low-dword write never syncs.
+    #[test]
+    fn test_bar_reprogram_64bit_high_dword_first() {
+        const OLD_ADDR: u64 = 0x2_0000_0000;
+        const NEW_LOW: u32 = 0x3000_0000;
+        const NEW_HIGH: u32 = 0x3;
+        const NEW_ADDR: u64 = ((NEW_HIGH as u64) << 32) | NEW_LOW as u64;
+
+        let mut cfg = reloc_test_config(None);
+        cfg.add_pci_bar(
+            &PciBarConfiguration::default()
+                .set_index(0)
+                .set_address(OLD_ADDR)
+                .set_size(0x2000)
+                .set_region_type(PciBarRegionType::Memory64BitRegion)
+                .set_prefetchable(PciBarPrefetchable::Prefetchable),
+        )
+        .unwrap();
+
+        // HIGH dword first: the high-dword branch fires immediately
+        // (the high half changed), releasing the BAR.
+        let reloc_high = write_bar(&mut cfg, 1, NEW_HIGH);
+        assert_eq!(reloc_high.release.len(), 1);
+        assert_eq!(reloc_high.release[0].base, OLD_ADDR);
+        assert!(cfg.pending_relocation[0].is_some());
+
+        // LOW dword second: the BAR is already released, nothing further
+        // is emitted; the write lands in the registers.
+        let reloc_low = write_bar(&mut cfg, 0, NEW_LOW);
+        assert!(reloc_low.is_empty());
+
+        // The install at the MSE edge must use the full guest-visible
+        // address, not a stale low dword.
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(
+            reloc_mse.install[0].new_base, NEW_ADDR,
+            "install target must be assembled from the live registers"
+        );
+    }
+
+    /// A BAR write while MSE is already on is an immediate move: one plan
+    /// carrying both the release and the install, with the bookkeeping
+    /// updated only by the install outcome.
+    #[test]
+    fn test_bar_reprogram_immediate_when_mse_on() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+        assert!(write_command(&mut cfg, MSE).is_empty());
+
+        let reloc = write_bar(&mut cfg, 0, ADDR_B as u32);
+        assert_eq!(reloc.release.len(), 1);
+        assert_eq!(reloc.release[0].base, ADDR_A);
+        assert_eq!(reloc.install.len(), 1);
+        assert_eq!(reloc.install[0].new_base, ADDR_B);
+
+        // Mid-plan the slot is released-pending; the Applied outcome
+        // finalizes it.
+        assert_eq!(cfg.mapped_addr[0], None);
+        assert_eq!(cfg.pending_relocation[0], Some(ADDR_A));
+        apply_ok(&mut cfg, &reloc);
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_B));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// A second BAR-address write while the BAR is already released must
+    /// not emit a second release (that would double-free the allocator
+    /// range); the recorded released-from base stays the original and the
+    /// eventual install targets the LAST written address.
+    #[test]
+    fn test_bar_rewrite_while_released_keeps_release_base() {
+        const ADDR_C: u64 = 0x3000_0000;
+
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+
+        let first = write_bar(&mut cfg, 0, ADDR_B as u32);
+        assert_eq!(first.release.len(), 1);
+
+        let second = write_bar(&mut cfg, 0, ADDR_C as u32);
+        assert!(
+            second.is_empty(),
+            "rewrite while released must not release again"
+        );
+        assert_eq!(cfg.pending_relocation[0], Some(ADDR_A));
+
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(reloc_mse.install[0].new_base, ADDR_C);
+    }
+
+    /// Writing the address back to its original value while released, then
+    /// enabling MSE: the install targets the original address, exercising
+    /// the delta-zero path in the device commits.
+    #[test]
+    fn test_bar_write_back_to_original_then_enable() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+
+        write_bar(&mut cfg, 0, ADDR_B as u32);
+        assert!(write_bar(&mut cfg, 0, ADDR_A as u32).is_empty());
+
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(reloc_mse.install[0].new_base, ADDR_A);
+    }
+
+    /// A failed install (Pending outcome) leaves the BAR released and
+    /// pending, and the next decode-enable edge re-emits the install with
+    /// the same released-from base.
+    #[test]
+    fn test_failed_install_stays_pending_and_retries_on_next_edge() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+
+        write_bar(&mut cfg, 0, ADDR_B as u32);
+        let first_edge = write_command(&mut cfg, MSE);
+        assert_eq!(first_edge.install.len(), 1);
+
+        // The install failed: nothing is mapped, the slot stays pending.
+        cfg.on_bar_relocation_status(0, BarRelocationStatus::Pending);
+        assert_eq!(cfg.mapped_addr[0], None);
+        assert_eq!(cfg.pending_relocation[0], Some(ADDR_A));
+
+        // The guest toggles MSE: the drain re-emits the same install.
+        assert!(write_command(&mut cfg, 0).is_empty());
+        let second_edge = write_command(&mut cfg, MSE);
+        assert_eq!(second_edge.install.len(), 1);
+        assert_eq!(second_edge.install[0].new_base, ADDR_B);
+
+        apply_ok(&mut cfg, &second_edge);
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_B));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// IO BARs are gated on IOSE (COMMAND bit 0), memory BARs on MSE (bit
+    /// 1): enabling one space must not drain the other's pending BARs, and
+    /// one write raising both bits drains both.
+    #[test]
+    fn test_io_bar_gated_on_iose_not_mse() {
+        const IO_OLD: u64 = 0x1000;
+        const IO_NEW: u64 = 0x2000;
+
+        let mut cfg = reloc_test_config(None);
+        add_io_bar(&mut cfg, 0, IO_OLD, 0x100);
+        add_mem32_bar(&mut cfg, 1, ADDR_A);
+
+        // Move both BARs with all decode off.
+        let io_reloc = write_bar(&mut cfg, 0, IO_NEW as u32);
+        assert_eq!(io_reloc.release.len(), 1);
+        assert_eq!(io_reloc.release[0].region_type, PciBarRegionType::IoRegion);
+        let mem_reloc = write_bar(&mut cfg, 1, ADDR_B as u32);
+        assert_eq!(mem_reloc.release.len(), 1);
+
+        // MSE alone drains only the memory BAR.
+        let mse_edge = write_command(&mut cfg, MSE);
+        assert_eq!(mse_edge.install.len(), 1);
+        assert_eq!(mse_edge.install[0].bar_idx, 1);
+        apply_ok(&mut cfg, &mse_edge);
+        assert!(cfg.pending_relocation[0].is_some());
+
+        // IOSE drains the IO BAR.
+        let iose_edge = write_command(&mut cfg, MSE | IOSE);
+        assert_eq!(iose_edge.install.len(), 1);
+        assert_eq!(iose_edge.install[0].bar_idx, 0);
+        assert_eq!(iose_edge.install[0].new_base, IO_NEW);
+        apply_ok(&mut cfg, &iose_edge);
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+
+        // And a single write raising both bits drains both spaces.
+        let mut cfg2 = reloc_test_config(None);
+        add_io_bar(&mut cfg2, 0, IO_OLD, 0x100);
+        add_mem32_bar(&mut cfg2, 1, ADDR_A);
+        write_bar(&mut cfg2, 0, IO_NEW as u32);
+        write_bar(&mut cfg2, 1, ADDR_B as u32);
+        let both_edge = write_command(&mut cfg2, MSE | IOSE);
+        assert_eq!(both_edge.install.len(), 2);
+    }
+
+    /// The expansion ROM BAR defers on MSE like a memory BAR, with its
+    /// bookkeeping under ROM_BAR_IDX.
+    #[test]
+    fn test_rom_bar_reprogram_defers_until_mse() {
+        const ROM_OLD: u64 = 0x4000_0000;
+        const ROM_NEW: u64 = 0x4100_0000;
+        const ROM_SIZE: u64 = 0x1_0000;
+
+        let mut cfg = reloc_test_config(None);
+        cfg.add_pci_rom_bar(
+            &PciBarConfiguration::default()
+                .set_index(ROM_BAR_IDX)
+                .set_address(ROM_OLD)
+                .set_size(ROM_SIZE)
+                .set_region_type(PciBarRegionType::Memory32BitRegion)
+                .set_prefetchable(PciBarPrefetchable::NotPrefetchable),
+            0x1,
+        )
+        .unwrap();
+        assert_eq!(cfg.rom_mapped_addr, Some(ROM_OLD));
+
+        let reloc =
+            cfg.write_config_register(ROM_BAR_REG, 0, &(ROM_NEW as u32 | 0x1).to_le_bytes());
+        assert_eq!(reloc.release.len(), 1);
+        assert_eq!(reloc.release[0].bar_idx, ROM_BAR_IDX);
+        assert_eq!(reloc.release[0].base, ROM_OLD);
+        assert_eq!(reloc.release[0].len, ROM_SIZE);
+        assert!(reloc.install.is_empty());
+        assert_eq!(cfg.rom_mapped_addr, None);
+        assert_eq!(cfg.pending_relocation[ROM_BAR_IDX], Some(ROM_OLD));
+
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(reloc_mse.install[0].bar_idx, ROM_BAR_IDX);
+        assert_eq!(reloc_mse.install[0].new_base, ROM_NEW);
+
+        apply_ok(&mut cfg, &reloc_mse);
+        assert_eq!(cfg.rom_mapped_addr, Some(ROM_NEW));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// Mid-window snapshot round-trip. A snapshot taken while a BAR is
+    /// released (decode off) serializes the in-flight move; the restored
+    /// configuration must record the BAR as mapped at the RELEASED-FROM
+    /// base (where the restore path materializes it, since the device-tree
+    /// resource only updates on commit) and pending, so the post-restore
+    /// enable edge replays the whole move: release at the old base, then
+    /// install at the guest-written target.
+    #[test]
+    fn test_mid_window_snapshot_restore_replays_move() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+        write_bar(&mut cfg, 0, ADDR_B as u32);
+        assert!(cfg.pending_relocation[0].is_some());
+
+        let state = cfg.state();
+        let restored_cfg = reloc_test_config(Some(state));
+        let mut cfg = restored_cfg;
+
+        // The restore seeding: mapped at the released-from base (NOT the
+        // config-space target, where nothing is mapped), pending set, and
+        // the guest-visible registers still carrying the target.
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_A));
+        assert_eq!(cfg.pending_relocation[0], Some(ADDR_A));
+        assert_eq!(
+            u64::from(cfg.read_config_register(BAR0_REG) & 0xffff_fff0),
+            ADDR_B
+        );
+
+        // The post-restore enable edge replays the move in one plan.
+        let reloc_mse = write_command(&mut cfg, MSE);
+        assert_eq!(reloc_mse.release.len(), 1, "restored move must re-release");
+        assert_eq!(reloc_mse.release[0].base, ADDR_A);
+        assert_eq!(reloc_mse.install.len(), 1);
+        assert_eq!(reloc_mse.install[0].new_base, ADDR_B);
+
+        apply_ok(&mut cfg, &reloc_mse);
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_B));
+        assert!(cfg.pending_relocation.iter().all(|e| e.is_none()));
+    }
+
+    /// A snapshot written by a binary without bar_idx in the serialized
+    /// params (the supported N->N+1 live-migration path) deserializes with
+    /// bar_idx defaulted to 0; the restore must resolve the entry to the
+    /// slot whose config-space target matches the recorded move.
+    #[test]
+    fn test_legacy_snapshot_without_bar_idx_resolves_slot() {
+        let mut cfg = reloc_test_config(None);
+        add_mem32_bar(&mut cfg, 0, ADDR_A);
+        add_mem32_bar(&mut cfg, 3, ADDR_B);
+
+        // Move BAR 3 (not BAR 0!) while decode is off.
+        const TARGET: u64 = 0x3000_0000;
+        write_bar(&mut cfg, 3, TARGET as u32);
+
+        let mut state = cfg.state();
+        assert_eq!(state.pending_bar_reprogram.len(), 1);
+        assert_eq!(state.pending_bar_reprogram[0].bar_idx, 3);
+        // Simulate the legacy wire format: no bar_idx field, serde default.
+        state.pending_bar_reprogram[0].bar_idx = 0;
+
+        let cfg = reloc_test_config(Some(state));
+
+        // BAR 0 is untouched (bar_idx 0 does not match the recorded
+        // target); BAR 3 is the pending one, mapped at its released-from
+        // base.
+        assert_eq!(cfg.mapped_addr[0], Some(ADDR_A));
+        assert!(cfg.pending_relocation[0].is_none());
+        assert_eq!(cfg.mapped_addr[3], Some(ADDR_B));
+        assert_eq!(cfg.pending_relocation[3], Some(ADDR_B));
     }
 }

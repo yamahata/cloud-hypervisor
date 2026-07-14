@@ -12,9 +12,9 @@ use std::{io, result};
 use anyhow::anyhow;
 use log::{debug, error, warn};
 use pci::{
-    BarReprogrammingParams, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
-    PciBarRegionType, PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType,
-    PciSubclass,
+    BarRelocation, BarRelocationStatus, PCI_CONFIGURATION_ID, PciBarConfiguration,
+    PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciDevice,
+    PciDeviceError, PciHeaderType, PciSubclass,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -189,8 +189,8 @@ impl IvshmemDevice {
         self.configuration.get_bar_addr(IVSHMEM_BAR0_IDX)
     }
 
-    pub fn data_bar_addr(&self) -> u64 {
-        self.configuration.get_bar_addr(IVSHMEM_BAR2_IDX)
+    pub fn data_bar_index(&self) -> usize {
+        IVSHMEM_BAR2_IDX
     }
 
     fn state(&self) -> IvshmemDeviceState {
@@ -310,7 +310,7 @@ impl PciDevice for IvshmemDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         (
             self.configuration
                 .write_config_register(reg_idx, offset, data),
@@ -351,15 +351,22 @@ impl PciDevice for IvshmemDevice {
         None
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> io::Result<()> {
-        if new_base == self.data_bar_addr() {
-            if let Some(old_mapping) = self.userspace_mapping.take() {
-                self.ivshmem_ops
-                    .lock()
-                    .unwrap()
-                    .unmap_ram_region(old_mapping)
-                    .map_err(io::Error::other)?;
-            }
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> io::Result<()> {
+        if bar_idx == IVSHMEM_BAR2_IDX
+            && let Some(old_mapping) = self.userspace_mapping.take()
+        {
+            self.ivshmem_ops
+                .lock()
+                .unwrap()
+                .unmap_ram_region(old_mapping)
+                .map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
+        if bar_idx == IVSHMEM_BAR2_IDX {
             let (region, new_mapping) = self
                 .ivshmem_ops
                 .lock()
@@ -373,7 +380,7 @@ impl PciDevice for IvshmemDevice {
             self.set_region(region, new_mapping);
         }
         for bar in self.bar_regions.iter_mut() {
-            if bar.addr() == old_base {
+            if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
             }
         }
@@ -381,8 +388,8 @@ impl PciDevice for IvshmemDevice {
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

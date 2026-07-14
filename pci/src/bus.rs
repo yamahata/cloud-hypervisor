@@ -11,12 +11,14 @@ use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::warn;
+use log::error;
 use thiserror::Error;
-use vm_device::BusDevice;
+use vm_device::{BusDevice, BusDeviceSync};
 
 use crate::configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType};
-use crate::device::{BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError, PciDevice};
+use crate::device::{
+    BarRelocation, BarRelocationStatus, DeviceRelocation, Error as PciDeviceError, PciDevice,
+};
 
 /// Denotes the PCI device ID of a bus' root bridge device.
 pub const PCI_ROOT_DEVICE_ID: u8 = 0;
@@ -86,7 +88,7 @@ impl PciDevice for PciRoot {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         (
             self.config.write_config_register(reg_idx, offset, data),
             None,
@@ -113,20 +115,36 @@ enum DeviceIdState {
     Allocated,
 }
 
+/// A device attached to the PCI bus: the PCI-facing trait object plus
+/// the BusDeviceSync handle the VMM inserted on the IO/MMIO buses for
+/// the device's BARs. Storing the pair keeps the bus handle reachable
+/// from the config-space path for the device's whole bus lifetime.
+struct PciBusDevice {
+    pci: Arc<Mutex<dyn PciDevice>>,
+    /// None only for the host bridge, which has no BARs to relocate.
+    bus: Option<Arc<dyn BusDeviceSync>>,
+}
+
 pub struct PciBus {
     /// Devices attached to this bus.
     /// Device 0 is host bridge.
-    devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>>,
+    devices: HashMap<u8, PciBusDevice>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: [DeviceIdState; NUM_DEVICE_IDS as usize],
 }
 
 impl PciBus {
     pub fn new(pci_root: PciRoot, device_reloc: Arc<dyn DeviceRelocation>) -> Self {
-        let mut devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>> = HashMap::new();
+        let mut devices: HashMap<u8, PciBusDevice> = HashMap::new();
         let mut device_ids = [DeviceIdState::Free; NUM_DEVICE_IDS as usize];
 
-        devices.insert(PCI_ROOT_DEVICE_ID, Arc::new(Mutex::new(pci_root)));
+        devices.insert(
+            PCI_ROOT_DEVICE_ID,
+            PciBusDevice {
+                pci: Arc::new(Mutex::new(pci_root)),
+                bus: None,
+            },
+        );
         device_ids[PCI_ROOT_DEVICE_ID as usize] = DeviceIdState::Allocated;
 
         PciBus {
@@ -136,13 +154,24 @@ impl PciBus {
         }
     }
 
-    pub fn add_device(&mut self, device_id: u8, device: Arc<Mutex<dyn PciDevice>>) -> Result<()> {
-        self.devices.insert(device_id, device);
+    pub fn add_device(
+        &mut self,
+        device_id: u8,
+        device: Arc<Mutex<dyn PciDevice>>,
+        bus_device: Option<Arc<dyn BusDeviceSync>>,
+    ) -> Result<()> {
+        self.devices.insert(
+            device_id,
+            PciBusDevice {
+                pci: device,
+                bus: bus_device,
+            },
+        );
         Ok(())
     }
 
     pub fn remove_by_device(&mut self, device: &Arc<Mutex<dyn PciDevice>>) -> Result<()> {
-        self.devices.retain(|_, dev| !Arc::ptr_eq(dev, device));
+        self.devices.retain(|_, dev| !Arc::ptr_eq(&dev.pci, device));
         Ok(())
     }
 
@@ -267,7 +296,7 @@ impl PciConfigIo {
             .devices
             .get(&(device as u8))
             .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
+                d.pci.lock().unwrap().read_config_register(register)
             })
     }
 
@@ -291,31 +320,17 @@ impl PciConfigIo {
 
         let pci_bus = self.pci_bus.as_ref().lock().unwrap();
         if let Some(d) = pci_bus.devices.get(&(device as u8)) {
-            let mut device = d.lock().unwrap();
+            let mut device = d.pci.lock().unwrap();
 
             // Update the register value
-            let (bar_reprogram, ret) = device.write_config_register(register, offset, data);
+            let (reloc, ret) = device.write_config_register(register, offset, data);
 
-            // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    warn!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                    // Rollback: the config register was already updated to
-                    // new_base by detect_bar_reprogramming(). Restore it by
-                    // writing back the old address so device state stays
-                    // consistent with the MMIO bus mapping.
-                    device.restore_bar_addr(params);
-                }
-            }
+            apply_bar_relocation(
+                &*pci_bus.device_reloc,
+                device.deref_mut(),
+                d.bus.as_ref(),
+                &reloc,
+            );
 
             ret
         } else {
@@ -403,7 +418,7 @@ impl PciConfigMmio {
             .devices
             .get(&(device as u8))
             .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
+                d.pci.lock().unwrap().read_config_register(register)
             })
     }
 
@@ -421,26 +436,71 @@ impl PciConfigMmio {
 
         let pci_bus = self.pci_bus.lock().unwrap();
         if let Some(d) = pci_bus.devices.get(&(device as u8)) {
-            let mut device = d.lock().unwrap();
+            let mut device = d.pci.lock().unwrap();
 
             // Update the register value
-            let (bar_reprogram, _) = device.write_config_register(register, offset, data);
+            let (reloc, _) = device.write_config_register(register, offset, data);
 
-            // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    warn!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                    device.restore_bar_addr(params);
-                }
+            apply_bar_relocation(
+                &*pci_bus.device_reloc,
+                device.deref_mut(),
+                d.bus.as_ref(),
+                &reloc,
+            );
+        }
+    }
+}
+
+/// Drives a `BarRelocation` plan: all releases first (tearing down old
+/// mappings), then each install, feeding its outcome back into the device's
+/// config-space bookkeeping. The caller holds both the PciBus lock and the
+/// device lock, so the plan, its application and the feedback are one atomic
+/// step for every other observer.
+///
+/// Release errors are logged and skipped so one failed BAR does not abort
+/// the plan. A failed install leaves its BAR pending (unmapped) and retried
+/// at the guest's next decode-enable edge.
+fn apply_bar_relocation(
+    device_reloc: &dyn DeviceRelocation,
+    device: &mut dyn PciDevice,
+    bus_device: Option<&Arc<dyn BusDeviceSync>>,
+    reloc: &BarRelocation,
+) {
+    for r in &reloc.release {
+        if let Err(e) = device_reloc.move_bar_prepare(r, device) {
+            error!(
+                "Failed releasing BAR {}: {}: 0x{:x}(0x{:x})",
+                r.bar_idx, e, r.base, r.len
+            );
+        }
+    }
+
+    for a in &reloc.install {
+        let Some(bus_device) = bus_device else {
+            // Only the host bridge has no bus handle, and it has no BARs; a
+            // plan for it means the device was registered wrong.
+            error!(
+                "BAR {} install at 0x{:x} for a device with no bus handle",
+                a.bar_idx, a.new_base
+            );
+            device.on_bar_relocation_status(a.bar_idx, BarRelocationStatus::Pending);
+            continue;
+        };
+
+        match device_reloc.move_bar_commit(a, device, bus_device) {
+            Ok(()) => {
+                device.on_bar_relocation_status(
+                    a.bar_idx,
+                    BarRelocationStatus::Applied { base: a.new_base },
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed installing BAR {}: {}: at 0x{:x}(0x{:x}); BAR left unmapped \
+until the guest's next decode-enable edge",
+                    a.bar_idx, e, a.new_base, a.len
+                );
+                device.on_bar_relocation_status(a.bar_idx, BarRelocationStatus::Pending);
             }
         }
     }
@@ -525,20 +585,25 @@ mod unit_tests {
     use std::result::Result;
 
     use super::*;
-    use crate::configuration::PciBarRegionType;
 
     #[derive(Debug)]
     /// Helper struct that mocks the implementation of DeviceRelocation
     struct MockDeviceRelocation;
 
     impl DeviceRelocation for MockDeviceRelocation {
-        fn move_bar(
+        fn move_bar_prepare(
             &self,
-            _old_base: u64,
-            _new_base: u64,
-            _len: u64,
+            _params: &crate::ReleaseParams,
             _pci_dev: &mut dyn PciDevice,
-            _region_type: PciBarRegionType,
+        ) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn move_bar_commit(
+            &self,
+            _params: &crate::InstallParams,
+            _pci_dev: &mut dyn PciDevice,
+            _bus_device: &Arc<dyn BusDeviceSync>,
         ) -> Result<(), io::Error> {
             Ok(())
         }

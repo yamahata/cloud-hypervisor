@@ -26,12 +26,13 @@ pub use self::bus::{
 };
 pub use self::configuration::{
     PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
-    PciCapabilityId, PciClassCode, PciConfiguration, PciExpressCapabilityId, PciHeaderType,
-    PciMassStorageSubclass, PciNetworkControllerSubclass, PciProgrammingInterface,
+    PciCapabilityId, PciClassCode, PciConfiguration, PciConfigurationState, PciExpressCapabilityId,
+    PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass, PciProgrammingInterface,
     PciSerialBusSubClass, PciSubclass,
 };
 pub use self::device::{
-    BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError, PciDevice,
+    BarRelocation, BarRelocationStatus, DeviceRelocation, Error as PciDeviceError, InstallParams,
+    PciDevice, ReleaseParams,
 };
 pub use self::msi::{MsiCap, MsiConfig, msi_num_enabled_vectors};
 pub use self::msix::{

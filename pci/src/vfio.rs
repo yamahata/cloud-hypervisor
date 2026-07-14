@@ -45,15 +45,15 @@ use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsiz
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::configuration::{COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK};
+use crate::configuration::COMMAND_REG;
 use crate::mmap::MmapRegion;
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
-    BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
-    MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
-    PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
-    PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_enabled_vectors,
+    BarRelocation, BarRelocationStatus, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig,
+    MsixCap, MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
+    PciBarRegionType, PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice,
+    PciDeviceError, PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_enabled_vectors,
 };
 
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
@@ -967,6 +967,12 @@ impl VfioCommon {
         mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for region in self.mmio_regions.iter() {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(region.index as usize) {
+                continue;
+            }
             match region.type_ {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
@@ -1417,7 +1423,7 @@ impl VfioCommon {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         // When the guest wants to write to a BAR, we trap it into
         // our local configuration space. We're not reprogramming
         // VFIO device.
@@ -1467,45 +1473,37 @@ impl VfioCommon {
         // to the device region to update the MSI Enable bit.
         self.vfio_wrapper.write_config((reg + offset) as u32, data);
 
-        // The non BAR write path goes directly to the VFIO device and not the shadow,
-        // so the PciConfiguration shadow can get stale. Mirror the write into the
-        // shadow here since snapshot() serializes it. Without this the shadow keeps its
-        // device init values and a snapshot encodes PCI_COMMAND as zero.
-        //
-        // Use the raw write_* helpers rather than the PciConfiguration method
-        // self.configuration.write_config_register(), which would otherwise drain
-        // pending_bar_reprogram, owned by the BAR block below, and rerun MSI-X
-        // set_msg_ctl, already done by update_msix_capabilities above.
-        let byte_offset = reg_idx * PCI_CONFIG_REGISTER_SIZE + offset as usize;
-        match data.len() {
-            1 => self.configuration.write_byte(byte_offset, data[0]),
-            2 => self
-                .configuration
-                .write_word(byte_offset, u16::from(data[0]) | (u16::from(data[1]) << 8)),
-            4 => self
-                .configuration
-                .write_reg(reg_idx, LittleEndian::read_u32(data)),
-            _ => {}
-        }
+        // The non-BAR write path goes straight to the VFIO device, so mirror it
+        // into the shadow: snapshot() serializes the shadow (else it snapshots
+        // PCI_COMMAND as zero), and the BAR state machine needs the COMMAND
+        // decode (IOSE/MSE) edges to install eagerly-released BARs. Mirror raw
+        // bytes rather than via write_config_register (MSI-X handled above;
+        // BAR/ROM writes returned early), then run the shared decode-edge drain.
+        let mut reloc = BarRelocation::default();
+        if offset as usize + data.len() <= 4 {
+            // Capture COMMAND before the write so decode-enable (IOSE/MSE
+            // 0->1) edges can be detected by the shared drain below.
+            let command_before = self.configuration.read_reg(COMMAND_REG);
 
-        // Return pending BAR repgrogramming if MSE bit is set
-        let mut ret_param = self.configuration.pending_bar_reprogram();
-        if !ret_param.is_empty() {
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                info!("BAR reprogramming parameter is returned: {ret_param:x?}");
-                self.configuration.clear_pending_bar_reprogram();
-            } else {
-                info!(
-                    "MSE bit is disabled. No BAR reprogramming parameter is returned: {ret_param:x?}"
-                );
-
-                ret_param = Vec::new();
+            match data.len() {
+                1 => self
+                    .configuration
+                    .write_byte(reg_idx * 4 + offset as usize, data[0]),
+                2 => self.configuration.write_word(
+                    reg_idx * 4 + offset as usize,
+                    u16::from(data[0]) | (u16::from(data[1]) << 8),
+                ),
+                4 => self
+                    .configuration
+                    .write_reg(reg_idx, LittleEndian::read_u32(data)),
+                _ => (),
             }
+
+            self.configuration
+                .drain_command_decode_edge(command_before, &mut reloc);
         }
 
-        (ret_param, None)
+        (reloc, None)
     }
 
     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2212,7 +2210,7 @@ impl PciDevice for VfioPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         self.common.write_config_register(reg_idx, offset, data)
     }
 
@@ -2228,11 +2226,11 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        let mut region_found = false;
         for region in self.common.mmio_regions.iter_mut() {
-            if region.start.raw_value() == old_base {
-                region.start = GuestAddress(new_base);
-
+            if region.index as usize == bar_idx {
+                region_found = true;
                 for user_memory_region in region.user_memory_regions.iter_mut() {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
@@ -2268,6 +2266,28 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                         )
                     }
                     .map_err(io::Error::other)?;
+                }
+            }
+        }
+
+        debug_assert!(region_found, "no MMIO region for BAR {bar_idx} (release)");
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        let mut region_found = false;
+        for region in self.common.mmio_regions.iter_mut() {
+            if region.index as usize == bar_idx {
+                region_found = true;
+                // The record still holds the released-from base (the release
+                // side is forbidden to mutate it).
+                let old_base = region.start.raw_value();
+                region.start = GuestAddress(new_base);
+
+                for user_memory_region in region.user_memory_regions.iter_mut() {
+                    let len = user_memory_region.mapping.len();
+                    let host_addr = user_memory_region.mapping.addr();
 
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
@@ -2316,11 +2336,18 @@ iova 0x{:x}, size 0x{:x}: {}, ",
             }
         }
 
+        debug_assert!(
+            region_found,
+            "no MMIO region for BAR {bar_idx} (install at 0x{new_base:x})"
+        );
+
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.common
+            .configuration
+            .on_bar_relocation_status(bar_idx, status);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

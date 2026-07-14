@@ -17,10 +17,10 @@ use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
 use log::{error, info, warn};
 use pci::{
-    BarReprogrammingParams, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig, PciBarConfiguration,
-    PciBarRegionType, PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice,
-    PciDeviceError, PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass,
-    PciSubclass,
+    BarRelocation, BarRelocationStatus, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig,
+    PciBarConfiguration, PciBarRegionType, PciCapability, PciCapabilityId, PciClassCode,
+    PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciMassStorageSubclass,
+    PciNetworkControllerSubclass, PciSubclass,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -695,9 +695,12 @@ impl VirtioPciDevice {
         self.common_config.driver_status.load(Ordering::SeqCst) == DEVICE_INIT as u8
     }
 
-    pub fn config_bar_addr(&self) -> u64 {
-        self.configuration
-            .get_bar_addr(VIRTIO_COMMON_BAR_INDEX.into())
+    pub fn config_bar_index(&self) -> usize {
+        VIRTIO_COMMON_BAR_INDEX.into()
+    }
+
+    pub fn shm_bar_index(&self) -> usize {
+        VIRTIO_SHM_BAR_INDEX
     }
 
     fn add_pci_capabilities(
@@ -984,7 +987,7 @@ impl PciDevice for VirtioPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         // Handle the special case where the capability VIRTIO_PCI_CAP_PCI_CFG
         // is accessed. This capability has a special meaning as it allows the
         // guest to access other capabilities without mapping the PCI BAR.
@@ -994,7 +997,10 @@ impl PciDevice for VirtioPciDevice {
                 <= self.cap_pci_cfg_info.offset + self.cap_pci_cfg_info.cap.bytes().len()
         {
             let offset = base + offset as usize - self.cap_pci_cfg_info.offset;
-            (Vec::new(), self.write_cap_pci_cfg(offset, data))
+            (
+                BarRelocation::default(),
+                self.write_cap_pci_cfg(offset, data),
+            )
         } else {
             (
                 self.configuration
@@ -1151,6 +1157,12 @@ impl PciDevice for VirtioPciDevice {
         mmio64_allocator: &mut AddressAllocator,
     ) -> result::Result<(), PciDeviceError> {
         for bar in self.bar_regions.drain(..) {
+            // A released BAR's range was already freed when the eager
+            // release ran (and the allocator may have re-issued it since);
+            // freeing it again would clobber another device's allocation.
+            if self.configuration.is_bar_released(bar.idx()) {
+                continue;
+            }
             match bar.region_type() {
                 PciBarRegionType::Memory32BitRegion => {
                     mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
@@ -1164,11 +1176,12 @@ impl PciDevice for VirtioPciDevice {
         Ok(())
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> io::Result<()> {
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         // We only update our idea of the bar in order to support free_bars() above.
-        // The majority of the reallocation is done inside DeviceManager.
+        // The majority of the reallocation, including the release side, is done
+        // inside DeviceManager, so this device has no move_bar_prepare.
         for bar in self.bar_regions.iter_mut() {
-            if bar.addr() == old_base {
+            if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
             }
         }
@@ -1176,8 +1189,8 @@ impl PciDevice for VirtioPciDevice {
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.configuration.restore_bar_addr(params);
+    fn on_bar_relocation_status(&mut self, bar_idx: usize, status: BarRelocationStatus) {
+        self.configuration.on_bar_relocation_status(bar_idx, status);
     }
 
     fn read_bar(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
