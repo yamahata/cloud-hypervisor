@@ -1035,7 +1035,7 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 value_str,
                 indent = (n_spaces + 2)
             );
-        } else {
+        } else if value.len() % 4 == 0 {
             let mut array = Vec::with_capacity(256);
             array.resize(value.len() / 4, 0u32);
             BigEndian::read_u32_into(value, &mut array);
@@ -1044,6 +1044,18 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 "",
                 name,
                 array,
+                indent = (n_spaces + 2)
+            );
+        } else {
+            // Not a single C string (e.g. a string list with interior
+            // NULs, like "interrupt-names") and not 4-byte aligned:
+            // print raw bytes. read_u32_into() would panic on a length
+            // that is not a multiple of 4.
+            debug!(
+                "{:indent$}{} : {:X?}",
+                "",
+                name,
+                value,
                 indent = (n_spaces + 2)
             );
         }
