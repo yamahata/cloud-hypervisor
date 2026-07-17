@@ -1040,7 +1040,7 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 value_str,
                 indent = (n_spaces + 2)
             );
-        } else {
+        } else if value.len() % 4 == 0 {
             let mut array = Vec::with_capacity(256);
             array.resize(value.len() / 4, 0u32);
             BigEndian::read_u32_into(value, &mut array);
@@ -1049,6 +1049,18 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 "",
                 name,
                 array,
+                indent = (n_spaces + 2)
+            );
+        } else {
+            // Not a single C string (e.g. a string list with interior
+            // NULs, like "interrupt-names") and not 4-byte aligned:
+            // print raw bytes. read_u32_into() would panic on a length
+            // that is not a multiple of 4.
+            debug!(
+                "{:indent$}{} : {:X?}",
+                "",
+                name,
+                value,
                 indent = (n_spaces + 2)
             );
         }
@@ -1172,5 +1184,19 @@ mod tests {
         let mut fdt = FdtWriter::new().unwrap();
         let result = create_distance_map_node(&mut fdt, &numa_nodes);
         assert!(result.is_ok(), "Should default to 20 for missing distances");
+    }
+
+    #[test]
+    fn test_print_fdt_string_list_property() {
+        // A string list with interior NULs whose length is not a
+        // multiple of 4 (29 bytes, as the SMMUv3 node's
+        // interrupt-names is): print_fdt() must not panic on it.
+        let names = "eventq\0priq\0cmdq-sync\0gerror\0";
+        assert_ne!(names.len() % 4, 0);
+        let mut fdt = FdtWriter::new().unwrap();
+        let root = fdt.begin_node("").unwrap();
+        fdt.property("interrupt-names", names.as_bytes()).unwrap();
+        fdt.end_node(root).unwrap();
+        print_fdt(&fdt.finish().unwrap());
     }
 }
