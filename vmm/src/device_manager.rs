@@ -881,7 +881,8 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(bar_idx, new_base)?;
+        pci_dev.move_bar_prepare(bar_idx)?;
+        pci_dev.move_bar_commit(bar_idx, new_base)?;
 
         let id = pci_dev
             .id()
