@@ -656,6 +656,90 @@ pub(crate) struct AddressManager {
     pci_mmio64_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
 }
 
+impl AddressManager {
+    fn allocator_free(
+        &self,
+        old_base: u64,
+        len: u64,
+        region_type: PciBarRegionType,
+    ) -> result::Result<(), io::Error> {
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                self.allocator
+                    .lock()
+                    .unwrap()
+                    .free_io_addresses(GuestAddress(old_base), len as GuestUsize);
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                let allocators = if region_type == PciBarRegionType::Memory32BitRegion {
+                    &self.pci_mmio32_allocators
+                } else {
+                    &self.pci_mmio64_allocators
+                };
+
+                // Find the specific allocator that this BAR was allocated from.
+                for allocator in allocators {
+                    let mut allocator = allocator.lock().unwrap();
+
+                    if old_base >= allocator.base().0 && old_base <= allocator.end().0 {
+                        allocator.free(GuestAddress(old_base), len as GuestUsize);
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn allocator_allocate(
+        &self,
+        old_base: u64,
+        new_base: u64,
+        len: u64,
+        region_type: PciBarRegionType,
+    ) -> result::Result<(), io::Error> {
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                self.allocator
+                    .lock()
+                    .unwrap()
+                    .allocate_io_addresses(Some(GuestAddress(new_base)), len as GuestUsize, None)
+                    .ok_or_else(|| {
+                        io::Error::other(format!("failed allocating new IO range: 0x{new_base:x}"))
+                    })?;
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                let allocators = if region_type == PciBarRegionType::Memory32BitRegion {
+                    &self.pci_mmio32_allocators
+                } else {
+                    &self.pci_mmio64_allocators
+                };
+
+                for allocator in allocators {
+                    let mut allocator = allocator.lock().unwrap();
+
+                    if old_base >= allocator.base().0 && old_base <= allocator.end().0 {
+                        // allocator checks if the requested area is within the region.
+                        allocator
+                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
+                            .ok_or_else(|| {
+                                io::Error::other(format!(
+                                    "failed allocating new MMIO range: 0x{new_base:x}(0x{len:x})"
+                                ))
+                            })?;
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl DeviceRelocation for AddressManager {
     fn move_bar(
         &self,
@@ -666,79 +750,25 @@ impl DeviceRelocation for AddressManager {
         pci_dev: &mut dyn PciDevice,
         region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
+        // Free the old range first so allocate(new_base) sees it as available.
+        self.allocator_free(old_base, len, region_type)?;
+        if let Err(e) = self.allocator_allocate(old_base, new_base, len, region_type) {
+            if self
+                .allocator_allocate(old_base, old_base, len, region_type)
+                .is_err()
+            {
+                error!("Failed to restore old range 0x{old_base:x} after rejected BAR move");
+            }
+            return Err(e);
+        }
+
         match region_type {
             PciBarRegionType::IoRegion => {
-                let mut sys_allocator = self.allocator.lock().unwrap();
-                // Free old_base first so allocate(new_base) sees it as
-                // available; restore old_base on failure to keep the
-                // allocator in sync with the PIO bus.
-                sys_allocator.free_io_addresses(GuestAddress(old_base), len as GuestUsize);
-                if sys_allocator
-                    .allocate_io_addresses(Some(GuestAddress(new_base)), len as GuestUsize, None)
-                    .is_none()
-                {
-                    if sys_allocator
-                        .allocate_io_addresses(
-                            Some(GuestAddress(old_base)),
-                            len as GuestUsize,
-                            None,
-                        )
-                        .is_none()
-                    {
-                        error!(
-                            "Failed to restore old IO range 0x{old_base:x} after rejected move_bar"
-                        );
-                    }
-                    return Err(io::Error::other("failed allocating new IO range"));
-                }
-
-                // Update PIO bus
                 self.io_bus
                     .update_range(old_base, len, new_base, len)
                     .map_err(io::Error::other)?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                let pci_mmio_allocators = if region_type == PciBarRegionType::Memory32BitRegion {
-                    &self.pci_mmio32_allocators
-                } else {
-                    &self.pci_mmio64_allocators
-                };
-
-                // Find the specific allocator that this BAR was allocated from and use it for a new one
-                for pci_mmio_allocator_mutex in pci_mmio_allocators {
-                    let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
-
-                    if old_base >= pci_mmio_allocator.base().0
-                        && old_base <= pci_mmio_allocator.end().0
-                    {
-                        // Free old_base first so allocate(new_base) sees it
-                        // as available; restore old_base on failure to keep
-                        // the allocator in sync with the MMIO bus.
-                        pci_mmio_allocator.free(GuestAddress(old_base), len as GuestUsize);
-                        if pci_mmio_allocator
-                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
-                            .is_none()
-                        {
-                            if pci_mmio_allocator
-                                .allocate(
-                                    Some(GuestAddress(old_base)),
-                                    len as GuestUsize,
-                                    Some(len),
-                                )
-                                .is_none()
-                            {
-                                error!(
-                                    "Failed to restore old MMIO range 0x{old_base:x} after rejected move_bar"
-                                );
-                            }
-                            return Err(io::Error::other("failed allocating new MMIO range"));
-                        }
-
-                        break;
-                    }
-                }
-
-                // Update MMIO bus
                 self.mmio_bus
                     .update_range(old_base, len, new_base, len)
                     .map_err(io::Error::other)?;
