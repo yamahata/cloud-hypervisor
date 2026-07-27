@@ -141,6 +141,10 @@ pub trait PciDevice: Send {
     ) -> result::Result<(), io::Error> {
         Ok(())
     }
+    /// BAR `bar_idx` is now mapped at its config-space address. A failed
+    /// install reports nothing: the slot stays unmapped and is retried on
+    /// the guest's next decode-enable edge of its space.
+    fn on_bar_installed(&mut self, _bar_idx: usize) {}
     /// Provides a mutable reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the trait.
     fn as_any_mut(&mut self) -> &mut dyn Any;

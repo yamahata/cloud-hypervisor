@@ -466,7 +466,9 @@ fn apply_bar_relocation(
         };
 
         match device_reloc.move_bar_commit(device, bus_device, a) {
-            Ok(()) => {}
+            Ok(()) => {
+                device.on_bar_installed(a.bar_idx);
+            }
             Err(e) => {
                 error!(
                     "Failed installing BAR {}: {}: at 0x{:x}; BAR left unmapped \

@@ -507,6 +507,10 @@ impl PciDevice for VfioUserPciDevice {
         Ok(())
     }
 
+    fn on_bar_installed(&mut self, bar_idx: usize) {
+        self.common.configuration.on_bar_installed(bar_idx);
+    }
+
     fn id(&self) -> Option<String> {
         Some(self.id.clone())
     }
