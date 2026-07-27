@@ -85,8 +85,9 @@ use libc::{
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
 use pci::{
-    DeviceRelocation, InstallParams, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf,
-    PciDevice, ReleaseParams, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
+    COMMAND_REG, COMMAND_REG_IO_SPACE_MASK, COMMAND_REG_MEMORY_SPACE_MASK, DeviceRelocation,
+    InstallParams, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
+    ReleaseParams, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
     VfioUserPciDeviceError,
 };
 use rate_limiter::group;
@@ -301,6 +302,10 @@ pub enum DeviceManagerError {
     /// Cannot allocate PCI BARs
     #[error("Cannot allocate PCI BARs")]
     AllocateBars(#[source] pci::PciDeviceError),
+
+    /// Failed releasing the BARs of an undecoded space after restore
+    #[error("Failed releasing the BARs of an undecoded space after restore")]
+    ReleaseUndecodedBars(#[source] io::Error),
 
     /// Could not free the BARs associated with a PCI device.
     #[error("Could not free the BARs associated with a PCI device")]
@@ -870,6 +875,39 @@ impl DeviceRelocation for AddressManager {
             }
             self.allocator_free(segment, new_base, len, region_type)?;
             return Err(e);
+        }
+
+        Ok(())
+    }
+
+    fn release_undecoded_bars(&self, pci_dev: &mut dyn PciDevice) -> result::Result<(), io::Error> {
+        let command = pci_dev.read_config_register(COMMAND_REG);
+        let id = pci_dev
+            .id()
+            .ok_or_else(|| io::Error::other("PCI device without an id"))?;
+        // Clone the resources so the device-tree lock is not held across the
+        // release, which locks allocators and the device tree itself.
+        let resources = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|node| node.resources.clone())
+            .ok_or_else(|| io::Error::other(format!("No device-tree node for {id}")))?;
+
+        for resource in resources {
+            let Resource::PciBar { index, type_, .. } = resource else {
+                continue;
+            };
+            let region_type = PciBarRegionType::from(type_);
+            let decode_mask = match region_type {
+                PciBarRegionType::IoRegion => COMMAND_REG_IO_SPACE_MASK,
+                _ => COMMAND_REG_MEMORY_SPACE_MASK,
+            };
+            if command & decode_mask != 0 {
+                continue;
+            }
+            self.move_bar_prepare(pci_dev, &ReleaseParams { bar_idx: index })?;
         }
 
         Ok(())
@@ -1838,6 +1876,19 @@ impl DeviceManager {
 
             self.bus_devices
                 .push(Arc::clone(&segment.pci_config_mmio) as Arc<dyn BusDeviceSync>);
+        }
+
+        // Restore: a BAR whose space is not decoded is left unmapped until the
+        // guest enables decode, so no in-flight move has to be replayed.
+        if snapshot.is_some() {
+            for segment in &self.pci_segments {
+                segment
+                    .pci_bus
+                    .lock()
+                    .unwrap()
+                    .release_undecoded_bars()
+                    .map_err(DeviceManagerError::ReleaseUndecodedBars)?;
+            }
         }
 
         Ok(())

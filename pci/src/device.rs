@@ -63,11 +63,7 @@ pub struct InstallParams {
     pub new_base: u64,
 }
 
-/// A relocation plan emitted by `write_config_register`: the old locations
-/// to release and the new locations to install. Today every entry pairs one
-/// release with one install describing a whole BAR move; the two Vecs exist
-/// so a later change can decouple the phases in time, where a single write
-/// emits releases, installs, or both.
+// A relocation plan emitted by `write_config_register`.
 #[derive(Clone, Debug, Default)]
 pub struct BarRelocation {
     pub release: Vec<ReleaseParams>,
@@ -142,8 +138,9 @@ pub trait PciDevice: Send {
         Ok(())
     }
     /// BAR `bar_idx` is now mapped at its config-space address. A failed
-    /// install reports nothing: the slot stays unmapped and is retried on
-    /// the guest's next decode-enable edge of its space.
+    /// install reports nothing: the slot stays released and is retried, while
+    /// its space is decoded, on this device's next BAR or COMMAND write and
+    /// after any other device's BAR release.
     fn on_bar_installed(&mut self, _bar_idx: usize) {}
     /// Provides a mutable reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the trait.
@@ -179,4 +176,16 @@ pub trait DeviceRelocation: Send + Sync {
         bus_device: &Arc<dyn BusDeviceSync>,
         params: &InstallParams,
     ) -> result::Result<(), io::Error>;
+
+    /// Release every BAR of `pci_dev` whose address space is not decoded
+    /// (memory or I/O space disabled in its COMMAND register). Called once
+    /// after a restore: such a BAR is installed at its config-space target
+    /// once the guest decodes its space, so no in-flight move is replayed.
+    /// The default does nothing.
+    fn release_undecoded_bars(
+        &self,
+        _pci_dev: &mut dyn PciDevice,
+    ) -> result::Result<(), io::Error> {
+        Ok(())
+    }
 }
