@@ -656,20 +656,55 @@ pub(crate) struct AddressManager {
     pci_mmio64_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
 }
 
+/// What the device tree records about one BAR of a device.
+struct BarRecord {
+    /// The PCI segment the device lives in; selects its MMIO allocators.
+    segment: usize,
+    /// The address the BAR is installed at. The resource is updated only
+    /// when an install succeeds, so this stays the old address while a move
+    /// is in flight.
+    base: u64,
+    len: u64,
+    region_type: PciBarRegionType,
+}
+
 impl AddressManager {
-    /// The PCI segment a device lives in. It selects the MMIO allocators a
-    /// BAR of the device is served from.
-    fn pci_segment_of(&self, pci_dev: &dyn PciDevice) -> result::Result<usize, io::Error> {
+    fn bar_record(
+        &self,
+        pci_dev: &dyn PciDevice,
+        bar_idx: usize,
+    ) -> result::Result<BarRecord, io::Error> {
         let id = pci_dev
             .id()
             .ok_or_else(|| io::Error::other("PCI device without an id"))?;
-        self.device_tree
-            .lock()
-            .unwrap()
+        let device_tree = self.device_tree.lock().unwrap();
+        let node = device_tree
             .get(&id)
-            .and_then(|node| node.pci_bdf)
+            .ok_or_else(|| io::Error::other(format!("No device-tree node for {id}")))?;
+        let segment = node
+            .pci_bdf
             .map(|bdf| usize::from(bdf.segment()))
-            .ok_or_else(|| io::Error::other(format!("No PCI BDF for device {id}")))
+            .ok_or_else(|| io::Error::other(format!("No PCI BDF for device {id}")))?;
+        node.resources
+            .iter()
+            .find_map(|resource| match resource {
+                Resource::PciBar {
+                    index,
+                    base,
+                    size,
+                    type_,
+                    ..
+                } if *index == bar_idx => Some(BarRecord {
+                    segment,
+                    base: *base,
+                    len: *size,
+                    region_type: PciBarRegionType::from(*type_),
+                }),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::other(format!("No resource for BAR {bar_idx} of device {id}"))
+            })
     }
 
     fn allocator_free(
@@ -747,13 +782,15 @@ impl DeviceRelocation for AddressManager {
     fn move_bar(
         &self,
         bar_idx: usize,
-        old_base: u64,
         new_base: u64,
-        len: u64,
         pci_dev: &mut dyn PciDevice,
-        region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
-        let segment = self.pci_segment_of(pci_dev)?;
+        let BarRecord {
+            segment,
+            base: old_base,
+            len,
+            region_type,
+        } = self.bar_record(pci_dev, bar_idx)?;
         // Free the old range first so allocate(new_base) sees it as available.
         self.allocator_free(segment, old_base, len, region_type)?;
         if let Err(e) = self.allocator_allocate(segment, new_base, len, region_type) {
@@ -776,32 +813,6 @@ impl DeviceRelocation for AddressManager {
                 self.mmio_bus
                     .update_range(old_base, len, new_base, len)
                     .map_err(io::Error::other)?;
-            }
-        }
-
-        // Update the device_tree resources associated with the device
-        if let Some(id) = pci_dev.id() {
-            if let Some(node) = self.device_tree.lock().unwrap().get_mut(&id) {
-                let mut resource_updated = false;
-                for resource in node.resources.iter_mut() {
-                    if let Resource::PciBar { index, base, .. } = resource
-                        && *index == bar_idx
-                    {
-                        *base = new_base;
-                        resource_updated = true;
-                        break;
-                    }
-                }
-
-                if !resource_updated {
-                    return Err(io::Error::other(format!(
-                        "Couldn't find a resource for BAR {bar_idx} of device {id}"
-                    )));
-                }
-            } else {
-                return Err(io::Error::other(format!(
-                    "Couldn't find device {id} from device tree"
-                )));
             }
         }
 
@@ -870,7 +881,28 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(bar_idx, new_base)
+        pci_dev.move_bar(bar_idx, new_base)?;
+
+        let id = pci_dev
+            .id()
+            .ok_or_else(|| io::Error::other("PCI device without an id"))?;
+        let mut device_tree = self.device_tree.lock().unwrap();
+        let node = device_tree
+            .get_mut(&id)
+            .ok_or_else(|| io::Error::other(format!("No device-tree node for {id}")))?;
+        let base = node
+            .resources
+            .iter_mut()
+            .find_map(|resource| match resource {
+                Resource::PciBar { index, base, .. } if *index == bar_idx => Some(base),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::other(format!("No resource for BAR {bar_idx} of device {id}"))
+            })?;
+        *base = new_base;
+
+        Ok(())
     }
 }
 

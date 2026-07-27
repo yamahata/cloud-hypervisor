@@ -112,13 +112,12 @@ pub trait PciDevice: Send {
 pub trait DeviceRelocation: Send + Sync {
     /// The BAR needs to be moved to a different location in the guest address
     /// space. This follows a decision from the software running in the guest.
+    /// The BAR is named by its slot; the implementation looks up its
+    /// current address, length and region type.
     fn move_bar(
         &self,
         bar_idx: usize,
-        old_base: u64,
         new_base: u64,
-        len: u64,
         pci_dev: &mut dyn PciDevice,
-        region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error>;
 }
