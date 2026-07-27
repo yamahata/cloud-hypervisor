@@ -11,7 +11,7 @@ use std::{io, result};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
-use vm_device::Resource;
+use vm_device::{BusDeviceSync, Resource};
 
 use crate::PciBarConfiguration;
 use crate::configuration::{self, PciBarRegionType};
@@ -35,6 +35,23 @@ pub enum Error {
     InvalidResource(Resource),
 }
 pub(crate) type Result<T> = result::Result<T, Error>;
+
+/// A BAR to release: its current guest-physical location is torn down.
+#[derive(Clone, Copy, Debug)]
+pub struct ReleaseParams {
+    /// The BAR slot (the low/primary slot for a 64-bit BAR, ROM_BAR_IDX for
+    /// the expansion ROM).
+    pub bar_idx: usize,
+}
+
+/// A BAR to install at `new_base`, the guest's current config-space target.
+#[derive(Clone, Copy, Debug)]
+pub struct InstallParams {
+    /// The BAR slot (the low/primary slot for a 64-bit BAR, ROM_BAR_IDX for
+    /// the expansion ROM).
+    pub bar_idx: usize,
+    pub new_base: u64,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BarReprogrammingParams {
@@ -122,14 +139,27 @@ pub trait PciDevice: Send {
 /// This trait defines a set of functions which can be triggered whenever a
 /// PCI device is modified in any way.
 pub trait DeviceRelocation: Send + Sync {
-    /// The BAR needs to be moved to a different location in the guest address
-    /// space. This follows a decision from the software running in the guest.
-    /// The BAR is named by its slot; the implementation looks up its
-    /// current address, length and region type.
-    fn move_bar(
+    /// Release the OLD guest-physical mapping of a BAR being relocated.
+    ///
+    /// This frees the allocator range, removes the trap-emulated bus range,
+    /// tears down the virtio shm / ioeventfd old-side mapping and runs the
+    /// device-side `move_bar_prepare`. The bus handle itself stays stored in
+    /// the `PciBus` device pair; the matching install re-inserts it at the
+    /// new address.
+    fn move_bar_prepare(
         &self,
-        bar_idx: usize,
-        new_base: u64,
         pci_dev: &mut dyn PciDevice,
+        params: &ReleaseParams,
+    ) -> result::Result<(), io::Error>;
+
+    /// Install the NEW guest-physical mapping of a BAR previously released
+    /// by `move_bar_prepare`: allocator range, bus insertion (using
+    /// `bus_device`, the MMIO/IO bus handle the PCI bus stores alongside the
+    /// device), the device-side commit and the follow-on mappings.
+    fn move_bar_commit(
+        &self,
+        pci_dev: &mut dyn PciDevice,
+        bus_device: &Arc<dyn BusDeviceSync>,
+        params: &InstallParams,
     ) -> result::Result<(), io::Error>;
 }

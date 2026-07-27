@@ -85,8 +85,9 @@ use libc::{
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
-    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, InstallParams, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf,
+    PciDevice, ReleaseParams, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
+    VfioUserPciDeviceError,
 };
 use rate_limiter::group;
 use rate_limiter::group::RateLimiterGroup;
@@ -779,52 +780,116 @@ impl AddressManager {
 }
 
 impl DeviceRelocation for AddressManager {
-    fn move_bar(
+    fn move_bar_prepare(
         &self,
-        bar_idx: usize,
-        new_base: u64,
         pci_dev: &mut dyn PciDevice,
+        params: &ReleaseParams,
     ) -> result::Result<(), io::Error> {
+        let bar_idx = params.bar_idx;
         let BarRecord {
             segment,
-            base: old_base,
+            base,
             len,
             region_type,
         } = self.bar_record(pci_dev, bar_idx)?;
-        // Free the old range first so allocate(new_base) sees it as available.
-        self.allocator_free(segment, old_base, len, region_type)?;
-        if let Err(e) = self.allocator_allocate(segment, new_base, len, region_type) {
-            if self
-                .allocator_allocate(segment, old_base, len, region_type)
-                .is_err()
-            {
-                error!("Failed to restore old range 0x{old_base:x} after rejected BAR move");
-            }
-            return Err(e);
-        }
+        self.allocator_free(segment, base, len, region_type)?;
 
         match region_type {
             PciBarRegionType::IoRegion => {
-                self.io_bus
-                    .update_range(old_base, len, new_base, len)
-                    .map_err(io::Error::other)?;
+                self.io_bus.remove(base, len).map_err(io::Error::other)?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                self.mmio_bus
-                    .update_range(old_base, len, new_base, len)
-                    .map_err(io::Error::other)?;
+                self.mmio_bus.remove(base, len).map_err(io::Error::other)?;
             }
         }
 
         let any_dev = pci_dev.as_any_mut();
         if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
             if bar_idx == VIRTIO_CONFIG_BAR_INDEX {
-                for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
+                // ioeventfd path: unregister the events at the old base.
+                for (event, addr) in virtio_pci_dev.ioeventfds(base) {
                     let io_addr = IoEventAddress::Mmio(addr);
                     self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
                         io::Error::other(format!("failed to unregister ioevent: {e:?}"))
                     })?;
                 }
+            } else if bar_idx == VIRTIO_SHM_BAR_INDEX {
+                // virtio shm path: remove the old KVM memslot.
+                let virtio_dev = virtio_pci_dev.virtio_device();
+                let virtio_dev = virtio_dev.lock().unwrap();
+                if let Some(shm_regions) = virtio_dev.get_shm_regions() {
+                    // SAFETY: guaranteed by MmapRegion invariants
+                    unsafe {
+                        self.vm.remove_user_memory_region(
+                            shm_regions.mem_slot,
+                            base,
+                            shm_regions.mapping.len(),
+                            shm_regions.mapping.as_ptr(),
+                            false,
+                        )
+                    }
+                    .map_err(|e| {
+                        io::Error::other(format!("failed to remove user memory region: {e:?}"))
+                    })?;
+                }
+            }
+        }
+
+        pci_dev.move_bar_prepare(bar_idx)
+    }
+
+    fn move_bar_commit(
+        &self,
+        pci_dev: &mut dyn PciDevice,
+        bus_device: &Arc<dyn BusDeviceSync>,
+        params: &InstallParams,
+    ) -> result::Result<(), io::Error> {
+        let InstallParams { bar_idx, new_base } = *params;
+        let BarRecord {
+            segment,
+            len,
+            region_type,
+            ..
+        } = self.bar_record(pci_dev, bar_idx)?;
+        self.allocator_allocate(segment, new_base, len, region_type)?;
+
+        let bus = match region_type {
+            PciBarRegionType::IoRegion => &self.io_bus,
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                &self.mmio_bus
+            }
+        };
+        if let Err(e) = bus.insert(Arc::clone(bus_device), new_base, len) {
+            self.allocator_free(segment, new_base, len, region_type)?;
+            return Err(io::Error::other(e));
+        }
+
+        if let Err(e) = self.move_bar_commit_device(pci_dev, params) {
+            if let Err(remove_err) = bus.remove(new_base, len) {
+                error!("Failed unwinding bus range for BAR {bar_idx}: {remove_err}");
+            }
+            self.allocator_free(segment, new_base, len, region_type)?;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+}
+
+impl AddressManager {
+    fn move_bar_commit_device(
+        &self,
+        pci_dev: &mut dyn PciDevice,
+        params: &InstallParams,
+    ) -> result::Result<(), io::Error> {
+        let &InstallParams { bar_idx, new_base } = params;
+
+        pci_dev.move_bar_commit(bar_idx, new_base)?;
+
+        let any_dev = pci_dev.as_any_mut();
+        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
+            if bar_idx == VIRTIO_CONFIG_BAR_INDEX {
+                // ioeventfd path: register the events at the new base.
                 for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
                     let io_addr = IoEventAddress::Mmio(addr);
                     self.vm
@@ -834,43 +899,25 @@ impl DeviceRelocation for AddressManager {
                         })?;
                 }
             } else if bar_idx == VIRTIO_SHM_BAR_INDEX {
+                // virtio shm path: create the new KVM memslot.
                 let virtio_dev = virtio_pci_dev.virtio_device();
                 let mut virtio_dev = virtio_dev.lock().unwrap();
                 if let Some(mut shm_regions) = virtio_dev.get_shm_regions() {
                     // SAFETY: guaranteed by MmapRegion invariants
                     unsafe {
-                        // Remove old mapping
-                        self.vm
-                            .remove_user_memory_region(
-                                shm_regions.mem_slot,
-                                old_base,
-                                shm_regions.mapping.len(),
-                                shm_regions.mapping.as_ptr(),
-                                false,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(format!(
-                                    "failed to remove user memory region: {e:?}"
-                                ))
-                            })?;
-
-                        // Create new mapping by inserting new region to KVM.
-                        self.vm
-                            .create_user_memory_region(
-                                shm_regions.mem_slot,
-                                new_base,
-                                shm_regions.mapping.len(),
-                                shm_regions.mapping.as_ptr(),
-                                false,
-                                false,
-                                hypervisor::MemoryVisibility::Shared,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(format!(
-                                    "failed to create user memory regions: {e:?}"
-                                ))
-                            })?;
+                        self.vm.create_user_memory_region(
+                            shm_regions.mem_slot,
+                            new_base,
+                            shm_regions.mapping.len(),
+                            shm_regions.mapping.as_ptr(),
+                            false,
+                            false,
+                            hypervisor::MemoryVisibility::Shared,
+                        )
                     }
+                    .map_err(|e| {
+                        io::Error::other(format!("failed to create user memory regions: {e:?}"))
+                    })?;
 
                     // Update shared memory regions to reflect the new mapping.
                     shm_regions.addr = GuestAddress(new_base);
@@ -880,9 +927,6 @@ impl DeviceRelocation for AddressManager {
                 }
             }
         }
-
-        pci_dev.move_bar_prepare(bar_idx)?;
-        pci_dev.move_bar_commit(bar_idx, new_base)?;
 
         let id = pci_dev
             .id()
