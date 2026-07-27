@@ -15,7 +15,7 @@ use vm_device::PciBarType;
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 use crate::MsixConfig;
-use crate::device::{BarRelocation, BarReprogrammingParams, InstallParams, ReleaseParams};
+use crate::device::{BarRelocation, InstallParams, ReleaseParams};
 
 // The number of 32bit registers in the config space, 4096 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 1024;
@@ -526,6 +526,25 @@ pub struct PciConfigurationState {
     // still parse, otherwise ignored, and written empty. See new().
     #[serde(default)]
     pending_bar_reprogram: Vec<BarReprogrammingParams>,
+}
+
+/// Legacy wire shape of an in-flight BAR move in
+/// [`PciConfigurationState::pending_bar_reprogram`]. Decoded so snapshots from
+/// older versions still parse, and otherwise ignored: a BAR whose space is not
+/// decoded at restore is reinstalled from config space once the guest decodes
+/// its space. Confined here so nothing else depends on it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct BarReprogrammingParams {
+    /// The BAR slot an older version recorded for an in-flight move
+    /// (expansion ROM = ROM_BAR_IDX; the low/primary slot for a 64-bit
+    /// BAR). Older snapshots still do not carry it. Not read: see
+    /// PciConfiguration::new().
+    #[serde(default)]
+    bar_idx: Option<usize>,
+    old_base: u64,
+    new_base: u64,
+    len: u64,
+    region_type: PciBarRegionType,
 }
 
 /// Contains the configuration space of a PCI node.

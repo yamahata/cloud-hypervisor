@@ -8,13 +8,11 @@ use std::any::Any;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::{BusDeviceSync, Resource};
 
-use crate::PciBarConfiguration;
-use crate::configuration::{self, PciBarRegionType};
+use crate::{PciBarConfiguration, configuration};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -35,16 +33,6 @@ pub enum Error {
     InvalidResource(Resource),
 }
 pub(crate) type Result<T> = result::Result<T, Error>;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct BarReprogrammingParams {
-    #[serde(default)]
-    pub bar_idx: Option<usize>,
-    pub old_base: u64,
-    pub new_base: u64,
-    pub len: u64,
-    pub region_type: PciBarRegionType,
-}
 
 /// A BAR to release: its current guest-physical location is torn down.
 #[derive(Clone, Copy, Debug)]
