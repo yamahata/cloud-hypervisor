@@ -36,6 +36,16 @@ pub enum Error {
 }
 pub(crate) type Result<T> = result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BarReprogrammingParams {
+    #[serde(default)]
+    pub bar_idx: Option<usize>,
+    pub old_base: u64,
+    pub new_base: u64,
+    pub len: u64,
+    pub region_type: PciBarRegionType,
+}
+
 /// A BAR to release: its current guest-physical location is torn down.
 #[derive(Clone, Copy, Debug)]
 pub struct ReleaseParams {
@@ -53,14 +63,21 @@ pub struct InstallParams {
     pub new_base: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct BarReprogrammingParams {
-    #[serde(default)]
-    pub bar_idx: Option<usize>,
-    pub old_base: u64,
-    pub new_base: u64,
-    pub len: u64,
-    pub region_type: PciBarRegionType,
+/// A relocation plan emitted by `write_config_register`: the old locations
+/// to release and the new locations to install. Today every entry pairs one
+/// release with one install describing a whole BAR move; the two Vecs exist
+/// so a later change can decouple the phases in time, where a single write
+/// emits releases, installs, or both.
+#[derive(Clone, Debug, Default)]
+pub struct BarRelocation {
+    pub release: Vec<ReleaseParams>,
+    pub install: Vec<InstallParams>,
+}
+
+impl BarRelocation {
+    pub fn is_empty(&self) -> bool {
+        self.release.is_empty() && self.install.is_empty()
+    }
 }
 
 pub trait PciDevice: Send {
@@ -94,7 +111,7 @@ pub trait PciDevice: Send {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>);
+    ) -> (BarRelocation, Option<Arc<Barrier>>);
     /// Gets a register from the configuration space.
     /// * `reg_idx` - The index of the config register to read.
     fn read_config_register(&mut self, reg_idx: usize) -> u32;
@@ -108,15 +125,15 @@ pub trait PciDevice: Send {
     fn write_bar(&mut self, _base: u64, _offset: u64, _data: &[u8]) -> Option<Arc<Barrier>> {
         None
     }
-    // Tear down the device's host-side state backing the BAR
-    // (KVM memslots, VFIO DMA maps) at its old BAR base address.
-    // Must NOT mutate the recorded base so that `move_bar_commit`
-    // can still derive per-region offsets from it.
+    /// Tear down the device's host-side state backing the BAR
+    /// (KVM memslots, VFIO DMA maps) at its old BAR base address.
+    /// Must NOT mutate the recorded base so that `move_bar_commit`
+    /// can still derive per-region offsets from it.
     fn move_bar_prepare(&mut self, _bar_idx: usize) -> result::Result<(), io::Error> {
         Ok(())
     }
-    // Set up the device's host-side state at `new_base` and update the recorded base.
-    // The implementations derive the old address from their own records.
+    /// Set up the device's host-side state at `new_base` and update the recorded base.
+    /// The implementations derive the old address from their own records.
     fn move_bar_commit(
         &mut self,
         _bar_idx: usize,
