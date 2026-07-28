@@ -305,6 +305,11 @@ pub(crate) struct UserMemoryRegion {
     pub slot: u32,
     pub start: u64,
     pub mapping: Arc<MmapRegion>,
+    /// True while this region's BAR content is DMA-mapped into the host
+    /// IOMMU address space (peer-to-peer DMA). Stays false when the
+    /// kernel cannot map MMIO into the IOMMU backend. Tracked on the
+    /// owning copy in VfioCommon::mmio_regions; clones can go stale.
+    pub p2p_mapped: bool,
 }
 
 #[derive(Clone)]
@@ -2353,10 +2358,11 @@ impl VfioPciDevice {
                         }
                     };
 
-                    let user_memory_region = UserMemoryRegion {
+                    let mut user_memory_region = UserMemoryRegion {
                         slot: self.memory_slot_allocator.next_memory_slot(),
                         start: region.start.0 + area.offset,
                         mapping: Arc::new(mapping),
+                        p2p_mapped: false,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2375,22 +2381,50 @@ impl VfioPciDevice {
                     }
                     .map_err(VfioPciError::CreateUserMemoryRegion)?;
 
-                    // Map the MMIO BAR into the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
+                    // Map the MMIO BAR into the host IOMMU address space via
+                    // VfioOps. Only needed if p2p_dma is enabled, and best
+                    // effort: some kernels cannot map MMIO (PFNMAP) memory
+                    // into their IOMMU backend, while the guest-visible
+                    // mapping above already succeeded, so losing this map
+                    // only disables DMA from other devices into this BAR.
                     if !self.iommu_attached && self.p2p_dma {
                         // vfio_dma_map should be unsafe but isn't.
                         // SAFETY: MmapRegion invariants guarantee that
                         // user_memory_region.mapping.addr() points to
                         // user_memory_region.mapping.len() bytes of
                         // valid memory that will only be unmapped with munmap().
-                        unsafe {
+                        match unsafe {
                             self.vfio_ops.vfio_dma_map(
                                 user_memory_region.start,
                                 user_memory_region.mapping.len(),
                                 user_memory_region.mapping.addr(),
                             )
+                        } {
+                            Ok(()) => user_memory_region.p2p_mapped = true,
+                            Err(e) if self.common.x_nv_gpudirect_clique.is_some() => {
+                                // x_nv_gpudirect_clique asserts peer-to-peer
+                                // DMA is required, so its loss stays fatal.
+                                // Push the region first: the KVM slot exists
+                                // and must be reclaimed on teardown.
+                                region.user_memory_regions.push(user_memory_region);
+                                return Err(VfioPciError::DmaMap(
+                                    e,
+                                    self.device_path.clone(),
+                                    self.bdf,
+                                ));
+                            }
+                            Err(e) => warn!(
+                                "Cannot map BAR {} of device {} at {} into the host \
+                                 IOMMU address space (iova 0x{:x}, size 0x{:x}): {e}. \
+                                 Guest access is unaffected; peer-to-peer DMA into \
+                                 this BAR is disabled.",
+                                region.index,
+                                self.bdf,
+                                self.device_path.display(),
+                                user_memory_region.start,
+                                user_memory_region.mapping.len(),
+                            ),
                         }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
                     }
                     region.user_memory_regions.push(user_memory_region);
                 }
@@ -2406,9 +2440,8 @@ impl VfioPciDevice {
                 let len = user_memory_region.mapping.len();
                 let host_addr = user_memory_region.mapping.addr();
                 // Unmap MMIO region from the host IOMMU address space via VfioOps
-                // Only needed if p2p_dma is enabled.
-                if !self.iommu_attached
-                    && self.p2p_dma
+                // Only for regions that were actually P2P-mapped.
+                if user_memory_region.p2p_mapped
                     && let Err(e) = self
                         .vfio_ops
                         .vfio_dma_unmap(user_memory_region.start, len)
@@ -2579,9 +2612,8 @@ impl PciDevice for VfioPciDevice {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
                     // Unmap the old MMIO region from the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if !self.iommu_attached
-                        && self.p2p_dma
+                    // Only for regions that were actually P2P-mapped.
+                    if user_memory_region.p2p_mapped
                         && let Err(e) = self
                             .vfio_ops
                             .vfio_dma_unmap(user_memory_region.start, len)
@@ -2634,25 +2666,34 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                     }
                     .map_err(io::Error::other)?;
 
-                    // Map the moved MMIO region into the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if !self.iommu_attached && self.p2p_dma {
+                    // Map the moved MMIO region into the host IOMMU address
+                    // space via VfioOps. Only regions that were P2P-mapped
+                    // before the move; best effort like the initial mapping,
+                    // so a refusal cannot fail the guest's BAR reprogramming
+                    // after the KVM slot has already moved. A lost mapping
+                    // is not retried on later moves.
+                    if user_memory_region.p2p_mapped {
                         // vfio_dma_map is unsound and ought to be marked as unsafe
                         // SAFETY: MmapRegion invariants guarantee that
                         // host_addr points to len bytes of
                         // valid memory that will only be unmapped with munmap().
-                        unsafe {
+                        if let Err(e) = unsafe {
                             self.vfio_ops
                                 .vfio_dma_map(user_memory_region.start, len, host_addr)
+                        } {
+                            error!(
+                                "Cannot re-map moved BAR {} of device {} at {} into \
+                                 the host IOMMU address space (iova 0x{:x}, size \
+                                 0x{:x}): {e}. Peer-to-peer DMA into this BAR is \
+                                 disabled.",
+                                region.index,
+                                self.bdf,
+                                self.device_path.display(),
+                                user_memory_region.start,
+                                len,
+                            );
+                            user_memory_region.p2p_mapped = false;
                         }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))
-                        .map_err(|e| {
-                            io::Error::other(format!(
-                                "Could not map MMIO region into the host IOMMU address space: \
-iova 0x{:x}, size 0x{:x}: {}, ",
-                                user_memory_region.start, len, e
-                            ))
-                        })?;
                     }
                 }
             }
@@ -2884,11 +2925,13 @@ mod tests {
                     slot: 0,
                     start: page_size,
                     mapping: mapping_a,
+                    p2p_mapped: false,
                 },
                 UserMemoryRegion {
                     slot: 1,
                     start: 3 * page_size,
                     mapping: mapping_b,
+                    p2p_mapped: false,
                 },
             ],
         }]

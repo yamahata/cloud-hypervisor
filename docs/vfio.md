@@ -159,6 +159,14 @@ nvidia-smi topo -p2p r
  GPU7	OK	OK	OK	OK	OK	OK	OK	X	
 ```
 
+Peer-to-peer BAR mappings are best effort: on kernels that cannot map BAR
+MMIO into the IOMMU (iommufd before Linux 6.19, and some type1 container
+kernels), Cloud Hypervisor logs a warning and continues with peer-to-peer
+DMA into the affected BARs disabled. Since `x_nv_gpudirect_clique` asserts
+that P2P DMA is required, a failed BAR mapping remains a hard error for
+devices with a clique configured. `vfio_p2p_dma=off` disables the mapping
+attempts entirely.
+
 Some VFIO devices expose BARs that should not be mmapped by the VMM even when
 the kernel reports them as mappable. The `x_exclude_mmap_bars` config argument can
 be used to skip mmap for specific BAR indices.
@@ -258,8 +266,11 @@ All the snapshot and restore requirements apply, plus the following.
 - **iommufd.** The destination receives the device as file descriptors, which
   requires the config to carry `iommufd=on`. The iommufd itself arrives as a
   file descriptor with the receive request, see below.
-- **BAR mapping.** `vfio_p2p_dma=off` is needed on older Linux kernels
-  (pre 6.19) that cannot map VFIO BAR MMIO into iommufd.
+- **BAR mapping.** Older Linux kernels (pre 6.19) cannot map VFIO BAR MMIO
+  into iommufd. Cloud Hypervisor warns and continues with peer-to-peer DMA
+  into the affected BARs disabled (see the peer-to-peer note under Advanced
+  Configuration Options); `vfio_p2p_dma=off` avoids the mapping attempts
+  (and the warnings) entirely.
 - **No virtual IOMMU.** Live migration of a VFIO device behind a virtual
   IOMMU is not supported and is refused at migration start. Assign the
   device without a virtual IOMMU.
