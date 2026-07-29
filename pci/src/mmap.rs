@@ -171,7 +171,7 @@ fn allocate_aligned_mapping(
 /// cause SIGSEGV or SIGBUS.  Non-atomic access will generally cause data
 /// races and thus Undefined Behavior.
 #[derive(Debug)]
-pub(crate) struct MmapRegion {
+pub struct MmapRegion {
     addr: *mut u8,
     len: size_t,
 }
@@ -191,7 +191,7 @@ unsafe impl Sync for MmapRegion {}
 
 impl MmapRegion {
     #[inline]
-    pub(crate) fn addr(&self) -> *mut u8 {
+    pub fn addr(&self) -> *mut u8 {
         self.addr
     }
 
@@ -199,12 +199,21 @@ impl MmapRegion {
     /// This function promises that the return value fits in [`libc::size_t`]
     /// and in [`isize`] and `unsafe` code can rely on this.
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether the region is empty. Always `false`: [`MmapRegion::mmap`]
+    /// never succeeds with a zero length. Present to satisfy the standard
+    /// `len()`/`is_empty()` API pairing now that the type is crate-external
+    /// (`pub mod mmap`).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Create an [`MmapRegion`] using `mmap` of a file descriptor.
-    pub(crate) fn mmap(
+    pub fn mmap(
         len: u64,
         prot: c_int,
         fd: BorrowedFd,
