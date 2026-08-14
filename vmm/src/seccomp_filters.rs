@@ -142,6 +142,12 @@ mod iommufd {
     pub(super) const IOMMU_VDEVICE_ALLOC: u64 = 0x3b91;
     pub(super) const IOMMU_VEVENTQ_ALLOC: u64 = 0x3b93;
     pub(super) const IOMMU_HW_QUEUE_ALLOC: u64 = 0x3b94;
+    // File-backed BAR mapping: issued from the VMM thread at device setup
+    // and from the vCPU thread when a guest un-revokes the dma-buf by
+    // re-enabling memory space decode.
+    pub(super) const IOMMU_IOAS_MAP_FILE: u64 = 0x3b8f;
+    // IOAS IOVA alignment query: VMM thread only, once per device setup.
+    pub(super) const IOMMU_IOAS_IOVA_RANGES: u64 = 0x3b84;
 
     // See include/uapi/linux/vfio.h in the kernel code.
     pub(super) const VFIO_DEVICE_BIND_IOMMUFD: u64 = 0x3b76;
@@ -311,6 +317,8 @@ fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendEr
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VDEVICE_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VEVENTQ_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HW_QUEUE_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_IOVA_RANGES)?],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_BIND_IOMMUFD)?],
         and![Cond::new(
             1,
@@ -881,6 +889,7 @@ fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendE
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
