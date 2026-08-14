@@ -162,10 +162,27 @@ nvidia-smi topo -p2p r
 Peer-to-peer BAR mappings are best effort: on kernels that cannot map BAR
 MMIO into the IOMMU (iommufd before Linux 6.19, and some type1 container
 kernels), Cloud Hypervisor logs a warning and continues with peer-to-peer
-DMA into the affected BARs disabled. Since `x_nv_gpudirect_clique` asserts
-that P2P DMA is required, a failed BAR mapping remains a hard error for
-devices with a clique configured. `vfio_p2p_dma=off` disables the mapping
-attempts entirely.
+DMA into the affected BARs disabled. `vfio_p2p_dma=off` disables the
+mapping attempts entirely.
+
+Since `x_nv_gpudirect_clique` asserts that every memory BAR is present in
+the guest's stage-2 map, a device with a clique configured fails closed
+(a hard error, not a warning) whenever any of the following would
+otherwise silently leave a BAR unmapped or partially mapped:
+
+- a failed peer-to-peer DMA map (the case above)
+- the BAR is named in `x_exclude_mmap_bars`
+- the kernel does not report the BAR as MMAP-capable
+  (`VFIO_REGION_INFO_FLAG_MMAP` unset)
+- the BAR carries the MSI-X table/PBA without
+  `VFIO_REGION_INFO_CAP_MSIX_MAPPABLE`
+- the kernel reports a genuine sparse-mmap hole
+  (`VFIO_REGION_INFO_CAP_SPARSE_MMAP` leaves part of the BAR unmapped)
+
+Two regions are exempt from this assert and keep the existing silent
+behavior regardless of the clique setting: the PCI expansion ROM (the
+kernel never reports it MMAP-capable, yet every documented clique GPU
+carries a VBIOS ROM) and I/O port BARs (never memory-mapped at all).
 
 Some VFIO devices expose BARs that should not be mmapped by the VMM even when
 the kernel reports them as mappable. The `x_exclude_mmap_bars` config argument can

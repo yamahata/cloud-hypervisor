@@ -74,8 +74,25 @@ use crate::{
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
 pub(crate) const VFIO_MIGRATION_ID: &str = "vfio_migration";
 
+/// Why a clique device's stage-2 mapping attempt failed closed at a
+/// site that otherwise silently leaves a BAR unmapped or partially
+/// mapped.
+#[derive(Debug, Error)]
+pub enum CliqueSkipReason {
+    #[error("excluded from the stage-2 map via x_exclude_mmap_bars")]
+    UserExcludedBar,
+    #[error("region is not MMAP-capable (VFIO_REGION_INFO_FLAG_MMAP unset)")]
+    NotMmapCapable,
+    #[error("MSI-X table/PBA region lacks VFIO_REGION_INFO_CAP_MSIX_MAPPABLE")]
+    MsixNotMappable,
+    #[error("sparse mmap covers only 0x{mapped:x} of 0x{size:x} bytes; a stage-2 hole remains")]
+    KernelSparseHole { mapped: u64, size: u64 },
+}
+
 #[derive(Debug, Error)]
 pub enum VfioPciError {
+    #[error("Clique device {0} BAR {1}: {2}")]
+    CliqueMappingSkipped(PciBdf, u32, CliqueSkipReason),
     #[error("Failed to create user memory region")]
     CreateUserMemoryRegion(#[source] HypervisorVmError),
     #[error("Failed to DMA map: {0} for device {1} (guest BDF: {2})")]
@@ -2241,6 +2258,76 @@ impl VfioPciDevice {
         }])
     }
 
+    /// Whether `map_mmio_regions()` must fail closed for this region
+    /// under `x_nv_gpudirect_clique`, and why. `None` means keep
+    /// today's silent behavior for this region (map it, skip it
+    /// quietly, or let a later check decide) - the caller interprets
+    /// `None` exactly as it did before this function existed. All of
+    /// the clique fail-closed decision lives here: the ROM/I/O-BAR
+    /// exemption, the four skip reasons, and generate_sparse_areas()'s
+    /// FIRST-cap-wins semantics for telling a genuine kernel-reported
+    /// sparse hole apart from a deliberate MSI-X table/PBA carve-out.
+    ///
+    /// Each check below short-circuits before touching the parameters
+    /// only a later check needs, so a call site that has not yet
+    /// computed those later facts may pass a placeholder (`false`,
+    /// `0`, `&[]`, or `(0, 0)`) for them without affecting the result.
+    #[allow(clippy::too_many_arguments)]
+    fn clique_skip_reason(
+        clique_configured: bool,
+        region_index: u32,
+        region_type: PciBarRegionType,
+        region_flags: u32,
+        caps: &[VfioRegionInfoCap],
+        user_excluded: bool,
+        is_msix_table_or_pba: bool,
+        mapped_vs_size: (u64, u64),
+    ) -> Option<CliqueSkipReason> {
+        if !clique_configured
+            || region_index == VFIO_PCI_ROM_REGION_INDEX
+            || region_type == PciBarRegionType::IoRegion
+        {
+            return None;
+        }
+
+        if user_excluded {
+            return Some(CliqueSkipReason::UserExcludedBar);
+        }
+
+        if region_flags & VFIO_REGION_INFO_FLAG_MMAP == 0 {
+            return Some(CliqueSkipReason::NotMmapCapable);
+        }
+
+        if is_msix_table_or_pba && !caps.contains(&VfioRegionInfoCap::MsixMappable) {
+            return Some(CliqueSkipReason::MsixNotMappable);
+        }
+
+        // Mirror generate_sparse_areas()'s FIRST-cap-wins semantics: a
+        // region can carry both SparseMmap and MsixMappable, and
+        // generate_sparse_areas() takes whichever comes first in the
+        // kernel-reported list. Only when SparseMmap is that first
+        // match is this a genuine kernel-reported hole; when
+        // MsixMappable wins instead, the "hole" is the MSI-X
+        // table/PBA carve-out, deliberately trapped by design, not a
+        // missing mapping.
+        let first_relevant_cap = caps.iter().find(|cap| {
+            matches!(
+                cap,
+                VfioRegionInfoCap::SparseMmap(_) | VfioRegionInfoCap::MsixMappable
+            )
+        });
+        let is_kernel_reported_sparse =
+            matches!(first_relevant_cap, Some(VfioRegionInfoCap::SparseMmap(_)));
+        if is_kernel_reported_sparse {
+            let (mapped, size) = mapped_vs_size;
+            if mapped < size {
+                return Some(CliqueSkipReason::KernelSparseHole { mapped, size });
+            }
+        }
+
+        None
+    }
+
     /// Map MMIO regions into the guest, and avoid VM exits when the guest tries
     /// to reach those regions.
     ///
@@ -2254,11 +2341,29 @@ impl VfioPciDevice {
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         for region in self.common.mmio_regions.iter_mut() {
+            let clique_configured = self.common.x_nv_gpudirect_clique.is_some();
+
             if self
                 .common
                 .x_exclude_mmap_bars
                 .contains(&(region.index as u8))
             {
+                if let Some(reason) = Self::clique_skip_reason(
+                    clique_configured,
+                    region.index,
+                    region.type_,
+                    0,
+                    &[],
+                    true,
+                    false,
+                    (0, 0),
+                ) {
+                    return Err(VfioPciError::CliqueMappingSkipped(
+                        self.bdf,
+                        region.index,
+                        reason,
+                    ));
+                }
                 info!(
                     "Skipping VFIO BAR mmap and P2P DMA mapping for device {} at {} BAR {} (size = 0x{:x})",
                     self.bdf,
@@ -2289,10 +2394,27 @@ impl VfioPciDevice {
                 // Don't try to mmap the region if it contains MSI-X table or
                 // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
                 // in the list of supported capabilities.
-                if let Some(msix) = self.common.interrupt.msix.as_ref()
-                    && (region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir())
-                    && !caps.contains(&VfioRegionInfoCap::MsixMappable)
-                {
+                let is_msix_table_or_pba =
+                    self.common.interrupt.msix.as_ref().is_some_and(|msix| {
+                        region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir()
+                    });
+                if is_msix_table_or_pba && !caps.contains(&VfioRegionInfoCap::MsixMappable) {
+                    if let Some(reason) = Self::clique_skip_reason(
+                        clique_configured,
+                        region.index,
+                        region.type_,
+                        region_flags,
+                        &caps,
+                        false,
+                        true,
+                        (0, 0),
+                    ) {
+                        return Err(VfioPciError::CliqueMappingSkipped(
+                            self.bdf,
+                            region.index,
+                            reason,
+                        ));
+                    }
                     continue;
                 }
 
@@ -2306,6 +2428,24 @@ impl VfioPciDevice {
                     mmap_size,
                     self.common.interrupt.msix.as_ref(),
                 )?;
+
+                let mapped_size: u64 = sparse_areas.iter().map(|area| area.size).sum();
+                if let Some(reason) = Self::clique_skip_reason(
+                    clique_configured,
+                    region.index,
+                    region.type_,
+                    region_flags,
+                    &caps,
+                    false,
+                    false,
+                    (mapped_size, mmap_size),
+                ) {
+                    return Err(VfioPciError::CliqueMappingSkipped(
+                        self.bdf,
+                        region.index,
+                        reason,
+                    ));
+                }
 
                 let page_size = get_page_size();
                 for area in sparse_areas.iter() {
@@ -2428,7 +2568,42 @@ impl VfioPciDevice {
                     }
                     region.user_memory_regions.push(user_memory_region);
                 }
+            } else if let Some(reason) = Self::clique_skip_reason(
+                clique_configured,
+                region.index,
+                region.type_,
+                region_flags,
+                &[],
+                false,
+                false,
+                (0, 0),
+            ) {
+                return Err(VfioPciError::CliqueMappingSkipped(
+                    self.bdf,
+                    region.index,
+                    reason,
+                ));
             }
+        }
+
+        for region in self.common.mmio_regions.iter() {
+            let extents: Vec<String> = region
+                .user_memory_regions
+                .iter()
+                .map(|umr| {
+                    format!(
+                        "0x{:x}..0x{:x}",
+                        umr.start,
+                        umr.start + umr.mapping.len() as u64
+                    )
+                })
+                .collect();
+            info!(
+                "Device {} BAR {}: mapped guest-PA extents [{}]",
+                self.bdf,
+                region.index,
+                extents.join(", ")
+            );
         }
 
         Ok(())
@@ -2883,6 +3058,7 @@ mod tests {
     use std::os::fd::AsFd;
     use std::sync::Mutex;
 
+    use vfio_ioctls::VfioRegionInfoCapSparseMmap;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -3701,5 +3877,225 @@ mod tests {
         restored.set_state(&state, None, None, None).unwrap();
 
         assert_eq!(restored.read_config_register(0x40 / 4), 0x0000_1234);
+    }
+
+    // clique_skip_reason(): the pure fail-closed decision function
+    // map_mmio_regions() delegates to under x_nv_gpudirect_clique. Each
+    // row below is named after the (region index, MMAP flag, caps,
+    // clique on/off) shape it exercises; no VfioDevice/fd/VM mock is
+    // needed since the function takes only plain data.
+
+    fn sparse_cap(size: u64) -> VfioRegionInfoCap {
+        VfioRegionInfoCap::SparseMmap(VfioRegionInfoCapSparseMmap {
+            areas: vec![VfioRegionSparseMmapArea { offset: 0, size }],
+        })
+    }
+
+    #[test]
+    fn test_clique_skip_reason_rom_region_is_exempt() {
+        // The bug row: the expansion ROM never gets FLAG_MMAP (the
+        // kernel only ever grants it FLAG_READ), yet every documented
+        // clique GPU carries a VBIOS ROM - this must stay silent.
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                VFIO_PCI_ROM_REGION_INDEX,
+                PciBarRegionType::Memory32BitRegion,
+                0,
+                &[],
+                false,
+                false,
+                (0, 0),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_io_bar_is_exempt() {
+        // I/O port BARs are never memory-mapped at all.
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                2,
+                PciBarRegionType::IoRegion,
+                0,
+                &[],
+                false,
+                false,
+                (0, 0),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_msix_carve_is_not_a_hole() {
+        // MsixMappable is the FIRST matching cap: generate_sparse_areas()
+        // takes the deliberate MSI-X table/PBA carve-out path, so the
+        // "gap" implied by (mapped, size) here is not a stage-2
+        // mapping defect and must not be flagged.
+        let caps = [VfioRegionInfoCap::MsixMappable, sparse_cap(0x1000)];
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                2,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                true,
+                (0x1000, 0x2000),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_kernel_sparse_hole_is_fatal_when_clique_on() {
+        let caps = [sparse_cap(0x1000)];
+        let reason = VfioPciDevice::clique_skip_reason(
+            true,
+            2,
+            PciBarRegionType::Memory64BitRegion,
+            VFIO_REGION_INFO_FLAG_MMAP,
+            &caps,
+            false,
+            false,
+            (0x1000, 0x2000),
+        );
+        assert!(matches!(
+            reason,
+            Some(CliqueSkipReason::KernelSparseHole {
+                mapped: 0x1000,
+                size: 0x2000,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_clique_skip_reason_kernel_sparse_hole_is_silent_when_clique_off() {
+        let caps = [sparse_cap(0x1000)];
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                false,
+                2,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                false,
+                (0x1000, 0x2000),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_user_excluded_bar_is_fatal_when_clique_on() {
+        let reason = VfioPciDevice::clique_skip_reason(
+            true,
+            2,
+            PciBarRegionType::Memory64BitRegion,
+            0,
+            &[],
+            true,
+            false,
+            (0, 0),
+        );
+        assert!(matches!(reason, Some(CliqueSkipReason::UserExcludedBar)));
+    }
+
+    #[test]
+    fn test_clique_skip_reason_not_mmap_capable_is_fatal_when_clique_on() {
+        let reason = VfioPciDevice::clique_skip_reason(
+            true,
+            2,
+            PciBarRegionType::Memory64BitRegion,
+            0,
+            &[],
+            false,
+            false,
+            (0, 0),
+        );
+        assert!(matches!(reason, Some(CliqueSkipReason::NotMmapCapable)));
+    }
+
+    #[test]
+    fn test_clique_skip_reason_msix_not_mappable_is_fatal_when_clique_on() {
+        let reason = VfioPciDevice::clique_skip_reason(
+            true,
+            0,
+            PciBarRegionType::Memory32BitRegion,
+            VFIO_REGION_INFO_FLAG_MMAP,
+            &[],
+            false,
+            true,
+            (0, 0),
+        );
+        assert!(matches!(reason, Some(CliqueSkipReason::MsixNotMappable)));
+    }
+
+    // Boundary rows.
+
+    #[test]
+    fn test_clique_skip_reason_no_op_when_clique_not_configured() {
+        // Every other input says "fail closed"; clique_configured =
+        // false must still win over all of them.
+        let reason = VfioPciDevice::clique_skip_reason(
+            false,
+            2,
+            PciBarRegionType::Memory64BitRegion,
+            0,
+            &[],
+            true,
+            true,
+            (0, 0x1000),
+        );
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn test_clique_skip_reason_sparse_mmap_full_coverage_is_not_a_hole() {
+        let caps = [sparse_cap(0x2000)];
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                2,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                false,
+                (0x2000, 0x2000),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_sparse_mmap_wins_when_first() {
+        // The flip side of the MSI-X-carve row: SparseMmap comes
+        // FIRST this time, so generate_sparse_areas() would take the
+        // genuine sparse-mmap path, and a real gap here is a genuine
+        // hole regardless of MsixMappable appearing later in caps.
+        let caps = [sparse_cap(0x1000), VfioRegionInfoCap::MsixMappable];
+        let reason = VfioPciDevice::clique_skip_reason(
+            true,
+            2,
+            PciBarRegionType::Memory64BitRegion,
+            VFIO_REGION_INFO_FLAG_MMAP,
+            &caps,
+            false,
+            false,
+            (0x1000, 0x2000),
+        );
+        assert!(matches!(
+            reason,
+            Some(CliqueSkipReason::KernelSparseHole {
+                mapped: 0x1000,
+                size: 0x2000,
+            })
+        ));
     }
 }
