@@ -212,6 +212,7 @@ impl VfioUserPciDevice {
                         p2p_mapped: false,
                         p2p_len: 0,
                         dmabuf: None,
+                        p2p_revoked: false,
                     };
 
                     // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion

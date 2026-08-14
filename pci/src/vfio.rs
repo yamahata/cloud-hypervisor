@@ -349,6 +349,10 @@ pub(crate) struct UserMemoryRegion {
     /// re-established on a vCPU thread, which cannot call
     /// VFIO_DEVICE_FEATURE. `None` when the legacy VA mapping is in use.
     pub dmabuf: Option<Arc<File>>,
+    /// Set when a revoke edge dropped this region's mapping, so the
+    /// un-revoke edge knows to re-establish it. A mapping lost to a failed
+    /// BAR move is deliberately not marked, and is not retried.
+    pub p2p_revoked: bool,
 }
 
 #[derive(Clone)]
@@ -2232,6 +2236,26 @@ fn p2p_unmap_region(
     vfio_ops.vfio_dma_unmap(umr.start, umr.p2p_len as usize)
 }
 
+/// A memory-space-enable (MSE, COMMAND register bit 1) transition between
+/// two reads of the same register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MseEdge {
+    Enabled,
+    Disabled,
+}
+
+/// The memory-space-enable edge between two COMMAND register reads.
+/// `None` when MSE is unchanged, whether or not some other bit changed.
+fn mse_transition(before: u32, after: u32) -> Option<MseEdge> {
+    let before_enabled = before & COMMAND_REG_MEMORY_SPACE_MASK == COMMAND_REG_MEMORY_SPACE_MASK;
+    let after_enabled = after & COMMAND_REG_MEMORY_SPACE_MASK == COMMAND_REG_MEMORY_SPACE_MASK;
+    match (before_enabled, after_enabled) {
+        (true, false) => Some(MseEdge::Disabled),
+        (false, true) => Some(MseEdge::Enabled),
+        (true, true) | (false, false) => None,
+    }
+}
+
 impl VfioPciDevice {
     /// Constructs a new Vfio Pci device for the given Vfio device
     #[expect(clippy::too_many_arguments)]
@@ -2646,6 +2670,7 @@ impl VfioPciDevice {
                         p2p_mapped: false,
                         p2p_len: 0,
                         dmabuf: None,
+                        p2p_revoked: false,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2967,6 +2992,121 @@ impl VfioPciDevice {
         }
     }
 
+    /// Drop the host IOMMU mapping for every dma-buf-backed region that is
+    /// currently mapped, in response to a guest edge that revokes the
+    /// dma-buf (memory-space-enable disabled, D3, or FLR). Regions with
+    /// `dmabuf == None` are untouched: the kernel's revoke is a dma-buf
+    /// mechanism, a legacy PFNMAP mapping is never revoked, and leaving
+    /// those regions alone is what keeps this hook inert on a kernel
+    /// without dma-buf export support. Never fatal: this runs on a vCPU
+    /// thread in response to a guest config-space write.
+    fn p2p_revoke_all(&mut self) {
+        for region in self.common.mmio_regions.iter_mut() {
+            for umr in region.user_memory_regions.iter_mut() {
+                if umr.dmabuf.is_none() || !umr.p2p_mapped {
+                    continue;
+                }
+                // IOMMU_IOAS_UNMAP is permitted while revoked (measured: T5).
+                if let Err(e) = self
+                    .vfio_ops
+                    .vfio_dma_unmap(umr.start, umr.p2p_len as usize)
+                {
+                    warn!(
+                        "Could not unmap the revoked dma-buf for BAR {} of device {} at {} \
+                         (iova 0x{:x}, size 0x{:x}): {e}",
+                        region.index,
+                        self.bdf,
+                        self.device_path.display(),
+                        umr.start,
+                        umr.p2p_len,
+                    );
+                }
+                // Whether or not the unmap above succeeded: the kernel's
+                // revoke already dropped the mapping on its side, and a
+                // stale entry here would only cause a spurious unmap
+                // later.
+                umr.p2p_mapped = false;
+                umr.p2p_revoked = true;
+                debug!(
+                    "BAR {} of device {} at {} dropped the host IOMMU mapping \
+                     for a revoked dma-buf (iova 0x{:x}, size 0x{:x}).",
+                    region.index,
+                    self.bdf,
+                    self.device_path.display(),
+                    umr.start,
+                    umr.p2p_len,
+                );
+            }
+        }
+    }
+
+    /// Re-establish the host IOMMU mapping for every region a revoke edge
+    /// dropped, in response to the matching un-revoke guest edge. Regions
+    /// with `dmabuf == None` are untouched, for the same reason as
+    /// `p2p_revoke_all`. Never fatal, for the same reason too.
+    fn p2p_restore_all(&mut self) {
+        for region in self.common.mmio_regions.iter_mut() {
+            for umr in region.user_memory_regions.iter_mut() {
+                if !umr.p2p_revoked {
+                    continue;
+                }
+                let Some(fd) = umr.dmabuf.as_ref().map(|f| f.as_raw_fd()) else {
+                    continue;
+                };
+                // UNMAP-then-MAP_FILE, always, and unconditionally of
+                // whether there is anything to unmap: a stale iopt_area
+                // provably survives a full revoke/un-revoke cycle and
+                // answers EEXIST on MAP_FILE otherwise (measured: T12).
+                let _ = self
+                    .vfio_ops
+                    .vfio_dma_unmap(umr.start, umr.p2p_len as usize);
+                match self
+                    .vfio_ops
+                    .vfio_dma_map_file(umr.start, umr.p2p_len, fd, 0)
+                {
+                    Ok(()) => {
+                        umr.p2p_mapped = true;
+                        umr.p2p_revoked = false;
+                        debug!(
+                            "BAR {} of device {} at {} re-established the host IOMMU \
+                             mapping through its dma-buf (iova 0x{:x}, size 0x{:x}).",
+                            region.index,
+                            self.bdf,
+                            self.device_path.display(),
+                            umr.start,
+                            umr.p2p_len,
+                        );
+                    }
+                    Err(e)
+                        if e.errno().map(classify_dma_buf_errno)
+                            == Some(DmaBufOutcome::Revoked) =>
+                    {
+                        // Expected, not a failure: retried on the next
+                        // un-revoke edge.
+                        debug!(
+                            "BAR {} of device {} at {} is still revoked, will retry on the \
+                             next un-revoke edge: {e}",
+                            region.index,
+                            self.bdf,
+                            self.device_path.display(),
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not restore the dma-buf mapping for BAR {} of device {} at \
+                             {} (iova 0x{:x}, size 0x{:x}): {e}",
+                            region.index,
+                            self.bdf,
+                            self.device_path.display(),
+                            umr.start,
+                            umr.p2p_len,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub fn mmio_regions(&self) -> Vec<MmioRegion> {
         self.common.mmio_regions.clone()
     }
@@ -3079,7 +3219,25 @@ impl PciDevice for VfioPciDevice {
         offset: u64,
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
-        self.common.write_config_register(reg_idx, offset, data)
+        // Reads pass straight through to the device, so sample the real
+        // COMMAND register on both sides of the forwarded write rather
+        // than trusting the shadow.
+        let watch = reg_idx == COMMAND_REG && !self.iommu_attached && self.p2p_dma;
+        let before = if watch {
+            self.common.read_config_register(COMMAND_REG)
+        } else {
+            0
+        };
+        let ret = self.common.write_config_register(reg_idx, offset, data);
+        if watch {
+            let after = self.common.read_config_register(COMMAND_REG);
+            match mse_transition(before, after) {
+                Some(MseEdge::Disabled) => self.p2p_revoke_all(),
+                Some(MseEdge::Enabled) => self.p2p_restore_all(),
+                None => {}
+            }
+        }
+        ret
     }
 
     fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -3420,6 +3578,7 @@ mod tests {
                     mapping: mapping_a,
                     p2p_mapped: false,
                     dmabuf: None,
+                    p2p_revoked: false,
                 },
                 UserMemoryRegion {
                     slot: 1,
@@ -3428,6 +3587,7 @@ mod tests {
                     mapping: mapping_b,
                     p2p_mapped: false,
                     dmabuf: None,
+                    p2p_revoked: false,
                 },
             ],
         }]
@@ -4489,5 +4649,34 @@ mod tests {
         let outcome = classify_dma_buf_errno(libc::ENODEV);
         assert_eq!(outcome, DmaBufOutcome::Revoked);
         assert_ne!(outcome, DmaBufOutcome::Failed);
+    }
+
+    // mse_transition: the memory-space-enable edge between two COMMAND
+    // register reads. Values are the exact pair the probe measured.
+
+    #[test]
+    fn mse_transition_disabled_edge() {
+        assert_eq!(mse_transition(0x0103, 0x0101), Some(MseEdge::Disabled));
+    }
+
+    #[test]
+    fn mse_transition_enabled_edge() {
+        assert_eq!(mse_transition(0x0101, 0x0103), Some(MseEdge::Enabled));
+    }
+
+    #[test]
+    fn mse_transition_unchanged_enabled_is_none() {
+        assert_eq!(mse_transition(0x0103, 0x0103), None);
+    }
+
+    #[test]
+    fn mse_transition_unchanged_disabled_is_none() {
+        assert_eq!(mse_transition(0x0101, 0x0101), None);
+    }
+
+    #[test]
+    fn mse_transition_unrelated_bit_change_is_none() {
+        // Bit 2 (bus master enable) flips; MSE (bit 1) stays disabled.
+        assert_eq!(mse_transition(0x0101, 0x0105), None);
     }
 }
