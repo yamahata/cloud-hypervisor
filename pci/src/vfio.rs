@@ -2187,6 +2187,51 @@ fn dma_buf_outcome_gloss(outcome: DmaBufOutcome) -> &'static str {
     }
 }
 
+/// Map a region's BAR content into the host IOMMU address space: through
+/// its dma-buf if it has one, or the legacy VA mapping otherwise. A free
+/// function rather than a method on `&self`: a method would need to
+/// borrow all of `self`, which conflicts with the `&mut` borrow of the
+/// region living inside `self.common.mmio_regions` at the one call site,
+/// `move_bar`, that is already live for the duration of the call.
+fn p2p_map_region(
+    vfio_ops: &dyn VfioOps,
+    umr: &mut UserMemoryRegion,
+    bar: u32,
+) -> Result<(), vfio_ioctls::VfioError> {
+    match &umr.dmabuf {
+        Some(f) => {
+            let ret = vfio_ops.vfio_dma_map_file(umr.start, umr.p2p_len, f.as_raw_fd(), 0);
+            if let Err(e) = &ret {
+                debug!("Cannot map BAR {bar} through its dma-buf: {e}");
+            }
+            ret
+        }
+        None => {
+            // vfio_dma_map is unsound and ought to be marked as unsafe
+            // SAFETY: MmapRegion invariants guarantee that
+            // host_addr points to len bytes of
+            // valid memory that will only be unmapped with munmap().
+            let ret =
+                unsafe { vfio_ops.vfio_dma_map(umr.start, umr.mapping.len(), umr.mapping.addr()) };
+            if let Err(e) = &ret {
+                debug!("Cannot map BAR {bar} through the legacy VA mapping: {e}");
+            }
+            ret
+        }
+    }
+}
+
+/// Unmap a region's BAR content from the host IOMMU address space.
+/// Always uses `p2p_len`, not `mapping.len()`: a dma-buf-backed mapping
+/// may cover less than the guest-visible mmap length. A free function
+/// for the same reason as `p2p_map_region` above.
+fn p2p_unmap_region(
+    vfio_ops: &dyn VfioOps,
+    umr: &mut UserMemoryRegion,
+) -> Result<(), vfio_ioctls::VfioError> {
+    vfio_ops.vfio_dma_unmap(umr.start, umr.p2p_len as usize)
+}
+
 impl VfioPciDevice {
     /// Constructs a new Vfio Pci device for the given Vfio device
     #[expect(clippy::too_many_arguments)]
@@ -3057,16 +3102,14 @@ impl PciDevice for VfioPciDevice {
                 for user_memory_region in region.user_memory_regions.iter_mut() {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
-                    // Unmap the old MMIO region from the host IOMMU address space via VfioOps
-                    // Only for regions that were actually P2P-mapped. Uses p2p_len,
-                    // not len: the two are always equal today, but a dma-buf-backed
-                    // mapping (added later) may cover less than the guest-visible
+                    // Unmap the old MMIO region from the host IOMMU address space.
+                    // Only for regions that were actually P2P-mapped. p2p_unmap_region
+                    // uses p2p_len, not len: the two are always equal today, but a
+                    // dma-buf-backed mapping may cover less than the guest-visible
                     // mmap length.
-                    let p2p_len = user_memory_region.p2p_len as usize;
+                    let p2p_len = user_memory_region.p2p_len;
                     if user_memory_region.p2p_mapped
-                        && let Err(e) = self
-                            .vfio_ops
-                            .vfio_dma_unmap(user_memory_region.start, p2p_len)
+                        && let Err(e) = p2p_unmap_region(self.vfio_ops.as_ref(), user_memory_region)
                             .map_err(|e| {
                                 VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf)
                             })
@@ -3117,33 +3160,31 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                     .map_err(io::Error::other)?;
 
                     // Map the moved MMIO region into the host IOMMU address
-                    // space via VfioOps. Only regions that were P2P-mapped
+                    // space, through its dma-buf if it has one or the legacy
+                    // VA mapping otherwise. Only regions that were P2P-mapped
                     // before the move; best effort like the initial mapping,
                     // so a refusal cannot fail the guest's BAR reprogramming
-                    // after the KVM slot has already moved. A lost mapping
-                    // is not retried on later moves.
-                    if user_memory_region.p2p_mapped {
-                        // vfio_dma_map is unsound and ought to be marked as unsafe
-                        // SAFETY: MmapRegion invariants guarantee that
-                        // host_addr points to len bytes of
-                        // valid memory that will only be unmapped with munmap().
-                        if let Err(e) = unsafe {
-                            self.vfio_ops
-                                .vfio_dma_map(user_memory_region.start, len, host_addr)
-                        } {
-                            error!(
-                                "Cannot re-map moved BAR {} of device {} at {} into \
-                                 the host IOMMU address space (iova 0x{:x}, size \
-                                 0x{:x}): {e}. Peer-to-peer DMA into this BAR is \
-                                 disabled.",
-                                region.index,
-                                self.bdf,
-                                self.device_path.display(),
-                                user_memory_region.start,
-                                len,
-                            );
-                            user_memory_region.p2p_mapped = false;
-                        }
+                    // after the KVM slot has already moved. A lost mapping is
+                    // not retried on later moves: dmabuf is left cached (the
+                    // export is still valid) and the revoke flag introduced
+                    // later is deliberately not set here, so a move failure
+                    // is never mistaken for a revoke.
+                    if user_memory_region.p2p_mapped
+                        && let Err(e) =
+                            p2p_map_region(self.vfio_ops.as_ref(), user_memory_region, region.index)
+                    {
+                        error!(
+                            "Cannot re-map moved BAR {} of device {} at {} into \
+                             the host IOMMU address space (iova 0x{:x}, size \
+                             0x{:x}): {e}. Peer-to-peer DMA into this BAR is \
+                             disabled.",
+                            region.index,
+                            self.bdf,
+                            self.device_path.display(),
+                            user_memory_region.start,
+                            len,
+                        );
+                        user_memory_region.p2p_mapped = false;
                     }
                 }
             }
