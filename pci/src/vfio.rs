@@ -5,6 +5,7 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -109,6 +110,19 @@ pub enum VfioPciError {
     MmapArea,
     #[error("Failed to notifier's eventfd")]
     MissingNotifier,
+    #[error(
+        "Failed to DMA map BAR {bar} of device {path} (guest BDF: {bdf}) \
+             into the host IOMMU address space; dma-buf layer: {dmabuf}; \
+             legacy layer: {source}"
+    )]
+    P2pDmaMapAllLayersFailed {
+        #[source]
+        source: vfio_ioctls::VfioError,
+        path: PathBuf,
+        bdf: PciBdf,
+        bar: u32,
+        dmabuf: String,
+    },
     #[error("Invalid region alignment")]
     RegionAlignment,
     #[error("Invalid region size")]
@@ -331,6 +345,10 @@ pub(crate) struct UserMemoryRegion {
     /// `mapping.len()`: a sub-page BAR's mmap is expanded to a full host
     /// page, but a dma-buf may not exceed `pci_resource_len`.
     pub p2p_len: u64,
+    /// The dma-buf exported for this area, kept alive so the mapping can be
+    /// re-established on a vCPU thread, which cannot call
+    /// VFIO_DEVICE_FEATURE. `None` when the legacy VA mapping is in use.
+    pub dmabuf: Option<Arc<File>>,
 }
 
 #[derive(Clone)]
@@ -2102,6 +2120,71 @@ pub struct VfioPciDevice {
     memory: GuestMemoryAtomic<GuestMemoryMmap>,
     bdf: PciBdf,
     device_path: PathBuf,
+    // Set once the "kernel/device does not support dma-buf export" warning
+    // has fired, so it is logged at most once per device rather than once
+    // per BAR (or per BAR per re-map).
+    dmabuf_unsupported_warned: bool,
+}
+
+/// The dma-buf length for a sparse area, or `None` when the area cannot
+/// satisfy the IOAS alignment contract:
+///   iova % alignment == 0 && (iova + length) % alignment == 0
+/// An alignment of 0 means the backend offers no file-backed path.
+fn dma_range_for_area(iova: u64, area_size: u64, iova_alignment: u64) -> Option<u64> {
+    if iova_alignment != 0
+        && area_size != 0
+        && iova.is_multiple_of(iova_alignment)
+        && area_size.is_multiple_of(iova_alignment)
+    {
+        Some(area_size)
+    } else {
+        None
+    }
+}
+
+/// How a dma-buf export or import errno maps onto the fallback ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmaBufOutcome {
+    // The kernel or device has no dma-buf export support at all.
+    Unsupported,
+    // The dma-buf is currently revoked (ENODEV). This only shapes what
+    // gets logged, not what happens: at the L1/L2 call sites below it
+    // just picks the log wording, and in p2p_restore_all every failure
+    // is retried on the next un-revoke edge regardless of
+    // classification - Revoked only makes that expected case log at
+    // debug! instead of warn!.
+    Revoked,
+    // A stale IOAS area occupies the IOVA (EEXIST). Also classification
+    // for logging only: an EEXIST here falls straight through to the
+    // legacy VA mapping (L3) like any other error; nothing unmaps and
+    // retries at this call site.
+    Stale,
+    // A genuine, unexpected failure.
+    Failed,
+}
+
+/// Classify an errno returned by a dma-buf export or file-backed map
+/// attempt onto the fallback ladder above.
+fn classify_dma_buf_errno(errno: i32) -> DmaBufOutcome {
+    match errno {
+        libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP => DmaBufOutcome::Unsupported,
+        libc::ENODEV => DmaBufOutcome::Revoked,
+        libc::EEXIST => DmaBufOutcome::Stale,
+        _ => DmaBufOutcome::Failed,
+    }
+}
+
+/// A short, human-readable gloss for a classified dma-buf layer failure,
+/// used to shape the L1/L2 debug log lines in `map_mmio_regions()`. Purely
+/// cosmetic at this commit - `Revoked` and `Stale` carry no behavioural
+/// consequence here; that arrives with the revoke/rebuild hooks.
+fn dma_buf_outcome_gloss(outcome: DmaBufOutcome) -> &'static str {
+    match outcome {
+        DmaBufOutcome::Unsupported => "this kernel/device has no dma-buf path",
+        DmaBufOutcome::Revoked => "the dma-buf is currently revoked",
+        DmaBufOutcome::Stale => "a stale IOAS area occupies the IOVA",
+        DmaBufOutcome::Failed => "a genuine failure worth attention",
+    }
 }
 
 impl VfioPciDevice {
@@ -2153,6 +2236,7 @@ impl VfioPciDevice {
             memory,
             bdf,
             device_path,
+            dmabuf_unsupported_warned: false,
         };
 
         Ok(vfio_pci_device)
@@ -2344,6 +2428,14 @@ impl VfioPciDevice {
         let fd = self.device.as_raw_fd();
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        // Query the alignment IOMMU_IOAS_MAP_FILE requires of an IOVA range,
+        // once per call rather than once per region or per area. unwrap_or(0)
+        // together with dma_range_for_area() returning None for alignment 0
+        // is what makes a backend without the file-backed path (the legacy
+        // container backend, an mshv-only build, or a kernel too old for
+        // IOMMU_IOAS_IOVA_RANGES) fall through cleanly to the legacy mapping
+        // below.
+        let iova_alignment = self.vfio_ops.vfio_dma_iova_alignment().unwrap_or(0);
         for region in self.common.mmio_regions.iter_mut() {
             let clique_configured = self.common.x_nv_gpudirect_clique.is_some();
 
@@ -2508,6 +2600,7 @@ impl VfioPciDevice {
                         mapping: Arc::new(mapping),
                         p2p_mapped: false,
                         p2p_len: 0,
+                        dmabuf: None,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2526,53 +2619,218 @@ impl VfioPciDevice {
                     }
                     .map_err(VfioPciError::CreateUserMemoryRegion)?;
 
-                    // Map the MMIO BAR into the host IOMMU address space via
-                    // VfioOps. Only needed if p2p_dma is enabled, and best
-                    // effort: some kernels cannot map MMIO (PFNMAP) memory
-                    // into their IOMMU backend, while the guest-visible
-                    // mapping above already succeeded, so losing this map
-                    // only disables DMA from other devices into this BAR.
+                    // Map the MMIO BAR into the host IOMMU address space.
+                    // Only needed if p2p_dma is enabled, and best effort:
+                    // some kernels cannot map MMIO (PFNMAP) memory into
+                    // their IOMMU backend, while the guest-visible mapping
+                    // above already succeeded, so losing this map only
+                    // disables DMA from other devices into this BAR. Tries
+                    // a dma-buf-backed mapping first (L1/L2), because that
+                    // is what can later be re-established from a vCPU
+                    // thread; falls back to the legacy VA mapping (L3),
+                    // which is today's working path on this host and must
+                    // stay reachable on any kernel that lacks dma-buf
+                    // export support.
                     if !self.iommu_attached && self.p2p_dma {
-                        // vfio_dma_map should be unsafe but isn't.
-                        // SAFETY: MmapRegion invariants guarantee that
-                        // user_memory_region.mapping.addr() points to
-                        // user_memory_region.mapping.len() bytes of
-                        // valid memory that will only be unmapped with munmap().
-                        match unsafe {
-                            self.vfio_ops.vfio_dma_map(
-                                user_memory_region.start,
-                                user_memory_region.mapping.len(),
-                                user_memory_region.mapping.addr(),
-                            )
-                        } {
-                            Ok(()) => {
-                                user_memory_region.p2p_mapped = true;
-                                user_memory_region.p2p_len =
-                                    user_memory_region.mapping.len() as u64;
+                        let mut dmabuf_layer_err: Option<String> = None;
+
+                        // L1 export: try to hand this area to the kernel as
+                        // a dma-buf. Exports area.size, never mmap_len - the
+                        // page-expanded length would exceed
+                        // pci_resource_len and could describe a range past
+                        // the BAR.
+                        let mapped_via_dmabuf = match dma_range_for_area(
+                            user_memory_region.start,
+                            area.size,
+                            iova_alignment,
+                        ) {
+                            Some(len) => {
+                                match self.device.export_dma_buf(region.index, area.offset, len) {
+                                    Ok(Some(file)) => {
+                                        // L2 map: the dma-buf's own offset
+                                        // space begins at 0 - the range was
+                                        // already selected at export time
+                                        // via area.offset - so the start
+                                        // argument here is always 0.
+                                        match self.vfio_ops.vfio_dma_map_file(
+                                            user_memory_region.start,
+                                            len,
+                                            file.as_raw_fd(),
+                                            0,
+                                        ) {
+                                            Ok(()) => {
+                                                debug!(
+                                                    "Mapped BAR {} of device {} at {} into the \
+                                                     host IOMMU address space through a dma-buf \
+                                                     (iova 0x{:x}, size 0x{len:x}).",
+                                                    region.index,
+                                                    self.bdf,
+                                                    self.device_path.display(),
+                                                    user_memory_region.start,
+                                                );
+                                                user_memory_region.p2p_mapped = true;
+                                                user_memory_region.p2p_len = len;
+                                                user_memory_region.dmabuf = Some(Arc::new(file));
+                                                true
+                                            }
+                                            Err(e) => {
+                                                // Classify by errno where the
+                                                // error carries one, to shape
+                                                // the log line; the outcome
+                                                // has no behavioural effect
+                                                // at this commit (that
+                                                // arrives with the
+                                                // revoke/rebuild hooks) - it
+                                                // only changes what gets
+                                                // logged.
+                                                match e.errno().map(classify_dma_buf_errno) {
+                                                    Some(outcome) => debug!(
+                                                        "Cannot map dma-buf for BAR {} of device \
+                                                         {} at {} into the host IOMMU address \
+                                                         space (iova 0x{:x}, size 0x{len:x}, \
+                                                         {}): {e}. Falling back to the legacy VA \
+                                                         mapping.",
+                                                        region.index,
+                                                        self.bdf,
+                                                        self.device_path.display(),
+                                                        user_memory_region.start,
+                                                        dma_buf_outcome_gloss(outcome),
+                                                    ),
+                                                    None => debug!(
+                                                        "Cannot map dma-buf for BAR {} of device \
+                                                         {} at {} into the host IOMMU address \
+                                                         space (iova 0x{:x}, size 0x{len:x}): \
+                                                         {e}. Falling back to the legacy VA \
+                                                         mapping.",
+                                                        region.index,
+                                                        self.bdf,
+                                                        self.device_path.display(),
+                                                        user_memory_region.start,
+                                                    ),
+                                                }
+                                                dmabuf_layer_err = Some(e.to_string());
+                                                false
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if !self.dmabuf_unsupported_warned {
+                                            // info!, not warn!: on a kernel
+                                            // without dma-buf export support
+                                            // (e.g. this project's own golden
+                                            // kernel 316) this is the
+                                            // expected, non-degraded path,
+                                            // not a problem worth a warning
+                                            // on every boot.
+                                            info!(
+                                                "Device {} at {} does not support exporting BAR \
+                                                 MMIO as a dma-buf; peer-to-peer DMA will use \
+                                                 the legacy VA mapping.",
+                                                self.bdf,
+                                                self.device_path.display(),
+                                            );
+                                            self.dmabuf_unsupported_warned = true;
+                                        }
+                                        // L1 was attempted and reported
+                                        // unsupported, not skipped - distinct
+                                        // from the None arm below, where the
+                                        // alignment predicate skipped it
+                                        // before any attempt.
+                                        dmabuf_layer_err = Some("unsupported".to_string());
+                                        false
+                                    }
+                                    Err(e) => {
+                                        // Classify by errno where the error
+                                        // carries one, to shape the log
+                                        // line; the outcome has no
+                                        // behavioural effect at this commit
+                                        // (that arrives with the
+                                        // revoke/rebuild hooks) - it only
+                                        // changes what gets logged.
+                                        match e.errno().map(classify_dma_buf_errno) {
+                                            Some(outcome) => debug!(
+                                                "Cannot export BAR {} of device {} at {} as a \
+                                                 dma-buf ({}): {e}. Falling back to the legacy \
+                                                 VA mapping.",
+                                                region.index,
+                                                self.bdf,
+                                                self.device_path.display(),
+                                                dma_buf_outcome_gloss(outcome),
+                                            ),
+                                            None => debug!(
+                                                "Cannot export BAR {} of device {} at {} as a \
+                                                 dma-buf: {e}. Falling back to the legacy VA \
+                                                 mapping.",
+                                                region.index,
+                                                self.bdf,
+                                                self.device_path.display(),
+                                            ),
+                                        }
+                                        dmabuf_layer_err = Some(e.to_string());
+                                        false
+                                    }
+                                }
                             }
-                            Err(e) if self.common.x_nv_gpudirect_clique.is_some() => {
-                                // x_nv_gpudirect_clique asserts peer-to-peer
-                                // DMA is required, so its loss stays fatal.
-                                // Push the region first: the KVM slot exists
-                                // and must be reclaimed on teardown.
-                                region.user_memory_regions.push(user_memory_region);
-                                return Err(VfioPciError::DmaMap(
-                                    e,
-                                    self.device_path.clone(),
+                            None => false,
+                        };
+
+                        // L3 legacy: reached from Ok(None), from any L1/L2
+                        // error, or when L1 was skipped (area could not
+                        // satisfy the alignment contract). Unchanged from
+                        // before this series.
+                        if !mapped_via_dmabuf {
+                            // vfio_dma_map should be unsafe but isn't.
+                            // SAFETY: MmapRegion invariants guarantee that
+                            // user_memory_region.mapping.addr() points to
+                            // user_memory_region.mapping.len() bytes of
+                            // valid memory that will only be unmapped with munmap().
+                            match unsafe {
+                                self.vfio_ops.vfio_dma_map(
+                                    user_memory_region.start,
+                                    user_memory_region.mapping.len(),
+                                    user_memory_region.mapping.addr(),
+                                )
+                            } {
+                                Ok(()) => {
+                                    user_memory_region.p2p_mapped = true;
+                                    user_memory_region.p2p_len =
+                                        user_memory_region.mapping.len() as u64;
+                                }
+                                Err(e) if self.common.x_nv_gpudirect_clique.is_some() => {
+                                    // L4: x_nv_gpudirect_clique asserts
+                                    // peer-to-peer DMA is required, so its
+                                    // loss stays fatal here and only here -
+                                    // the flag asserts the capability, not
+                                    // the mechanism, and making it fatal at
+                                    // L1/L2 would turn every clique user on
+                                    // a pre-6.19 kernel - including this
+                                    // project's own GH200 on kernel 316 -
+                                    // from booting-and-working into
+                                    // refusing-to-boot. Push the region
+                                    // first: the KVM slot exists and must
+                                    // be reclaimed on teardown.
+                                    region.user_memory_regions.push(user_memory_region);
+                                    return Err(VfioPciError::P2pDmaMapAllLayersFailed {
+                                        source: e,
+                                        path: self.device_path.clone(),
+                                        bdf: self.bdf,
+                                        bar: region.index,
+                                        dmabuf: dmabuf_layer_err
+                                            .unwrap_or_else(|| "not attempted".to_string()),
+                                    });
+                                }
+                                Err(e) => warn!(
+                                    "Cannot map BAR {} of device {} at {} into the host \
+                                     IOMMU address space (iova 0x{:x}, size 0x{:x}): {e}. \
+                                     Guest access is unaffected; peer-to-peer DMA into \
+                                     this BAR is disabled.",
+                                    region.index,
                                     self.bdf,
-                                ));
+                                    self.device_path.display(),
+                                    user_memory_region.start,
+                                    user_memory_region.mapping.len(),
+                                ),
                             }
-                            Err(e) => warn!(
-                                "Cannot map BAR {} of device {} at {} into the host \
-                                 IOMMU address space (iova 0x{:x}, size 0x{:x}): {e}. \
-                                 Guest access is unaffected; peer-to-peer DMA into \
-                                 this BAR is disabled.",
-                                region.index,
-                                self.bdf,
-                                self.device_path.display(),
-                                user_memory_region.start,
-                                user_memory_region.mapping.len(),
-                            ),
                         }
                     }
                     region.user_memory_regions.push(user_memory_region);
@@ -3120,6 +3378,7 @@ mod tests {
                     p2p_len: mapping_a.len() as u64,
                     mapping: mapping_a,
                     p2p_mapped: false,
+                    dmabuf: None,
                 },
                 UserMemoryRegion {
                     slot: 1,
@@ -3127,6 +3386,7 @@ mod tests {
                     p2p_len: mapping_b.len() as u64,
                     mapping: mapping_b,
                     p2p_mapped: false,
+                    dmabuf: None,
                 },
             ],
         }]
@@ -4116,5 +4376,77 @@ mod tests {
                 size: 0x2000,
             })
         ));
+    }
+
+    // Pure helpers for the dma-buf-backed P2P BAR mapping cascade:
+    // dma_range_for_area (the sub-page BAR skip) and
+    // classify_dma_buf_errno (the fallback ladder).
+
+    #[test]
+    fn dma_range_for_area_full_bar_aligned() {
+        // 16 MiB BAR at a 64 KiB-aligned iova, alignment 0x10000.
+        let iova = 0x1_0000_0000u64;
+        let area_size = 16 * 1024 * 1024u64;
+        assert_eq!(
+            dma_range_for_area(iova, area_size, 0x10000),
+            Some(area_size)
+        );
+    }
+
+    #[test]
+    fn dma_range_for_area_sub_page_nvme_area_is_none() {
+        // The measured NVMe case: a 16 KiB area cannot satisfy a 64 KiB
+        // alignment contract.
+        let iova = 0x1_0000_0000u64;
+        let area_size = 16 * 1024u64;
+        assert_eq!(dma_range_for_area(iova, area_size, 0x10000), None);
+    }
+
+    #[test]
+    fn dma_range_for_area_zero_alignment_is_none() {
+        // Alignment 0 means the backend offers no file-backed path at all.
+        assert_eq!(dma_range_for_area(0x1_0000_0000, 16 * 1024 * 1024, 0), None);
+    }
+
+    #[test]
+    fn dma_range_for_area_alignment_one_is_some() {
+        // The kernel documents 1 as "any IOVA allowed".
+        assert_eq!(dma_range_for_area(0x1234_5678, 0x2345, 1), Some(0x2345));
+    }
+
+    #[test]
+    fn dma_range_for_area_misaligned_iova_is_none() {
+        let iova = 0x1_0000_0001u64; // not a multiple of 0x10000
+        let area_size = 16 * 1024 * 1024u64;
+        assert_eq!(dma_range_for_area(iova, area_size, 0x10000), None);
+    }
+
+    #[test]
+    fn classify_dma_buf_errno_maps_every_arm() {
+        assert_eq!(
+            classify_dma_buf_errno(libc::ENOTTY),
+            DmaBufOutcome::Unsupported
+        );
+        assert_eq!(
+            classify_dma_buf_errno(libc::EINVAL),
+            DmaBufOutcome::Unsupported
+        );
+        assert_eq!(
+            classify_dma_buf_errno(libc::EOPNOTSUPP),
+            DmaBufOutcome::Unsupported
+        );
+        assert_eq!(classify_dma_buf_errno(libc::ENODEV), DmaBufOutcome::Revoked);
+        assert_eq!(classify_dma_buf_errno(libc::EEXIST), DmaBufOutcome::Stale);
+        assert_eq!(classify_dma_buf_errno(libc::EIO), DmaBufOutcome::Failed);
+    }
+
+    // The datum the hardware run bought: a revoked dma-buf answers ENODEV,
+    // and that must be retried on the next un-revoke edge, never treated
+    // as a hard failure.
+    #[test]
+    fn classify_dma_buf_errno_enodev_is_revoked_not_failed() {
+        let outcome = classify_dma_buf_errno(libc::ENODEV);
+        assert_eq!(outcome, DmaBufOutcome::Revoked);
+        assert_ne!(outcome, DmaBufOutcome::Failed);
     }
 }

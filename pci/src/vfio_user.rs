@@ -211,6 +211,7 @@ impl VfioUserPciDevice {
                         // host IOMMU through VfioOps.
                         p2p_mapped: false,
                         p2p_len: 0,
+                        dmabuf: None,
                     };
 
                     // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion
