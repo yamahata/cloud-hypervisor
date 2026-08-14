@@ -210,6 +210,7 @@ impl VfioUserPciDevice {
                         // vfio-user regions are never DMA-mapped into the
                         // host IOMMU through VfioOps.
                         p2p_mapped: false,
+                        p2p_len: 0,
                     };
 
                     // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion

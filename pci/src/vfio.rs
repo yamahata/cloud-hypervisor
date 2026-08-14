@@ -327,6 +327,10 @@ pub(crate) struct UserMemoryRegion {
     /// kernel cannot map MMIO into the IOMMU backend. Tracked on the
     /// owning copy in VfioCommon::mmio_regions; clones can go stale.
     pub p2p_mapped: bool,
+    /// Length actually passed to the host IOMMU. Not always
+    /// `mapping.len()`: a sub-page BAR's mmap is expanded to a full host
+    /// page, but a dma-buf may not exceed `pci_resource_len`.
+    pub p2p_len: u64,
 }
 
 #[derive(Clone)]
@@ -2503,6 +2507,7 @@ impl VfioPciDevice {
                         start: region.start.0 + area.offset,
                         mapping: Arc::new(mapping),
                         p2p_mapped: false,
+                        p2p_len: 0,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2540,7 +2545,11 @@ impl VfioPciDevice {
                                 user_memory_region.mapping.addr(),
                             )
                         } {
-                            Ok(()) => user_memory_region.p2p_mapped = true,
+                            Ok(()) => {
+                                user_memory_region.p2p_mapped = true;
+                                user_memory_region.p2p_len =
+                                    user_memory_region.mapping.len() as u64;
+                            }
                             Err(e) if self.common.x_nv_gpudirect_clique.is_some() => {
                                 // x_nv_gpudirect_clique asserts peer-to-peer
                                 // DMA is required, so its loss stays fatal.
@@ -2615,17 +2624,21 @@ impl VfioPciDevice {
                 let len = user_memory_region.mapping.len();
                 let host_addr = user_memory_region.mapping.addr();
                 // Unmap MMIO region from the host IOMMU address space via VfioOps
-                // Only for regions that were actually P2P-mapped.
+                // Only for regions that were actually P2P-mapped. Uses p2p_len,
+                // not len: the two are always equal today, but a dma-buf-backed
+                // mapping (added later) may cover less than the guest-visible
+                // mmap length.
+                let p2p_len = user_memory_region.p2p_len as usize;
                 if user_memory_region.p2p_mapped
                     && let Err(e) = self
                         .vfio_ops
-                        .vfio_dma_unmap(user_memory_region.start, len)
+                        .vfio_dma_unmap(user_memory_region.start, p2p_len)
                         .map_err(|e| VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf))
                 {
                     error!(
                         "Could not unmap MMIO region from the host IOMMU address space: \
                             iova 0x{:x}, size 0x{:x}: {}, ",
-                        user_memory_region.start, len, e
+                        user_memory_region.start, p2p_len, e
                     );
                 }
 
@@ -2787,11 +2800,15 @@ impl PciDevice for VfioPciDevice {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
                     // Unmap the old MMIO region from the host IOMMU address space via VfioOps
-                    // Only for regions that were actually P2P-mapped.
+                    // Only for regions that were actually P2P-mapped. Uses p2p_len,
+                    // not len: the two are always equal today, but a dma-buf-backed
+                    // mapping (added later) may cover less than the guest-visible
+                    // mmap length.
+                    let p2p_len = user_memory_region.p2p_len as usize;
                     if user_memory_region.p2p_mapped
                         && let Err(e) = self
                             .vfio_ops
-                            .vfio_dma_unmap(user_memory_region.start, len)
+                            .vfio_dma_unmap(user_memory_region.start, p2p_len)
                             .map_err(|e| {
                                 VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf)
                             })
@@ -2799,7 +2816,7 @@ impl PciDevice for VfioPciDevice {
                         error!(
                             "Could not unmap MMIO region from the host IOMMU address space: \
 iova 0x{:x}, size 0x{:x}: {}, ",
-                            user_memory_region.start, len, e
+                            user_memory_region.start, p2p_len, e
                         );
                     }
                     // Remove old region
@@ -3100,12 +3117,14 @@ mod tests {
                 UserMemoryRegion {
                     slot: 0,
                     start: page_size,
+                    p2p_len: mapping_a.len() as u64,
                     mapping: mapping_a,
                     p2p_mapped: false,
                 },
                 UserMemoryRegion {
                     slot: 1,
                     start: 3 * page_size,
+                    p2p_len: mapping_b.len() as u64,
                     mapping: mapping_b,
                     p2p_mapped: false,
                 },
