@@ -9,6 +9,7 @@ use std::fs::File;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
@@ -758,6 +759,21 @@ pub(crate) struct VfioCommon {
     // Negotiated dirty bitmap granularity while DMA logging is active.
     dma_logging_page_size: Option<u64>,
     extended_caps: Vec<Arc<dyn PciExpressCapability + Send + Sync>>,
+    // Standard-capability-list offset of the PCI Express Capability, set
+    // by parse_capabilities. Used to locate the Device Control register
+    // (offset+8) for the FLR hook and to gate parse_extended_capabilities
+    // the same way the old pci_express_cap_found bool did.
+    pcie_cap_offset: Option<u8>,
+    // Standard-capability-list offset of the Power Management Capability,
+    // set by parse_capabilities. Used to locate the PMCSR register
+    // (offset+4) for the D3 hook and to gate parse_extended_capabilities
+    // the same way the old power_management_cap_found bool did.
+    pm_cap_offset: Option<u8>,
+    // Bumped by reset_and_rearm() after every reset. AtomicU64 because
+    // reset_and_rearm takes &self; Relaxed is sufficient because the
+    // comparison against it always happens later, on the same thread
+    // (VfioPciDevice::reconcile_after_reset).
+    reset_generation: AtomicU64,
 }
 
 #[derive(Default)]
@@ -836,6 +852,9 @@ impl VfioCommon {
             migration_flags,
             dma_logging_page_size: None,
             extended_caps: config.extended_caps,
+            pcie_cap_offset: None,
+            pm_cap_offset: None,
+            reset_generation: AtomicU64::new(0),
         };
 
         let state: Option<VfioCommonState> = snapshot
@@ -866,6 +885,11 @@ impl VfioCommon {
                     ))
                 })?;
             vfio_common.set_state(state, msi_state, msix_state, mig)?;
+            // parse_capabilities() does not run on this path, so capture
+            // the same two capability offsets directly - otherwise the
+            // D3 and FLR hooks are silently dead on a restored or
+            // live-migrated device.
+            vfio_common.capture_pcie_and_pm_cap_offsets();
         } else {
             vfio_common.parse_capabilities(bdf)?;
             vfio_common.initialize_legacy_interrupt()?;
@@ -1233,9 +1257,19 @@ impl VfioCommon {
         None
     }
 
-    fn parse_capabilities(&mut self, bdf: PciBdf) -> Result<(), VfioPciError> {
+    /// Capture the standard-capability-list offsets of the PCI Express
+    /// and Power Management capabilities, needed by
+    /// `write_config_register`'s D3 and FLR hooks. Deliberately narrow:
+    /// unlike `parse_capabilities`, this does not initialize MSI/MSI-X,
+    /// add the NVIDIA clique capability, or parse extended capabilities.
+    /// It exists so the two offsets are captured on the restore path
+    /// too, where `set_state` runs instead of `parse_capabilities` and
+    /// neither field is serialized - without this, the D3 and FLR hooks
+    /// are silently dead on every snapshot-restored or live-migrated
+    /// device.
+    fn capture_pcie_and_pm_cap_offsets(&mut self) {
         if !self.has_capabilities() {
-            return Ok(());
+            return;
         }
 
         let mut cap_iter = self
@@ -1243,8 +1277,37 @@ impl VfioCommon {
             .read_config_byte(PCI_CONFIG_CAPABILITY_OFFSET)
             & PCI_CONFIG_CAPABILITY_PTR_MASK;
 
-        let mut pci_express_cap_found = false;
-        let mut power_management_cap_found = false;
+        while cap_iter != 0 {
+            let cap_id = self.vfio_wrapper.read_config_byte(cap_iter.into());
+
+            match PciCapabilityId::from(cap_id) {
+                PciCapabilityId::PciExpress => self.pcie_cap_offset = Some(cap_iter),
+                PciCapabilityId::PowerManagement => self.pm_cap_offset = Some(cap_iter),
+                _ => {}
+            }
+
+            let cap_next = self.vfio_wrapper.read_config_byte((cap_iter + 1).into())
+                & PCI_CONFIG_CAPABILITY_PTR_MASK;
+
+            if cap_next == 0 || cap_next == cap_iter {
+                break;
+            }
+
+            cap_iter = cap_next;
+        }
+    }
+
+    fn parse_capabilities(&mut self, bdf: PciBdf) -> Result<(), VfioPciError> {
+        if !self.has_capabilities() {
+            return Ok(());
+        }
+
+        self.capture_pcie_and_pm_cap_offsets();
+
+        let mut cap_iter = self
+            .vfio_wrapper
+            .read_config_byte(PCI_CONFIG_CAPABILITY_OFFSET)
+            & PCI_CONFIG_CAPABILITY_PTR_MASK;
 
         while cap_iter != 0 {
             let cap_id = self.vfio_wrapper.read_config_byte(cap_iter.into());
@@ -1270,20 +1333,16 @@ impl VfioCommon {
                         self.initialize_msix(msix_cap, cap_iter as u32, bdf, None);
                     }
                 }
-                PciCapabilityId::PciExpress => {
-                    pci_express_cap_found = true;
-
-                    // Advertise the device as a PCIe integrated endpoint if the
-                    // PASID capability is enabled.
+                // Advertise the device as a PCIe integrated endpoint if the
+                // PASID capability is enabled.
+                PciCapabilityId::PciExpress
                     if self
                         .extended_caps
                         .iter()
-                        .any(|cap| cap.id() == PciExpressCapabilityId::ProcessAddressSpaceId)
-                    {
-                        self.present_as_integrated_endpoint(cap_iter);
-                    }
+                        .any(|cap| cap.id() == PciExpressCapabilityId::ProcessAddressSpaceId) =>
+                {
+                    self.present_as_integrated_endpoint(cap_iter);
                 }
-                PciCapabilityId::PowerManagement => power_management_cap_found = true,
                 _ => {}
             }
 
@@ -1305,7 +1364,7 @@ impl VfioCommon {
             self.add_nv_gpudirect_clique_cap(cap_iter, clique_id);
         }
 
-        if pci_express_cap_found && power_management_cap_found {
+        if self.pcie_cap_offset.is_some() && self.pm_cap_offset.is_some() {
             self.parse_extended_capabilities()?;
         }
 
@@ -1940,6 +1999,10 @@ impl VfioCommon {
         if let Err(e) = self.sync_command_and_interrupts() {
             error!("VFIO device rearm after reset failed: {e}");
         }
+        // Let VfioPciDevice know a reset happened, so it can rebuild any
+        // P2P mapping the reset may have dropped. Relaxed: the comparison
+        // against this happens later, on the same thread.
+        self.reset_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     // A failed set can leave the device anywhere along the transition path
@@ -2128,6 +2191,10 @@ pub struct VfioPciDevice {
     // has fired, so it is logged at most once per device rather than once
     // per BAR (or per BAR per re-map).
     dmabuf_unsupported_warned: bool,
+    // The last common.reset_generation value reconcile_after_reset() has
+    // rebuilt P2P mappings against. Plain u64, not an atomic: every
+    // caller of reconcile_after_reset() already holds &mut self.
+    reconciled_reset_generation: u64,
 }
 
 /// The dma-buf length for a sparse area, or `None` when the area cannot
@@ -2256,6 +2323,57 @@ fn mse_transition(before: u32, after: u32) -> Option<MseEdge> {
     }
 }
 
+// PMCSR (Power Management Control/Status Register) power-state field:
+// bits 1:0 of the dword at `pm_cap_offset + 4`. D0 is 0b00.
+const PMCSR_POWER_STATE_MASK: u32 = 0b11;
+const PMCSR_D0: u32 = 0;
+
+/// A D-state transition between two reads of the PMCSR dword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DStateEdge {
+    EnteredLowPower,
+    ReturnedToD0,
+}
+
+/// The D-state edge between two PMCSR reads. `None` when the power-state
+/// field is unchanged, whether or not some other PMCSR bit (e.g. PME_En)
+/// changed, and also `None` for a transition between two non-D0 states
+/// (D1/D2 are not used by this hook's revoke/restore semantics).
+fn d_state_transition(before: u32, after: u32) -> Option<DStateEdge> {
+    let before_state = before & PMCSR_POWER_STATE_MASK;
+    let after_state = after & PMCSR_POWER_STATE_MASK;
+    match (before_state == PMCSR_D0, after_state == PMCSR_D0) {
+        (true, false) => Some(DStateEdge::EnteredLowPower),
+        (false, true) => Some(DStateEdge::ReturnedToD0),
+        (true, true) | (false, false) => None,
+    }
+}
+
+/// Whether a config-space write to `reg_idx` at byte `offset` (relative
+/// to the dword) with the given `data` sets BCR_FLR - bit 15 of the PCIe
+/// Device Control register, which occupies the low word of the dword at
+/// `pcie_cap_offset + 8`. Detected from the write data itself, not a
+/// before/after comparison: vfio-pci performs the reset synchronously
+/// inside the forwarded write, so by the time an "after" read would
+/// happen the reset has already run.
+fn write_sets_flr(pcie_cap_offset: u8, reg_idx: usize, offset: u64, data: &[u8]) -> bool {
+    let flr_reg_idx = (pcie_cap_offset as usize + 8) / 4;
+    if reg_idx != flr_reg_idx {
+        return false;
+    }
+    // Bit 15 of the dword is bit 7 of byte index 1 (0-based) within it.
+    // checked_sub returns None when the write starts after byte index 1,
+    // i.e. does not reach it at all.
+    const FLR_BYTE_INDEX: usize = 1;
+    const FLR_BIT_MASK: u8 = 0x80;
+    let write_start = offset as usize;
+    let Some(index_in_data) = FLR_BYTE_INDEX.checked_sub(write_start) else {
+        return false;
+    };
+    data.get(index_in_data)
+        .is_some_and(|byte| byte & FLR_BIT_MASK != 0)
+}
+
 impl VfioPciDevice {
     /// Constructs a new Vfio Pci device for the given Vfio device
     #[expect(clippy::too_many_arguments)]
@@ -2306,6 +2424,7 @@ impl VfioPciDevice {
             bdf,
             device_path,
             dmabuf_unsupported_warned: false,
+            reconciled_reset_generation: 0,
         };
 
         Ok(vfio_pci_device)
@@ -3107,6 +3226,23 @@ impl VfioPciDevice {
         }
     }
 
+    /// Rebuild P2P mappings after a reset that `VfioCommon::reset_and_rearm`
+    /// performed since the last call, detected via the reset generation
+    /// counter. Called at exactly the four `VfioPciDevice`-level entry
+    /// points that can reach `reset_and_rearm`: `Pausable::pause`,
+    /// `Pausable::resume`, `Snapshottable::snapshot`, and
+    /// `Migratable::start_migration`. The restore path is deliberately
+    /// excluded: it runs during construction, before `map_mmio_regions`,
+    /// when no P2P mapping exists yet.
+    fn reconcile_after_reset(&mut self) {
+        let generation = self.common.reset_generation.load(Ordering::Relaxed);
+        if generation != self.reconciled_reset_generation {
+            self.reconciled_reset_generation = generation;
+            self.p2p_revoke_all();
+            self.p2p_restore_all();
+        }
+    }
+
     pub fn mmio_regions(&self) -> Vec<MmioRegion> {
         self.common.mmio_regions.clone()
     }
@@ -3219,24 +3355,62 @@ impl PciDevice for VfioPciDevice {
         offset: u64,
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+        let p2p_watched = !self.iommu_attached && self.p2p_dma;
+
+        // FLR hook (R2=A): detected from the write data itself, before
+        // forwarding, rather than from a before/after COMMAND-register
+        // comparison like MSE and D3 below - vfio-pci performs the reset
+        // synchronously inside the forwarded write, wrapped in
+        // pci_save_state/pci_restore_state, and it is unverified whether
+        // MSE is observably cleared around that.
+        let sets_flr = p2p_watched
+            && self
+                .common
+                .pcie_cap_offset
+                .is_some_and(|off| write_sets_flr(off, reg_idx, offset, data));
+        if sets_flr {
+            self.p2p_revoke_all();
+        }
+
         // Reads pass straight through to the device, so sample the real
-        // COMMAND register on both sides of the forwarded write rather
-        // than trusting the shadow.
-        let watch = reg_idx == COMMAND_REG && !self.iommu_attached && self.p2p_dma;
+        // register on both sides of the forwarded write rather than
+        // trusting the shadow. reg_idx, not a hardcoded COMMAND_REG,
+        // because this same before/after pattern also covers the PMCSR
+        // register for the D3 hook below.
+        let watch_mse = p2p_watched && reg_idx == COMMAND_REG;
+        let watch_pmcsr = p2p_watched
+            && self
+                .common
+                .pm_cap_offset
+                .is_some_and(|off| reg_idx == (off as usize + 4) / 4);
+        let watch = watch_mse || watch_pmcsr;
         let before = if watch {
-            self.common.read_config_register(COMMAND_REG)
+            self.common.read_config_register(reg_idx)
         } else {
             0
         };
         let ret = self.common.write_config_register(reg_idx, offset, data);
         if watch {
-            let after = self.common.read_config_register(COMMAND_REG);
-            match mse_transition(before, after) {
-                Some(MseEdge::Disabled) => self.p2p_revoke_all(),
-                Some(MseEdge::Enabled) => self.p2p_restore_all(),
-                None => {}
+            let after = self.common.read_config_register(reg_idx);
+            if watch_mse {
+                match mse_transition(before, after) {
+                    Some(MseEdge::Disabled) => self.p2p_revoke_all(),
+                    Some(MseEdge::Enabled) => self.p2p_restore_all(),
+                    None => {}
+                }
+            } else {
+                match d_state_transition(before, after) {
+                    Some(DStateEdge::EnteredLowPower) => self.p2p_revoke_all(),
+                    Some(DStateEdge::ReturnedToD0) => self.p2p_restore_all(),
+                    None => {}
+                }
             }
         }
+
+        if sets_flr {
+            self.p2p_restore_all();
+        }
+
         ret
     }
 
@@ -3366,21 +3540,29 @@ iova 0x{:x}, size 0x{:x}: {}, ",
 
 impl Pausable for VfioPciDevice {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        if self.common.migration_flags.is_some() {
+        let ret = if self.common.migration_flags.is_some() {
             self.common
                 .transition_migration_state_with_recovery(VfioMigrationState::Stop, None)
-                .map_err(MigratableError::Pause)?;
-        }
-        Ok(())
+                .map_err(MigratableError::Pause)
+        } else {
+            Ok(())
+        };
+        // Reconcile regardless of the transition's own outcome: a failed
+        // transition is exactly the case that can fall back to a reset.
+        self.reconcile_after_reset();
+        ret
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        if self.common.migration_flags.is_some() {
+        let ret = if self.common.migration_flags.is_some() {
             self.common
                 .transition_migration_state_with_recovery(VfioMigrationState::Running, None)
-                .map_err(MigratableError::Resume)?;
-        }
-        Ok(())
+                .map_err(MigratableError::Resume)
+        } else {
+            Ok(())
+        };
+        self.reconcile_after_reset();
+        ret
     }
 }
 
@@ -3390,11 +3572,13 @@ impl Snapshottable for VfioPciDevice {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        // Snapshot VfioCommon. Reconcile before propagating any error:
+        // save_migration_data's own recovery path can reset the device.
+        let common_snapshot = self.common.snapshot();
+        self.reconcile_after_reset();
+
         let mut vfio_pci_dev_snapshot = Snapshot::default();
-
-        // Snapshot VfioCommon
-        vfio_pci_dev_snapshot.add_snapshot(self.common.id(), self.common.snapshot()?);
-
+        vfio_pci_dev_snapshot.add_snapshot(self.common.id(), common_snapshot?);
         Ok(vfio_pci_dev_snapshot)
     }
 }
@@ -3405,20 +3589,28 @@ impl Migratable for VfioPciDevice {
     fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         // Reject a device that does not implement migration v2 up front,
         // rather than silently skipping its state and dirty tracking.
-        if self.common.migration_flags.is_none() {
-            return Err(MigratableError::MigrateSend(anyhow!(
+        let ret = if self.common.migration_flags.is_none() {
+            Err(MigratableError::MigrateSend(anyhow!(
                 "VFIO device does not support migration"
-            )));
-        }
-        // Dirty tracking behind a virtual IOMMU needs IOVA to GPA translation
-        // and would have to follow mappings the guest changes mid migration,
-        // neither of which is implemented, see issue #8567.
-        if self.iommu_attached {
-            return Err(MigratableError::MigrateSend(anyhow!(
+            )))
+        } else if self.iommu_attached {
+            // Dirty tracking behind a virtual IOMMU needs IOVA to GPA
+            // translation and would have to follow mappings the guest
+            // changes mid migration, neither of which is implemented,
+            // see issue #8567.
+            Err(MigratableError::MigrateSend(anyhow!(
                 "VFIO device live migration is not supported behind a virtual IOMMU"
-            )));
-        }
-        Ok(())
+            )))
+        } else {
+            Ok(())
+        };
+        // Reconcile even though this function does not itself trigger a
+        // reset: it is the natural checkpoint before migration begins,
+        // and catching up on any reconciliation left pending by an
+        // earlier pause()/resume()/snapshot() call is cheap (a no-op
+        // when the reset generation has not moved) and never wrong.
+        self.reconcile_after_reset();
+        ret
     }
 
     fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
@@ -3866,6 +4058,9 @@ mod tests {
             migration_flags,
             dma_logging_page_size: None,
             extended_caps: Vec::new(),
+            pcie_cap_offset: None,
+            pm_cap_offset: None,
+            reset_generation: AtomicU64::new(0),
         }
     }
 
@@ -4678,5 +4873,90 @@ mod tests {
     fn mse_transition_unrelated_bit_change_is_none() {
         // Bit 2 (bus master enable) flips; MSE (bit 1) stays disabled.
         assert_eq!(mse_transition(0x0101, 0x0105), None);
+    }
+
+    // d_state_transition: the D-state edge between two PMCSR reads.
+
+    #[test]
+    fn d_state_transition_entered_low_power() {
+        assert_eq!(
+            d_state_transition(0x0000, 0x0003),
+            Some(DStateEdge::EnteredLowPower)
+        );
+    }
+
+    #[test]
+    fn d_state_transition_returned_to_d0() {
+        assert_eq!(
+            d_state_transition(0x0003, 0x0000),
+            Some(DStateEdge::ReturnedToD0)
+        );
+    }
+
+    #[test]
+    fn d_state_transition_unchanged_d0_is_none() {
+        assert_eq!(d_state_transition(0x0000, 0x0000), None);
+    }
+
+    #[test]
+    fn d_state_transition_pme_en_only_change_is_none() {
+        // PME_En (bit 8) flips; the power-state field (bits 1:0) stays D0.
+        assert_eq!(d_state_transition(0x0000, 0x0100), None);
+    }
+
+    // write_sets_flr: detecting a BCR_FLR-setting write from the write
+    // data itself, across the byte/offset shapes a config-space write
+    // can take.
+
+    #[test]
+    fn write_sets_flr_four_byte_write_with_bit_set() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        let data = 0x0000_8010u32.to_le_bytes();
+        assert!(write_sets_flr(pcie_cap_offset, reg_idx, 0, &data));
+    }
+
+    #[test]
+    fn write_sets_flr_two_byte_write_at_offset_zero_with_bit_set() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        let data = 0x8000u16.to_le_bytes();
+        assert!(write_sets_flr(pcie_cap_offset, reg_idx, 0, &data));
+    }
+
+    #[test]
+    fn write_sets_flr_one_byte_write_at_offset_one_with_bit_set() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        assert!(write_sets_flr(pcie_cap_offset, reg_idx, 1, &[0x80]));
+    }
+
+    #[test]
+    fn write_sets_flr_bit_not_set_is_false() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        assert!(!write_sets_flr(pcie_cap_offset, reg_idx, 0, &[0x00, 0x00]));
+    }
+
+    #[test]
+    fn write_sets_flr_wrong_register_is_false() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        assert!(!write_sets_flr(
+            pcie_cap_offset,
+            reg_idx + 1,
+            0,
+            &[0x80, 0x80]
+        ));
+    }
+
+    #[test]
+    fn write_sets_flr_write_does_not_reach_flr_byte_is_false() {
+        let pcie_cap_offset = 0x40u8;
+        let reg_idx = (pcie_cap_offset as usize + 8) / 4;
+        // A 1-byte write at offset 0 touches only byte 0, never byte 1.
+        assert!(!write_sets_flr(pcie_cap_offset, reg_idx, 0, &[0xff]));
+        // A write starting at offset 2 doesn't reach byte 1 either.
+        assert!(!write_sets_flr(pcie_cap_offset, reg_idx, 2, &[0xff, 0xff]));
     }
 }
