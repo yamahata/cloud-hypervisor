@@ -159,18 +159,42 @@ nvidia-smi topo -p2p r
  GPU7	OK	OK	OK	OK	OK	OK	OK	X	
 ```
 
-Peer-to-peer BAR mappings are best effort: on kernels that cannot map BAR
-MMIO into the IOMMU (iommufd before Linux 6.19, and some type1 container
-kernels), Cloud Hypervisor logs a warning and continues with peer-to-peer
-DMA into the affected BARs disabled. `vfio_p2p_dma=off` disables the
-mapping attempts entirely.
+Peer-to-peer BAR mappings are best effort and layered. Whether a given
+BAR's MMIO can be mapped into the host IOMMU address space is kernel-
+and configuration-dependent, not a clean cutoff at a given kernel
+version: for example, `IOAS_MAP` against GPU BAR0/2/4 on this
+project's own GH200 hardware succeeds on a 6.17 kernel, with PFNMAP
+supported and a zero DMA fault delta.
 
-Since `x_nv_gpudirect_clique` asserts that every memory BAR is present in
-the guest's stage-2 map, a device with a clique configured fails closed
-(a hard error, not a warning) whenever any of the following would
-otherwise silently leave a BAR unmapped or partially mapped:
+When the kernel and device support it (`CONFIG_VFIO_PCI_DMABUF`, the
+`VFIO_DEVICE_FEATURE_DMA_BUF` device feature), Cloud Hypervisor exports
+each BAR as a dma-buf and maps that into the IOMMU instead of the
+guest-visible VA mapping. This is detected at runtime, with no config
+knob: the same binary takes the dma-buf path on a kernel that supports
+it and falls back automatically, with no user action needed, on one
+that does not. A BAR whose sparse area is smaller than the IOAS's
+minimum IOVA alignment cannot use the dma-buf path regardless of
+kernel support - a 16 KiB NVMe BAR against a 64 KiB alignment on
+aarch64 is a case measured on this project's own hardware - and falls
+back the same way.
 
-- a failed peer-to-peer DMA map (the case above)
+Whenever the dma-buf path cannot be used, or the mapping attempt
+itself fails, Cloud Hypervisor falls back to the legacy VA mapping
+this project has always used; only when every layer, including that
+legacy mapping, fails does Cloud Hypervisor log a warning and continue
+with peer-to-peer DMA into the affected BAR disabled. Since
+`x_nv_gpudirect_clique` asserts that P2P DMA is required, a mapping
+failure remains a hard error for devices with a clique configured, but
+only once every layer has been tried: a clique configured on a kernel
+that lacks dma-buf support still boots and works exactly as before.
+`vfio_p2p_dma=off` disables the mapping attempts, of either kind,
+entirely.
+
+A clique configured also fails closed independently of that mapping
+cascade, whenever any of the following would otherwise silently leave
+a BAR unmapped or partially mapped rather than routed through the
+layers above:
+
 - the BAR is named in `x_exclude_mmap_bars`
 - the kernel does not report the BAR as MMAP-capable
   (`VFIO_REGION_INFO_FLAG_MMAP` unset)
@@ -183,6 +207,16 @@ Two regions are exempt from this assert and keep the existing silent
 behavior regardless of the clique setting: the PCI expansion ROM (the
 kernel never reports it MMAP-capable, yet every documented clique GPU
 carries a VBIOS ROM) and I/O port BARs (never memory-mapped at all).
+
+Once a BAR is mapped through its dma-buf, Cloud Hypervisor also
+rebuilds that mapping automatically after the guest events that revoke
+it: disabling memory space decode (MSE) in the PCIe COMMAND register, a
+D0-to-D3hot power transition, and a function-level reset (FLR). Without
+this, peer-to-peer DMA into that BAR would silently and permanently
+stop working the first time the guest does any of those things - an
+ordinary driver unbind/rebind cycle, a runtime power-management
+suspend, or a guest-initiated `pci_disable_device()` - rather than
+only at boot.
 
 Some VFIO devices expose BARs that should not be mmapped by the VMM even when
 the kernel reports them as mappable. The `x_exclude_mmap_bars` config argument can
@@ -283,11 +317,13 @@ All the snapshot and restore requirements apply, plus the following.
 - **iommufd.** The destination receives the device as file descriptors, which
   requires the config to carry `iommufd=on`. The iommufd itself arrives as a
   file descriptor with the receive request, see below.
-- **BAR mapping.** Older Linux kernels (pre 6.19) cannot map VFIO BAR MMIO
-  into iommufd. Cloud Hypervisor warns and continues with peer-to-peer DMA
-  into the affected BARs disabled (see the peer-to-peer note under Advanced
-  Configuration Options); `vfio_p2p_dma=off` avoids the mapping attempts
-  (and the warnings) entirely.
+- **BAR mapping.** Whether a BAR's MMIO can be mapped into iommufd is
+  kernel- and configuration-dependent (see the peer-to-peer section under
+  Advanced Configuration Options for the dma-buf fast path, the fallback
+  layers, and the revoke/rebuild behavior); Cloud Hypervisor falls back
+  automatically and only warns once every layer has failed.
+  `vfio_p2p_dma=off` avoids the mapping attempts (and the warnings)
+  entirely.
 - **No virtual IOMMU.** Live migration of a VFIO device behind a virtual
   IOMMU is not supported and is refused at migration start. Assign the
   device without a virtual IOMMU.
