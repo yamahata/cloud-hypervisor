@@ -97,11 +97,12 @@ pub enum RegionType {
     Reserved,
 }
 
-/// Module for the SMBIOS table builder.
-#[cfg(target_arch = "x86_64")]
+/// Module for the SMBIOS table builder, shared by the architectures that
+/// stage SMBIOS tables for the guest.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod smbios;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use smbios::{SmbiosChassisConfig, SmbiosConfig, SmbiosSystem};
 
 /// Module for aarch64 related functionality.
