@@ -198,54 +198,49 @@ unsafe impl ByteValued for SmbiosChassis {}
 // SAFETY: data structure only contain a series of integers
 unsafe impl ByteValued for SmbiosEndOfTable {}
 
-fn write_and_incr<T: ByteValued>(
-    mem: &GuestMemoryMmap,
-    val: T,
-    mut curptr: GuestAddress,
-) -> Result<GuestAddress> {
-    mem.write_obj(val, curptr).map_err(Error::WriteData)?;
-    curptr = curptr
-        .checked_add(size_of::<T>() as u64)
-        .ok_or(Error::NotEnoughMemory)?;
-    Ok(curptr)
+/// Carries the state every SMBIOS table write needs: the guest memory being
+/// written and the current write position, which advances as structures and
+/// strings are appended.
+struct SmbiosWriter<'a> {
+    mem: &'a GuestMemoryMmap,
+    curptr: GuestAddress,
 }
 
-fn write_string(
-    mem: &GuestMemoryMmap,
-    val: &str,
-    mut curptr: GuestAddress,
-) -> Result<GuestAddress> {
-    for c in val.as_bytes().iter() {
-        curptr = write_and_incr(mem, *c, curptr)?;
+impl SmbiosWriter<'_> {
+    fn write_and_incr<T: ByteValued>(&mut self, val: T) -> Result<()> {
+        self.mem
+            .write_obj(val, self.curptr)
+            .map_err(Error::WriteData)?;
+        self.curptr = self
+            .curptr
+            .checked_add(size_of::<T>() as u64)
+            .ok_or(Error::NotEnoughMemory)?;
+        Ok(())
     }
-    curptr = write_and_incr(mem, 0u8, curptr)?;
-    Ok(curptr)
-}
 
-fn write_opt_string(
-    mem: &GuestMemoryMmap,
-    s: Option<&str>,
-    cur: GuestAddress,
-) -> Result<GuestAddress> {
-    if let Some(v) = s {
-        write_string(mem, v, cur)
-    } else {
-        Ok(cur)
+    fn write_string(&mut self, val: &str) -> Result<()> {
+        for c in val.as_bytes().iter() {
+            self.write_and_incr(*c)?;
+        }
+        self.write_and_incr(0u8)
     }
-}
 
-fn write_string_terminator(
-    mem: &GuestMemoryMmap,
-    cur: GuestAddress,
-    has_strings: bool,
-) -> Result<GuestAddress> {
-    // SMBIOS DSP0134 §6.1.3: if all string-reference fields are 0, follow the
-    // formatted section with two null bytes (empty string-set).
-    if has_strings {
-        write_and_incr(mem, 0u8, cur)
-    } else {
-        let cur = write_and_incr(mem, 0u8, cur)?;
-        write_and_incr(mem, 0u8, cur)
+    fn write_opt_string(&mut self, s: Option<&str>) -> Result<()> {
+        if let Some(v) = s {
+            self.write_string(v)?;
+        }
+        Ok(())
+    }
+
+    fn write_string_terminator(&mut self, has_strings: bool) -> Result<()> {
+        // SMBIOS DSP0134 §6.1.3: if all string-reference fields are 0, follow the
+        // formatted section with two null bytes (empty string-set).
+        if has_strings {
+            self.write_and_incr(0u8)
+        } else {
+            self.write_and_incr(0u8)?;
+            self.write_and_incr(0u8)
+        }
     }
 }
 
@@ -271,8 +266,7 @@ fn alloc_index(next: &mut u8, present: bool) -> Result<u8> {
 }
 
 fn write_type1_system(
-    mem: &GuestMemoryMmap,
-    curptr: &mut GuestAddress,
+    writer: &mut SmbiosWriter<'_>,
     handle: &mut u16,
     system: Option<&SmbiosSystem>,
 ) -> Result<()> {
@@ -318,20 +312,19 @@ fn write_type1_system(
         family: family_idx,
     };
 
-    *curptr = write_and_incr(mem, sys, *curptr)?;
-    *curptr = write_string(mem, manufacturer, *curptr)?;
-    *curptr = write_string(mem, product, *curptr)?;
-    *curptr = write_opt_string(mem, version, *curptr)?;
-    *curptr = write_opt_string(mem, serial, *curptr)?;
-    *curptr = write_opt_string(mem, sku, *curptr)?;
-    *curptr = write_opt_string(mem, family, *curptr)?;
-    *curptr = write_and_incr(mem, 0u8, *curptr)?;
+    writer.write_and_incr(sys)?;
+    writer.write_string(manufacturer)?;
+    writer.write_string(product)?;
+    writer.write_opt_string(version)?;
+    writer.write_opt_string(serial)?;
+    writer.write_opt_string(sku)?;
+    writer.write_opt_string(family)?;
+    writer.write_and_incr(0u8)?;
     Ok(())
 }
 
 fn write_type3_chassis(
-    mem: &GuestMemoryMmap,
-    curptr: &mut GuestAddress,
+    writer: &mut SmbiosWriter<'_>,
     handle: &mut u16,
     chassis: &SmbiosChassisConfig,
 ) -> Result<()> {
@@ -359,9 +352,9 @@ fn write_type3_chassis(
         ..Default::default()
     };
 
-    *curptr = write_and_incr(mem, ch, *curptr)?;
-    *curptr = write_opt_string(mem, asset_tag, *curptr)?;
-    *curptr = write_string_terminator(mem, *curptr, asset_tag.is_some())?;
+    writer.write_and_incr(ch)?;
+    writer.write_opt_string(asset_tag)?;
+    writer.write_string_terminator(asset_tag.is_some())?;
     Ok(())
 }
 
@@ -376,7 +369,10 @@ pub fn setup_smbios(
     let physptr = smbios_start
         .checked_add(size_of::<Smbios30Entrypoint>() as u64)
         .ok_or(Error::NotEnoughMemory)?;
-    let mut curptr = physptr;
+    let mut writer = SmbiosWriter {
+        mem,
+        curptr: physptr,
+    };
     let mut handle = 0;
 
     {
@@ -391,16 +387,16 @@ pub fn setup_smbios(
             characteristics_ext2: IS_VIRTUAL_MACHINE,
             ..Default::default()
         };
-        curptr = write_and_incr(mem, smbios_biosinfo, curptr)?;
-        curptr = write_string(mem, "cloud-hypervisor", curptr)?;
-        curptr = write_string(mem, "0", curptr)?;
-        curptr = write_and_incr(mem, 0u8, curptr)?;
+        writer.write_and_incr(smbios_biosinfo)?;
+        writer.write_string("cloud-hypervisor")?;
+        writer.write_string("0")?;
+        writer.write_and_incr(0u8)?;
     }
 
-    write_type1_system(mem, &mut curptr, &mut handle, system)?;
+    write_type1_system(&mut writer, &mut handle, system)?;
 
     if let Some(chassis) = chassis {
-        write_type3_chassis(mem, &mut curptr, &mut handle, chassis)?;
+        write_type3_chassis(&mut writer, &mut handle, chassis)?;
     }
 
     if !oem_strings.is_empty() {
@@ -413,13 +409,13 @@ pub fn setup_smbios(
             count: oem_strings.len() as u8,
         };
 
-        curptr = write_and_incr(mem, smbios_oemstrings, curptr)?;
+        writer.write_and_incr(smbios_oemstrings)?;
 
         for s in oem_strings {
-            curptr = write_string(mem, s, curptr)?;
+            writer.write_string(s)?;
         }
 
-        curptr = write_string_terminator(mem, curptr, true)?;
+        writer.write_string_terminator(true)?;
     }
 
     {
@@ -429,9 +425,9 @@ pub fn setup_smbios(
             length: size_of::<SmbiosEndOfTable>() as u8,
             handle,
         };
-        curptr = write_and_incr(mem, smbios_end, curptr)?;
-        curptr = write_and_incr(mem, 0u8, curptr)?;
-        curptr = write_and_incr(mem, 0u8, curptr)?;
+        writer.write_and_incr(smbios_end)?;
+        writer.write_and_incr(0u8)?;
+        writer.write_and_incr(0u8)?;
     }
 
     {
@@ -443,7 +439,7 @@ pub fn setup_smbios(
             minorver: 0x02,
             docrev: 0x00,
             revision: 0x01, // SMBIOS 3.0
-            max_size: curptr.unchecked_offset_from(physptr) as u32,
+            max_size: writer.curptr.unchecked_offset_from(physptr) as u32,
             physptr: physptr.0,
             ..Default::default()
         };
@@ -452,7 +448,7 @@ pub fn setup_smbios(
             .map_err(Error::WriteSmbiosEp)?;
     }
 
-    Ok(curptr.unchecked_offset_from(physptr) + size_of::<Smbios30Entrypoint>() as u64)
+    Ok(writer.curptr.unchecked_offset_from(physptr) + size_of::<Smbios30Entrypoint>() as u64)
 }
 
 #[cfg(test)]
