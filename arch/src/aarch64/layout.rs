@@ -85,6 +85,12 @@ pub const MEM_PCI_IO_SIZE: u64 = 0x10000;
 pub const MEM_32BIT_DEVICES_START: GuestAddress = GuestAddress(0x1000_0000);
 pub const MEM_32BIT_DEVICES_SIZE: u64 = 0x2000_0000;
 
+// The SMBIOS reservation sits at the tail of the ACPI window, immediately
+// before the kernel, and the ACPI window's usable budget is shrunk by
+// exactly the same amount - see the SMBIOS_* and ACPI_* constants below.
+const _: () = assert!(SMBIOS_START.0 + SMBIOS_MAX_SIZE == KERNEL_START.0);
+const _: () = assert!(ACPI_START.0 + ACPI_USABLE_MAX_SIZE == SMBIOS_START.0);
+
 /// PCI MMCONFIG space (start: after the device space at 1 GiB, length: 256MiB)
 pub const PCI_MMCONFIG_START: GuestAddress = GuestAddress(0x3000_0000);
 pub const PCI_MMCONFIG_SIZE: u64 = 256 << 20;
@@ -120,6 +126,14 @@ pub const FDT_MAX_SIZE: u64 = 0x20_0000;
 pub const ACPI_START: GuestAddress = GuestAddress(RAM_START.0 + FDT_MAX_SIZE);
 pub const ACPI_MAX_SIZE: u64 = 0x20_0000;
 pub const RSDP_POINTER: GuestAddress = ACPI_START;
+
+/// SMBIOS tables are staged in the TAIL of the ACPI window. The CloudHv
+/// firmware reads them from this fixed address, so it is frozen
+/// CH<->firmware ABI (cf. the RSDP_POINTER precedent).
+pub const SMBIOS_MAX_SIZE: u64 = 0x1_0000;
+pub const SMBIOS_START: GuestAddress = GuestAddress(ACPI_START.0 + ACPI_MAX_SIZE - SMBIOS_MAX_SIZE);
+/// ACPI tables must not grow into the SMBIOS reservation above.
+pub const ACPI_USABLE_MAX_SIZE: u64 = ACPI_MAX_SIZE - SMBIOS_MAX_SIZE;
 
 /// Kernel start after FDT and ACPI
 pub const KERNEL_START: GuestAddress = GuestAddress(ACPI_START.0 + ACPI_MAX_SIZE);

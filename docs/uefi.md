@@ -143,6 +143,30 @@ bit). If you build the firmware from source and need to boot guests
 with the older GRUB behavior, apply the same override. x86-64
 (`CLOUDHV.fd`) is unaffected as it does not enforce this NX policy.
 
+### SMBIOS on AArch64 guests
+
+The SMBIOS table builder (`arch/src/smbios.rs`) is arch-shared; x86 output
+is byte-identical to before. On AArch64, Cloud Hypervisor stages the SMBIOS
+3.0 entry point and tables at the tail of the ACPI window
+(`arch::aarch64::layout::SMBIOS_START`, frozen CH<->firmware ABI like
+`RSDP_POINTER`).
+
+Staging alone does not make SMBIOS visible to the guest: a CloudHv EDK2
+firmware needs an SMBIOS platform DXE that reads the staged tables from
+`SMBIOS_START` and republishes them into the UEFI configuration table.
+Stock `ArmVirtCloudHv` does **not** include such a DXE, so with it a guest
+still reports no DMI ("DMI not present or invalid") even though the tables
+are present in guest memory - only a firmware build with the SMBIOS DXE
+completes the chain.
+
+The staging window is **not** reserved from the guest's point of view: CH's
+AArch64 FDT emits no memory-reservation entry and no `/reserved-memory`
+node for it, and the guest's `/memory` node covers this range, so firmware
+must consume the staged tables before its own allocator can reach that
+address. This matches how CH already hands ACPI tables to the firmware via
+a fixed address (`RSDP_POINTER`) - it is the existing convention, not a new
+risk.
+
 ## Using OVMF Binaries
 
 Any UEFI capable image can be booted using the Cloud Hypervisor specific firmware. Windows guests under Cloud Hypervisor only support UEFI boot, therefore OVMF is mandatory there.

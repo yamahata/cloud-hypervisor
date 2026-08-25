@@ -458,9 +458,16 @@ pub fn setup_smbios(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::layout;
 
-    /// First possible location per the spec (matches x86_64's `layout::SMBIOS_START`).
-    const SMBIOS_START: GuestAddress = GuestAddress(0xf0000);
+    /// The address each architecture actually stages its tables at, so the
+    /// tests below exercise the real layout rather than a synthetic value.
+    /// x86_64 spells the constant as a bare `u64`, aarch64 as a
+    /// `GuestAddress`.
+    #[cfg(target_arch = "x86_64")]
+    const SMBIOS_START: GuestAddress = GuestAddress(layout::SMBIOS_START);
+    #[cfg(target_arch = "aarch64")]
+    const SMBIOS_START: GuestAddress = layout::SMBIOS_START;
 
     /// Collects all strings after a SMBIOS structure, stopping at the double-NUL terminator and returns next addr.
     fn read_string_set(mem: &GuestMemoryMmap, addr: GuestAddress) -> (Vec<String>, GuestAddress) {
