@@ -1187,6 +1187,18 @@ pub fn create_acpi_tables(
         tpm_enabled,
     )?;
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        let acpi_len = Rsdp::len() as u64 + tables_bytes.len() as u64;
+        assert!(
+            acpi_len <= layout::ACPI_USABLE_MAX_SIZE,
+            "ACPI tables ({acpi_len} bytes) overflow the usable ACPI window \
+             ({} bytes); they would overwrite the SMBIOS staging area at {:#x}",
+            layout::ACPI_USABLE_MAX_SIZE,
+            layout::SMBIOS_START.0,
+        );
+    }
+
     guest_mem
         .write_slice(rsdp.as_bytes(), rsdp_addr)
         .map_err(Error::GuestMemory)?;
