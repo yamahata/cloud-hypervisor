@@ -74,6 +74,10 @@ pub const EBDA_START: GuestAddress = GuestAddress(0xa0000);
 pub const RSDP_POINTER: GuestAddress = EBDA_START;
 
 pub const SMBIOS_START: u64 = 0xf0000; // First possible location per the spec.
+/// Bounds the SMBIOS blob to the F-segment below the 1 MiB boundary
+/// (0xf0000..0x100000, i.e. `SMBIOS_START..HIGH_RAM_START`), which x86's
+/// e820 map already excludes from usable RAM.
+pub const SMBIOS_MAX_SIZE: u64 = 0x1_0000;
 
 // == End of "EBDA" range ==
 

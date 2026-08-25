@@ -198,16 +198,32 @@ unsafe impl ByteValued for SmbiosChassis {}
 // SAFETY: data structure only contain a series of integers
 unsafe impl ByteValued for SmbiosEndOfTable {}
 
+/// Verify that a write of `len` bytes starting at `curptr` stays within the
+/// reserved SMBIOS blob (`curptr + len <= limit`), BEFORE the write
+/// happens. This is checked ahead of every write so an oversized SMBIOS
+/// configuration is rejected before any byte is written past the
+/// reservation, rather than detected after the fact.
+fn check_fits(curptr: GuestAddress, len: u64, limit: GuestAddress) -> Result<()> {
+    let write_end = curptr.checked_add(len).ok_or(Error::NotEnoughMemory)?;
+    if write_end.0 > limit.0 {
+        return Err(Error::NotEnoughMemory);
+    }
+    Ok(())
+}
+
 /// Carries the state every SMBIOS table write needs: the guest memory being
-/// written and the current write position, which advances as structures and
-/// strings are appended.
+/// written, the current write position, which advances as structures and
+/// strings are appended, and the end of the reservation the blob must stay
+/// inside.
 struct SmbiosWriter<'a> {
     mem: &'a GuestMemoryMmap,
     curptr: GuestAddress,
+    limit: GuestAddress,
 }
 
 impl SmbiosWriter<'_> {
     fn write_and_incr<T: ByteValued>(&mut self, val: T) -> Result<()> {
+        check_fits(self.curptr, size_of::<T>() as u64, self.limit)?;
         self.mem
             .write_obj(val, self.curptr)
             .map_err(Error::WriteData)?;
@@ -362,7 +378,12 @@ pub fn setup_smbios(
     mem: &GuestMemoryMmap,
     smbios: Option<&SmbiosConfig>,
     smbios_start: GuestAddress,
+    smbios_max_size: u64,
 ) -> Result<u64> {
+    let limit = smbios_start
+        .checked_add(smbios_max_size)
+        .ok_or(Error::AddressOverflow)?;
+
     let system = smbios.and_then(|cfg| cfg.system.as_ref());
     let chassis = smbios.and_then(|cfg| cfg.chassis.as_ref());
     let oem_strings: &[String] = smbios.map_or(&[], |cfg| &cfg.oem_strings);
@@ -372,6 +393,7 @@ pub fn setup_smbios(
     let mut writer = SmbiosWriter {
         mem,
         curptr: physptr,
+        limit,
     };
     let mut handle = 0;
 
@@ -444,6 +466,7 @@ pub fn setup_smbios(
             ..Default::default()
         };
         smbios_ep.checksum = compute_checksum(&smbios_ep);
+        check_fits(smbios_start, size_of::<Smbios30Entrypoint>() as u64, limit)?;
         mem.write_obj(smbios_ep, smbios_start)
             .map_err(Error::WriteSmbiosEp)?;
     }
@@ -464,6 +487,11 @@ mod unit_tests {
     const SMBIOS_START: GuestAddress = GuestAddress(layout::SMBIOS_START);
     #[cfg(target_arch = "aarch64")]
     const SMBIOS_START: GuestAddress = layout::SMBIOS_START;
+
+    /// The reservation size each architecture bounds the blob to. It is
+    /// larger than any table these tests build, so it is never the binding
+    /// constraint for the well-formed configurations exercised here.
+    const SMBIOS_MAX_SIZE: u64 = layout::SMBIOS_MAX_SIZE;
 
     /// Collects all strings after a SMBIOS structure, stopping at the double-NUL terminator and returns next addr.
     fn read_string_set(mem: &GuestMemoryMmap, addr: GuestAddress) -> (Vec<String>, GuestAddress) {
@@ -505,7 +533,7 @@ mod unit_tests {
     fn entrypoint_checksum() {
         let mem = GuestMemoryMmap::from_ranges(&[(SMBIOS_START, 4096)]).unwrap();
 
-        setup_smbios(&mem, None, SMBIOS_START).unwrap();
+        setup_smbios(&mem, None, SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
 
@@ -539,7 +567,7 @@ mod unit_tests {
             ..Default::default()
         };
 
-        setup_smbios(&mem, Some(&smbios), SMBIOS_START).unwrap();
+        setup_smbios(&mem, Some(&smbios), SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
         let mut cur = GuestAddress(smbios_ep.physptr);
@@ -579,7 +607,7 @@ mod unit_tests {
             ..Default::default()
         };
 
-        setup_smbios(&mem, Some(&smbios), SMBIOS_START).unwrap();
+        setup_smbios(&mem, Some(&smbios), SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
         let mut cur = GuestAddress(smbios_ep.physptr);
@@ -618,7 +646,7 @@ mod unit_tests {
     fn smbios_strings_terminators_default() {
         let mem = GuestMemoryMmap::from_ranges(&[(SMBIOS_START, 4096)]).unwrap();
 
-        setup_smbios(&mem, None, SMBIOS_START).unwrap();
+        setup_smbios(&mem, None, SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
         let mut cur = GuestAddress(smbios_ep.physptr);
@@ -671,7 +699,7 @@ mod unit_tests {
             ..Default::default()
         };
 
-        let err = setup_smbios(&mem, Some(&smbios), SMBIOS_START).unwrap_err();
+        let err = setup_smbios(&mem, Some(&smbios), SMBIOS_START, SMBIOS_MAX_SIZE).unwrap_err();
         assert!(matches!(err, Error::ParseUuid(_, _)));
     }
 
@@ -687,7 +715,7 @@ mod unit_tests {
             ..Default::default()
         };
 
-        setup_smbios(&mem, Some(&smbios), SMBIOS_START).unwrap();
+        setup_smbios(&mem, Some(&smbios), SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
         let mut cur = GuestAddress(smbios_ep.physptr);
@@ -706,7 +734,7 @@ mod unit_tests {
         let mem = GuestMemoryMmap::from_ranges(&[(SMBIOS_START, size_of::<Smbios30Entrypoint>())])
             .unwrap();
 
-        let err = setup_smbios(&mem, None, SMBIOS_START).unwrap_err();
+        let err = setup_smbios(&mem, None, SMBIOS_START, SMBIOS_MAX_SIZE).unwrap_err();
         assert!(matches!(err, Error::WriteData(_)));
     }
 
@@ -714,7 +742,7 @@ mod unit_tests {
     fn smbios_type0_is_virtual_machine_bit_set() {
         let mem = GuestMemoryMmap::from_ranges(&[(SMBIOS_START, 4096)]).unwrap();
 
-        setup_smbios(&mem, None, SMBIOS_START).unwrap();
+        setup_smbios(&mem, None, SMBIOS_START, SMBIOS_MAX_SIZE).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(SMBIOS_START).unwrap();
         let type0_addr = GuestAddress(smbios_ep.physptr);
@@ -730,5 +758,47 @@ mod unit_tests {
             characteristics_ext2 & IS_VIRTUAL_MACHINE,
             IS_VIRTUAL_MACHINE
         );
+    }
+
+    #[test]
+    fn smbios_oversized_oem_strings_rejected_before_overrun() {
+        // The real per-architecture reservation size.
+        const LIMIT: u64 = SMBIOS_MAX_SIZE;
+
+        // Give the region enough room past the limit that the sentinel
+        // address below is valid memory - otherwise this test would pass
+        // for the wrong reason (a guest-memory-region-bounds error rather
+        // than the intended limit check).
+        let mem = GuestMemoryMmap::from_ranges(&[(SMBIOS_START, (LIMIT * 2) as usize)]).unwrap();
+
+        let limit_addr = SMBIOS_START.checked_add(LIMIT).unwrap();
+
+        // Write a sentinel byte pattern at the limit address *before*
+        // calling setup_smbios. If setup_smbios ever writes at or past the
+        // reservation boundary, this byte will change.
+        const SENTINEL: u8 = 0xAA;
+        mem.write_obj(SENTINEL, limit_addr).unwrap();
+
+        // A single OEM string bigger than the entire 64 KiB reservation.
+        // Reachable in practice via `--platform oem_strings=...` on the
+        // REST/CLI config path (vmm/src/vm_config.rs, vmm/src/config.rs),
+        // which places no bound on string length.
+        let huge = "A".repeat(LIMIT as usize + 4096);
+        let smbios = SmbiosConfig {
+            oem_strings: [huge].into(),
+            ..Default::default()
+        };
+
+        let err = setup_smbios(&mem, Some(&smbios), SMBIOS_START, LIMIT).unwrap_err();
+        assert!(matches!(err, Error::NotEnoughMemory));
+
+        // The point of this test: prove the rejection happened BEFORE any
+        // write reached the sentinel, not merely that an error was
+        // eventually returned. Pre-amendment, `write_and_incr` only checked
+        // guest-memory-region bounds (there was no `smbios_max_size` at
+        // all), so it would have happily written straight through this
+        // address.
+        let after: u8 = mem.read_obj(limit_addr).unwrap();
+        assert_eq!(after, SENTINEL);
     }
 }
