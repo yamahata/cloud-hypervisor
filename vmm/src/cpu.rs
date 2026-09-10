@@ -28,8 +28,6 @@ use anyhow::anyhow;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::cache::{CacheTopologyInfo, read_cache_topology};
 use arch::{EntryPoint, NumaNodes, layout};
-#[cfg(target_arch = "aarch64")]
-use devices::gic::Gic;
 use devices::interrupt_controller::InterruptController;
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
@@ -1900,7 +1898,17 @@ impl CpuManager {
 
                 madt.append(gicc);
             }
-            let vgic_config = Gic::create_default_config(self.config.boot_vcpus.into());
+            // Read the GIC frames from the vGIC rather than re-deriving
+            // them from the vCPU count. The vGIC is what KVM was
+            // actually programmed with, and the FDT path
+            // (`create_gic_node`) already reports these same properties.
+            // Two independent derivations of one address can drift; one
+            // cannot.
+            let gic_reg_prop = vgic.lock().unwrap().device_properties();
+            let msi_reg_prop = vgic.lock().unwrap().msi_properties();
+            let (dist_addr, redists_addr, redists_size) =
+                (gic_reg_prop[0], gic_reg_prop[2], gic_reg_prop[3]);
+            let msi_addr = msi_reg_prop[0];
 
             // GIC Distributor structure. See section 5.2.12.15 in ACPI spec.
             let gicd = GicD {
@@ -1908,7 +1916,7 @@ impl CpuManager {
                 length: 24,
                 reserved0: 0,
                 gic_id: 0,
-                base_address: vgic_config.dist_addr,
+                base_address: dist_addr,
                 global_irq_base: 0,
                 version: 3,
                 reserved1: [0; 3],
@@ -1920,8 +1928,8 @@ impl CpuManager {
                 r#type: acpi::ACPI_APIC_GENERIC_REDISTRIBUTOR,
                 length: 16,
                 reserved: 0,
-                base_address: vgic_config.redists_addr,
-                range_length: vgic_config.redists_size as u32,
+                base_address: redists_addr,
+                range_length: redists_size as u32,
             };
             madt.append(gicr);
 
@@ -1932,7 +1940,7 @@ impl CpuManager {
                     length: 24,
                     reserved0: 0,
                     msi_frame_id: 0,
-                    base_address: vgic_config.msi_addr,
+                    base_address: msi_addr,
                     flags: 1,
                     spi_count: GICV2M_SPI_NUM as u16,
                     spi_base: GICV2M_SPI_BASE as u16,
@@ -1945,7 +1953,7 @@ impl CpuManager {
                     length: 20,
                     reserved0: 0,
                     translation_id: 0,
-                    base_address: vgic_config.msi_addr,
+                    base_address: msi_addr,
                     reserved1: 0,
                 };
                 madt.append(gicits);
