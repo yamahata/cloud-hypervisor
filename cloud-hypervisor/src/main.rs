@@ -25,7 +25,6 @@ use seccompiler::SeccompAction;
 use signal_hook::consts::SIGSYS;
 use signal_hook::low_level;
 use thiserror::Error;
-use vm_migration::protocol;
 #[cfg(feature = "dbus_api")]
 use vmm::api::dbus::{DBusApiOptions, dbus_api_graceful_shutdown};
 use vmm::api::http::http_api_graceful_shutdown;
@@ -969,12 +968,6 @@ fn main() {
 
     if cmd_arguments.get_flag("version") {
         println!("{} {}", env!("CARGO_BIN_NAME"), env!("BUILD_VERSION"));
-        let migration_protocol_versions = protocol::supported_protocol_versions()
-            .map(|version| version.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("Migration Protocol Versions: {migration_protocol_versions}");
-
         if cmd_arguments.get_count("v") != 0 {
             println!("Enabled features: {:?}", vmm::feature_list());
         }
@@ -1024,7 +1017,7 @@ fn main() {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::mem::zeroed;
     use std::path::PathBuf;
     use std::ptr::from_mut;
@@ -1126,7 +1119,7 @@ mod unit_tests {
                 hugepages: false,
                 hugepage_size: None,
                 prefault: false,
-                reserve: false,
+                reserve: None,
                 zones: None,
                 thp: true,
             },
@@ -1358,13 +1351,13 @@ mod unit_tests {
                     "/path/to/kernel",
                     "--disk",
                     "path=/path/to/disk/1,image_type=raw",
-                    "path=/path/to/disk/2",
+                    "path=/path/to/disk/2,image_type=raw",
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
                         {"path": "/path/to/disk/1", "image_type": "Raw"},
-                        {"path": "/path/to/disk/2", "image_type": "Unknown"}
+                        {"path": "/path/to/disk/2", "image_type": "Raw"}
                     ]
                 }"#,
                 true,
@@ -1430,16 +1423,16 @@ mod unit_tests {
                     "--kernel",
                     "/path/to/kernel",
                     "--disk",
-                    "path=/path/to/disk/1,rate_limit_group=group0",
-                    "path=/path/to/disk/2,rate_limit_group=group0",
+                    "path=/path/to/disk/1,rate_limit_group=group0,image_type=raw",
+                    "path=/path/to/disk/2,rate_limit_group=group0,image_type=raw",
                     "--rate-limit-group",
                     "id=group0,bw_size=1000,bw_refill_time=100",
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
-                        {"path": "/path/to/disk/1", "rate_limit_group": "group0", "image_type": "Unknown"},
-                        {"path": "/path/to/disk/2", "rate_limit_group": "group0", "image_type": "Unknown"}
+                        {"path": "/path/to/disk/1", "rate_limit_group": "group0", "image_type": "Raw"},
+                        {"path": "/path/to/disk/2", "rate_limit_group": "group0", "image_type": "Raw"}
                     ],
                     "rate_limit_groups": [
                         {"id": "group0", "rate_limiter_config": {"bandwidth": {"size": 1000, "one_time_burst": 0, "refill_time": 100}}}

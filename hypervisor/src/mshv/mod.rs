@@ -2024,6 +2024,7 @@ impl vm::Vm for MshvVm {
         userspace_addr: *mut u8,
         readonly: bool,
         _log_dirty_pages: bool,
+        _visibility: vm::MemoryVisibility,
     ) -> vm::Result<()> {
         let mut flags = 1 << MSHV_SET_MEM_BIT_EXECUTABLE;
         if !readonly {
@@ -2067,7 +2068,6 @@ impl vm::Vm for MshvVm {
         memory_size: usize,
         userspace_addr: *mut u8,
         readonly: bool,
-        _log_dirty_pages: bool,
     ) -> vm::Result<()> {
         let mut flags = 1 << MSHV_SET_MEM_BIT_EXECUTABLE;
         if !readonly {
@@ -2504,7 +2504,7 @@ impl vm::Vm for MshvVm {
             self.fd
                 .set_partition_property(
                     hv_partition_property_code_HV_PARTITION_PROPERTY_GIC_PPI_PERFORMANCE_MONITORS_INTERRUPT,
-                    (AARCH64_PMU_IRQ + AARCH64_MIN_PPI_IRQ) as u64,
+                    AARCH64_PMU_IRQ as u64,
                 )
                 .map_err(|e| {
                     vm::HypervisorVmError::InitializeVm(anyhow!(

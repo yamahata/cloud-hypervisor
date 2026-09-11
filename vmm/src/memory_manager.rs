@@ -5,13 +5,13 @@
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
 use std::ops::{BitAnd, Not, Sub};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -59,8 +59,7 @@ use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::sparse::{next_data_extent, write_region_sparse};
 use crate::uffd::{
-    self, FaultResolution, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource,
-    UffdRange,
+    self, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource, UffdRange,
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, userfaultfd};
@@ -83,6 +82,9 @@ const SNAPSHOT_FILENAME: &str = "memory-ranges";
 const X86_64_IRQ_BASE: u32 = 5;
 
 const HOTPLUG_COUNT: usize = 8;
+const HOTPLUG_RAM_ALIGN_SIZE: u64 = 128 << 20;
+// Gap needed to ensure regions are not contiguous in guest physical address space
+const HOTPLUG_RAM_GAP_SIZE: u64 = 256 << 20;
 
 // Memory policy constants
 const MPOL_BIND: u32 = 2;
@@ -217,12 +219,13 @@ pub struct MemoryManager {
     hotplug_method: HotplugMethod,
     boot_ram: u64,
     current_ram: u64,
+    hotplug_size: u64,
     next_hotplug_slot: usize,
     shared: bool,
     hugepages: bool,
     hugepage_size: Option<u64>,
     prefault: bool,
-    reserve: bool,
+    reserve: Option<bool>,
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
@@ -253,6 +256,10 @@ pub enum Error {
     #[error("Failed to set shared file length")]
     SharedFileSetLen(#[source] io::Error),
 
+    /// Failed to seal shared file.
+    #[error("Failed to seal shared file")]
+    SharedFileSeal(#[source] io::Error),
+
     /// Mmap backed guest memory error
     #[error("Mmap backed guest memory error")]
     GuestMemory(#[source] MmapError),
@@ -274,8 +281,8 @@ pub enum Error {
     NoSlotAvailable,
 
     /// Not enough space in the hotplug RAM region
-    #[error("Not enough space in the hotplug RAM region")]
-    InsufficientHotplugRam,
+    #[error("Not enough space in the hotplug RAM region: {0} exceeds {1}")]
+    InsufficientHotplugRam(u64, u64),
 
     /// The requested hotplug memory addition is not a valid size
     #[error("The requested hotplug memory addition is not a valid size")]
@@ -292,10 +299,6 @@ pub enum Error {
     /// Failed to EventFd.
     #[error("Failed to EventFd")]
     EventFdFail(#[source] io::Error),
-
-    /// Eventfd write error
-    #[error("Eventfd write error")]
-    EventfdError(#[source] io::Error),
 
     /// Failed to virtio-mem resize
     #[error("Failed to virtio-mem resize")]
@@ -394,6 +397,10 @@ pub enum Error {
     // Error copying snapshot into region
     #[error("Error copying snapshot into region")]
     SnapshotCopy(#[source] GuestMemoryError),
+
+    /// Error mapping snapshot file over guest RAM
+    #[error("Error mapping snapshot file over guest RAM")]
+    SnapshotMmap(#[source] io::Error),
 
     /// Failed to allocate MMIO address
     #[error("Failed to allocate MMIO address")]
@@ -702,7 +709,7 @@ impl MemoryManager {
                     region_start,
                     region_size as usize,
                     prefault.unwrap_or(zone.prefault),
-                    zone.reserve,
+                    zone.reserve.unwrap_or(zone.hugepages),
                     zone.shared,
                     zone.hugepages,
                     zone.hugepage_size,
@@ -805,7 +812,7 @@ impl MemoryManager {
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
                         prefault.unwrap_or(zone_config.prefault),
-                        zone_config.reserve,
+                        zone_config.reserve.unwrap_or(zone_config.hugepages),
                         zone_config.shared,
                         zone_config.hugepages,
                         zone_config.hugepage_size,
@@ -843,10 +850,6 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
-        if saved_regions.is_empty() {
-            return Ok(());
-        }
-
         // Open (read only) the snapshot file.
         let mut memory_file = OpenOptions::new()
             .read(true)
@@ -919,6 +922,37 @@ impl MemoryManager {
         }
 
         Ok(())
+    }
+
+    // Restore guest memory by mapping the snapshot file copy-on-write over
+    // the anonymous guest mappings — before any KVM memslot or device
+    // consumes them, so overlay identity concerns do not apply. Falls back
+    // to the eager copy whenever a range cannot be mapped safely. The
+    // snapshot file must remain on disk for the VM lifetime.
+    fn mmap_cow_saved_regions(
+        &mut self,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        let guest_memory = self.guest_memory.memory();
+        if !is_restore_cow_compatible(&guest_memory, saved_regions) {
+            info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
+            return self.fill_saved_regions(file_path, saved_regions);
+        }
+        let memory_file = OpenOptions::new()
+            .read(true)
+            .open(file_path)
+            .map_err(Error::SnapshotOpen)?;
+        // A range mapped past EOF faults SIGBUS at run time, not restore time.
+        let mapped_len: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
+        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
+        if file_len < mapped_len {
+            return Err(Error::SnapshotMmap(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "snapshot memory file is shorter than the saved ranges",
+            )));
+        }
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -1108,14 +1142,19 @@ impl MemoryManager {
             .name("uffd-handler".to_string())
             .spawn(move || {
                 panic::catch_unwind(panic::AssertUnwindSafe(move || {
-                    let result = Self::uffd_handler_loop(
+                    let mut result = Self::uffd_handler_loop(
                         uffd_fd,
-                        thread_stop_event,
+                        &thread_stop_event,
                         source,
                         &handler_ranges,
                         &ready_tx,
                         &thread_prefault_complete,
                     );
+
+                    if result.is_err() && thread_stop_event.read().is_ok() {
+                        // Error during shutdown is expected
+                        result = Ok(());
+                    }
 
                     if let Err(e) = &result {
                         error!("UFFD handler exited with error: {e}");
@@ -1201,7 +1240,7 @@ impl MemoryManager {
     #[expect(clippy::needless_pass_by_value)]
     fn uffd_handler_loop(
         uffd_fd: OwnedFd,
-        stop_event: EventFd,
+        stop_event: &EventFd,
         mut source: Box<dyn UffdMemorySource>,
         ranges: &[UffdRange],
         ready_tx: &SyncSender<()>,
@@ -1226,10 +1265,11 @@ impl MemoryManager {
             })
             .collect();
 
-        // Prefault cursor: (range index, page index within range). `None`
-        // means prefault was given up due to an error (natural completion
-        // returns from the function instead).
-        let mut prefault_cursor: Option<(usize, u64)> = (!ranges.is_empty()).then_some((0, 0));
+        let pages_loading: Mutex<HashSet<(usize, u64)>> = Mutex::new(HashSet::new());
+
+        let mut prefault_active = !ranges.is_empty();
+        let mut range_idx = 0;
+        let mut page_idx = 0;
         let prefault_start = time::Instant::now();
 
         const EVENT_STOP: u64 = 0;
@@ -1261,29 +1301,35 @@ impl MemoryManager {
         loop {
             // Block only when prefault is done; otherwise poll non-blocking
             // so we can advance prefault between faults.
-            let timeout = if prefault_cursor.is_some() { 0 } else { -1 };
+            let timeout = if prefault_active { 0 } else { -1 };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
 
+            // Check the entire batch before handling UFFD events so a pending
+            // stop cannot be delayed by a blocking page resolution.
+            if events
+                .iter()
+                .take(num_events)
+                .any(|event| event.data == EVENT_STOP)
+            {
+                stop_event.read().ok();
+                info!("UFFD handler: received stop event, exiting");
+                return Ok(());
+            }
+
             let mut got_uffd_data = false;
             for event in events.iter().take(num_events) {
                 let token = event.data;
                 let evt_flags = event.events;
 
-                if token == EVENT_STOP {
-                    stop_event.read().ok();
-                    info!("UFFD handler: received stop event, exiting");
-                    return Ok(());
-                }
-
                 if token == EVENT_UFFD
                     && (evt_flags & epoll::Events::EPOLLHUP.bits()) != 0
                     && (evt_flags & epoll::Events::EPOLLIN.bits()) == 0
                 {
-                    info!("UFFD handler: fd closed (EPOLLHUP), exiting");
+                    debug!("UFFD handler: fd closed (EPOLLHUP), exiting");
                     return Ok(());
                 }
 
@@ -1311,7 +1357,7 @@ impl MemoryManager {
                     return Err(err);
                 }
                 if n == 0 {
-                    info!("UFFD handler: EOF on fd, exiting");
+                    debug!("UFFD handler: EOF on fd, exiting");
                     return Ok(());
                 }
                 if n as usize != size_of::<uffd::UffdMsg>() {
@@ -1326,53 +1372,96 @@ impl MemoryManager {
                 }
 
                 let fault_addr = msg.pf_address;
+                let minor_fault = msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_MINOR != 0;
 
-                let mut served = false;
-                for (range_idx, range) in ranges.iter().enumerate() {
-                    let Some(page_idx) = range.page_index_of(fault_addr) else {
-                        continue;
-                    };
-
-                    loop {
-                        match source.resolve(uffd_fd.as_fd(), range, page_idx)? {
-                            FaultResolution::Served => {
-                                pages_served += 1;
-                                served_bitmap[range_idx].set_bit(page_idx as usize);
-                                break;
-                            }
-                            FaultResolution::Retry => {
-                                // The kernel reported a transient state while the fault
-                                // is being resolved; yield and retry instead of aborting.
-                                thread::yield_now();
-                            }
-                        }
-                    }
-                    served = true;
-                    break;
-                }
-
-                if !served {
-                    return Err(io::Error::other(format!(
+                // Find the corresponding page info from the fault address
+                let (range, range_idx, page_idx) = ranges
+                    .iter()
+                    .enumerate()
+                    .find_map(|(range_idx, uffd_range)| {
+                        uffd_range.page_index_of(fault_addr).map(|page_idx| (uffd_range, range_idx, page_idx))
+                    })
+                    .ok_or_else(|| io::Error::other(format!(
                         "UFFD handler: fault at {fault_addr:#x} does not belong to any registered range",
-                    )));
+                    )))?;
+
+                let key = (range_idx, page_idx);
+
+                let served_minor = {
+                    let mut loading = pages_loading.lock().unwrap();
+                    let served = served_bitmap[range_idx].is_bit_set(page_idx as usize);
+
+                    if served && minor_fault {
+                        true
+                    } else if !loading.insert(key) {
+                        // Another worker owns this page. The thread that's
+                        // handling this page will call UFFDIO_COPY or
+                        // UFFDIO_CONTINUE on the page range. The kernel
+                        // guarantees us that it will wake all the threads
+                        // waiting on this range, so we don't need to do
+                        // anything here.
+                        continue;
+                    } else {
+                        if served {
+                            // The page has been discarded (ie. virtio-balloon)
+                            served_bitmap[range_idx].reset_bit(page_idx as usize);
+                        }
+                        false
+                    }
+                };
+
+                if served_minor {
+                    // The backing page is already in the page cache. A
+                    // minor fault only needs the page mapped into this VMA.
+                    uffd::uffd_continue(
+                        uffd_fd.as_fd(),
+                        range.page_addr(page_idx),
+                        range.page_size,
+                    )
+                    .or_else(|e| {
+                        if e.raw_os_error() == Some(libc::EEXIST) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })?;
+
+                    // Do not fall through and resolve an already present page.
+                    continue;
                 }
+
+                let result = source.resolve(uffd_fd.as_fd(), range, page_idx);
+
+                {
+                    let mut loading = pages_loading.lock().unwrap();
+
+                    if result.is_ok() {
+                        served_bitmap[range_idx].set_bit(page_idx as usize);
+                    }
+
+                    loading.remove(&key);
+                }
+
+                result?;
+                pages_served += 1;
 
                 continue;
             }
 
-            // No fault pending — advance the prefault cursor past served and
-            // end-of-range pages, then prefault one fresh page below.
-            let cursor = loop {
-                let Some((range_idx, page_idx)) = prefault_cursor else {
-                    break None;
-                };
-                if page_idx >= ranges[range_idx].num_pages() {
-                    if range_idx + 1 < ranges.len() {
-                        prefault_cursor = Some((range_idx + 1, 0));
-                        continue;
-                    }
-                    // Reached the end of the last range — every page is
-                    // mapped, so no future faults can occur. Exit.
+            if !prefault_active {
+                continue;
+            }
+
+            match Self::uffd_prefault(
+                uffd_fd.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                ranges,
+                &mut source,
+                &served_bitmap,
+                &pages_loading,
+            ) {
+                Ok(0) => {
                     let elapsed = prefault_start.elapsed();
                     info!(
                         "UFFD handler: prefault done in {elapsed:.3?} — \
@@ -1382,50 +1471,90 @@ impl MemoryManager {
                     prefault_complete.store(true, Ordering::Release);
                     return Ok(());
                 }
-                if served_bitmap[range_idx].is_bit_set(page_idx as usize) {
-                    prefault_cursor = Some((range_idx, page_idx + 1));
-                    continue;
-                }
-                break Some((range_idx, page_idx));
-            };
-
-            let Some((range_idx, page_idx)) = cursor else {
-                // Prefault was given up earlier (or the range list was
-                // empty). Keep serving on-demand faults.
-                continue;
-            };
-
-            let range = &ranges[range_idx];
-
-            let advance = match source.resolve(uffd_fd.as_fd(), range, page_idx) {
-                Ok(FaultResolution::Served) => {
-                    pages_prefaulted += 1;
-                    served_bitmap[range_idx].set_bit(page_idx as usize);
-                    true
-                }
-                Ok(FaultResolution::Retry) => {
-                    // Unlike the on demand handler (which must retry to wake
-                    // the faulting thread), prefault can safely skip: any
-                    // future guest access will simply page-fault and be
-                    // served by the on demand path.
-                    true
-                }
+                Ok(prefaulted) => pages_prefaulted += prefaulted,
                 Err(e) => {
-                    let page_addr = range.page_addr(page_idx);
-                    warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
-                    false
+                    // Give up prefaulting but continue serving demand faults.
+                    warn!("UFFD prefault: abandoning background prefault after error: {e}");
+                    prefault_active = false;
                 }
-            };
+            }
+        }
+    }
 
-            if !advance {
-                // Prefault hit an unrecoverable error; give up but keep
-                // serving on-demand faults.
-                warn!("UFFD prefault: abandoning background prefault after error");
-                prefault_cursor = None;
-                continue;
+    fn uffd_prefault(
+        uffd_fd: BorrowedFd,
+        range_idx: &mut usize,
+        page_idx: &mut u64,
+        ranges: &[UffdRange],
+        source: &mut Box<dyn UffdMemorySource>,
+        served_bitmap: &[AtomicBitmap],
+        pages_loading: &Mutex<HashSet<(usize, u64)>>,
+    ) -> Result<u64, io::Error> {
+        let mut current_page_idx = *page_idx;
+        let mut current_range_idx = *range_idx;
+
+        'outer: loop {
+            'find_range: loop {
+                if current_page_idx >= ranges[current_range_idx].num_pages() {
+                    if current_range_idx + 1 < ranges.len() {
+                        current_range_idx += 1;
+                        current_page_idx = 0;
+                        continue 'find_range;
+                    }
+
+                    *range_idx = current_range_idx;
+                    *page_idx = current_page_idx;
+                    return Ok(0);
+                }
+                break 'find_range;
             }
 
-            prefault_cursor = Some((range_idx, page_idx + 1));
+            let range = &ranges[current_range_idx];
+            let key = (current_range_idx, current_page_idx);
+            let claimed = {
+                let mut loading = pages_loading.lock().unwrap();
+
+                if served_bitmap[current_range_idx].is_bit_set(current_page_idx as usize) {
+                    current_page_idx += 1;
+                    continue 'outer;
+                }
+
+                loading.insert(key)
+            };
+
+            if !claimed {
+                // Do not advance the cursor until the page's owner publishes
+                // completion or makes the page available for another attempt.
+                thread::yield_now();
+                continue 'outer;
+            }
+
+            let result = source.resolve(uffd_fd, range, current_page_idx);
+
+            {
+                let mut loading = pages_loading.lock().unwrap();
+
+                if result.is_ok() {
+                    served_bitmap[current_range_idx].set_bit(current_page_idx as usize);
+                }
+
+                loading.remove(&key);
+            }
+
+            match result {
+                Ok(()) => {
+                    current_page_idx += 1;
+
+                    *range_idx = current_range_idx;
+                    *page_idx = current_page_idx;
+                    return Ok(1);
+                }
+                Err(e) => {
+                    let page_addr = range.page_addr(current_page_idx);
+                    warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -1583,6 +1712,7 @@ impl MemoryManager {
                         zone_mergeable,
                         false,
                         self.log_dirty,
+                        hypervisor::MemoryVisibility::Private,
                     )
                 }?;
 
@@ -1647,6 +1777,7 @@ impl MemoryManager {
                     uefi_region.as_ptr(),
                     false,
                     false,
+                    hypervisor::MemoryVisibility::Private,
                 )
                 .map_err(Error::CreateUefiFlash)?;
         }
@@ -1759,8 +1890,11 @@ impl MemoryManager {
                         }
 
                         if !user_provided_zones && config.hotplug_method == HotplugMethod::Acpi {
+                            let hotplug_address_space_size = hotplug_size
+                                .checked_add(HOTPLUG_RAM_GAP_SIZE * (HOTPLUG_COUNT as u64 - 1))
+                                .ok_or(Error::GuestAddressOverFlow)?;
                             start_of_device_area = start_of_device_area
-                                .checked_add(hotplug_size)
+                                .checked_add(hotplug_address_space_size)
                                 .ok_or(Error::GuestAddressOverFlow)?;
                         } else {
                             // Alignment must be "natural" i.e. same as size of block
@@ -1780,7 +1914,7 @@ impl MemoryManager {
                                 start_addr,
                                 hotplug_size as usize,
                                 prefault.unwrap_or(zone.prefault),
-                                zone.reserve,
+                                zone.reserve.unwrap_or(zone.hugepages),
                                 zone.shared,
                                 zone.hugepages,
                                 zone.hugepage_size,
@@ -1889,6 +2023,7 @@ impl MemoryManager {
             hotplug_method: config.hotplug_method,
             boot_ram,
             current_ram,
+            hotplug_size: config.hotplug_size.unwrap_or_default(),
             next_hotplug_slot,
             shared: config.shared,
             hugepages: config.hugepages,
@@ -1942,16 +2077,22 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                mm.lock().unwrap().restore_by_uffd(
-                    &memory_file_path,
-                    &mem_snapshot.memory_ranges,
-                    exit_evt,
-                )?;
-            } else {
-                mm.lock()
-                    .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+            if !mem_snapshot.memory_ranges.is_empty() {
+                match memory_restore_mode {
+                    MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
+                        &memory_file_path,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?,
+                    MemoryRestoreMode::CopyOnWrite => mm
+                        .lock()
+                        .unwrap()
+                        .mmap_cow_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                    MemoryRestoreMode::Copy => mm
+                        .lock()
+                        .unwrap()
+                        .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                }
             }
 
             Ok(mm)
@@ -2007,6 +2148,7 @@ impl MemoryManager {
         let fd = Self::memfd_create(
             &ffi::CString::new("ch_ram").unwrap(),
             libc::MFD_CLOEXEC
+                | libc::MFD_ALLOW_SEALING
                 | if hugepages {
                     libc::MFD_HUGETLB
                         | if let Some(hugepage_size) = hugepage_size {
@@ -2034,6 +2176,22 @@ impl MemoryManager {
         // SAFETY: fd is valid
         let f = unsafe { File::from_raw_fd(fd) };
         f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
+
+        // Seal the FD to prevent truncate changing the size (and triggering
+        // SIGBUS in the VMM) as it may be shared with an external process.
+        //
+        // SAFETY: `f` provides a valid file descriptor, and `F_ADD_SEALS` takes
+        // no pointer arguments.
+        let res = unsafe {
+            libc::fcntl(
+                f.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+            )
+        };
+        if res < 0 {
+            return Err(Error::SharedFileSeal(io::Error::last_os_error()));
+        }
 
         Ok(FileOffset::new(f, 0))
     }
@@ -2303,12 +2461,14 @@ impl MemoryManager {
     // Calculate the start address of an area next to RAM.
     //
     // If memory hotplug is allowed, the start address needs to be aligned
-    // (rounded-up) to 128MiB boundary.
+    // (rounded-up) to 128MiB boundary and separated from the previous RAM
+    // region by a 256MiB gap. This prevents the guest from accessing memory
+    // across two separate mappings with a single access.
     // If memory hotplug is not allowed, there is no alignment required.
     // And it must also start at the 64bit start.
     fn start_addr(mem_end: GuestAddress, allow_mem_hotplug: bool) -> Result<GuestAddress, Error> {
         let mut start_addr = if allow_mem_hotplug {
-            GuestAddress(mem_end.0 | ((128 << 20) - 1))
+            GuestAddress(mem_end.0 | (HOTPLUG_RAM_ALIGN_SIZE - 1))
         } else {
             mem_end
         };
@@ -2320,6 +2480,12 @@ impl MemoryManager {
         #[cfg(not(target_arch = "riscv64"))]
         if mem_end < layout::MEM_32BIT_RESERVED_START {
             return Ok(layout::RAM_64BIT_START);
+        }
+
+        if allow_mem_hotplug {
+            start_addr = start_addr
+                .checked_add(HOTPLUG_RAM_GAP_SIZE)
+                .ok_or(Error::GuestAddressOverFlow)?;
         }
 
         Ok(start_addr)
@@ -2337,7 +2503,7 @@ impl MemoryManager {
             start_addr,
             size,
             self.prefault,
-            self.reserve,
+            self.reserve.unwrap_or(self.hugepages),
             self.shared,
             self.hugepages,
             self.hugepage_size,
@@ -2358,6 +2524,7 @@ impl MemoryManager {
                     .map_or(self.mergeable, |z| z.mergeable),
                 false,
                 self.log_dirty,
+                hypervisor::MemoryVisibility::Private,
             )
         }?;
         self.guest_ram_mappings.push(GuestRamMapping {
@@ -2383,8 +2550,22 @@ impl MemoryManager {
         }
 
         // "Inserted" DIMM must have a size that is a multiple of 128MiB
-        if !size.is_multiple_of(128 << 20) {
+        if !size.is_multiple_of(HOTPLUG_RAM_ALIGN_SIZE as usize) {
             return Err(Error::InvalidSize);
+        }
+
+        let total_hotplug_ram = self
+            .hotplug_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .map(|slot| slot.length)
+            .sum::<u64>()
+            + size as u64;
+        if total_hotplug_ram > self.hotplug_size {
+            return Err(Error::InsufficientHotplugRam(
+                total_hotplug_ram,
+                self.hotplug_size,
+            ));
         }
 
         let start_addr = MemoryManager::start_addr(self.guest_memory.memory().last_addr(), true)?;
@@ -2394,7 +2575,10 @@ impl MemoryManager {
             .unwrap()
             > self.end_of_ram_area
         {
-            return Err(Error::InsufficientHotplugRam);
+            return Err(Error::InsufficientHotplugRam(
+                total_hotplug_ram,
+                self.hotplug_size,
+            ));
         }
 
         let region = self.add_ram_region(start_addr, size)?;
@@ -2456,6 +2640,7 @@ impl MemoryManager {
     ///
     /// `userspace_addr` and `memory_size` must be and remain valid
     /// until `remove_userspace_mapping` is called.
+    #[expect(clippy::too_many_arguments)]
     pub unsafe fn create_userspace_mapping(
         &mut self,
         guest_phys_addr: u64,
@@ -2464,6 +2649,7 @@ impl MemoryManager {
         mergeable: bool,
         readonly: bool,
         log_dirty: bool,
+        visibility: hypervisor::MemoryVisibility,
     ) -> Result<u32, Error> {
         let slot = self.allocate_memory_slot();
 
@@ -2482,6 +2668,7 @@ impl MemoryManager {
                     userspace_addr,
                     readonly,
                     log_dirty,
+                    visibility,
                 )
                 .map_err(Error::CreateUserMemoryRegion)?;
         }
@@ -2559,7 +2746,6 @@ impl MemoryManager {
                     memory_size,
                     userspace_addr,
                     false, /* readonly -- don't care */
-                    false, /* log dirty */
                 )
                 .map_err(Error::RemoveUserMemoryRegion)?;
         }
@@ -3430,8 +3616,8 @@ impl Migratable for MemoryManager {
             let vmm_dirty_bitmap = match self.guest_memory.memory().find_region(GuestAddress(r.gpa))
             {
                 Some(region) => {
-                    assert!(region.start_addr().raw_value() == r.gpa);
-                    assert!(region.len() == r.size);
+                    assert_eq!(region.start_addr().raw_value(), r.gpa);
+                    assert_eq!(region.len(), r.size);
                     (**region).bitmap().get_and_reset()
                 }
                 None => {
@@ -3461,5 +3647,398 @@ impl Migratable for MemoryManager {
             table.extend(sub_table);
         }
         Ok(table)
+    }
+}
+
+// Reports whether every saved range is page-aligned and lies wholly inside a
+// single plain private-anonymous guest region — the MAP_FIXED overlay
+// preconditions. File-backed regions are rejected: their stale mapping
+// metadata would misdirect a later snapshot or fd consumer.
+fn is_restore_cow_compatible(
+    guest_memory: &GuestMemoryMmap,
+    saved_regions: &MemoryRangeTable,
+) -> bool {
+    // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut file_offset: u64 = 0;
+    for range in saved_regions.regions() {
+        if !file_offset.is_multiple_of(page_size)
+            || !range.gpa.is_multiple_of(page_size)
+            || !range.length.is_multiple_of(page_size)
+        {
+            return false;
+        }
+        let Some(end) = range.gpa.checked_add(range.length) else {
+            return false;
+        };
+        let ok = guest_memory
+            .find_region(GuestAddress(range.gpa))
+            .is_some_and(|r| {
+                r.file_offset().is_none() && end <= r.start_addr().raw_value() + r.len()
+            });
+        if !ok {
+            return false;
+        }
+        let Some(next) = file_offset.checked_add(range.length) else {
+            return false;
+        };
+        file_offset = next;
+    }
+    true
+}
+
+// Maps each saved range over its guest RAM window, re-applying the owning
+// region's reserve policy and the THP policy. Ranges must have passed
+// `is_restore_cow_compatible`.
+fn do_mmap_cow_saved_regions(
+    guest_memory: &GuestMemoryMmap,
+    memory_file: &File,
+    saved_regions: &MemoryRangeTable,
+    thp: bool,
+) -> Result<(), Error> {
+    let mut file_offset: u64 = 0;
+    for range in saved_regions.regions() {
+        // Zones map with their own reserve setting, so take MAP_NORESERVE
+        // from the region actually backing this range rather than from the
+        // global memory config.
+        let reserve_flag = guest_memory
+            .find_region(GuestAddress(range.gpa))
+            .map(|region| region.flags() & libc::MAP_NORESERVE)
+            .ok_or_else(|| {
+                Error::SnapshotMmap(io::Error::other("saved range outside guest memory"))
+            })?;
+        let host_addr = guest_memory
+            .get_host_address(GuestAddress(range.gpa))
+            .map_err(|e| Error::SnapshotMmap(io::Error::other(e)))?;
+        let length = range.length as usize;
+        // SAFETY: the window is page-aligned, wholly inside a live private
+        // anonymous region nothing consumes yet, so the MAP_FIXED replacement
+        // cannot clobber foreign mappings. The fd stays valid for the call.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr.cast(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | reserve_flag,
+                memory_file.as_raw_fd(),
+                file_offset as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+        }
+        if thp {
+            // SAFETY: ret/length name the private mapping just installed above.
+            let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
+            if adv != 0 {
+                warn!(
+                    "Restore (mode=copyonwrite): MADV_HUGEPAGE failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
+            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+
+    use super::*;
+
+    struct RecordingUffdMemorySource {
+        attempts: Arc<Mutex<Vec<(u64, u64)>>>,
+        fail_next: bool,
+    }
+
+    impl UffdMemorySource for RecordingUffdMemorySource {
+        fn resolve(
+            &mut self,
+            _uffd_fd: BorrowedFd<'_>,
+            range: &UffdRange,
+            page_idx: u64,
+        ) -> Result<(), io::Error> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((range.host_addr, page_idx));
+
+            if self.fail_next {
+                self.fail_next = false;
+                return Err(io::Error::other("test source failure"));
+            }
+
+            Ok(())
+        }
+
+        fn requires_uffd_minor_mode(&self) -> bool {
+            false
+        }
+    }
+
+    fn page_size() -> u64 {
+        // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    fn new_served_bitmap(ranges: &[UffdRange]) -> Vec<AtomicBitmap> {
+        ranges
+            .iter()
+            .map(|range| {
+                AtomicBitmap::new(
+                    range.length as usize,
+                    NonZeroUsize::new(range.page_size as usize).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn uffd_prefault_skips_present_pages_and_crosses_ranges() {
+        let page = page_size();
+        let ranges = [
+            UffdRange {
+                host_addr: 0x10_0000,
+                length: 2 * page,
+                source_offset: 0,
+                page_size: page,
+            },
+            UffdRange {
+                host_addr: 0x20_0000,
+                length: page,
+                source_offset: 2 * page,
+                page_size: page,
+            },
+        ];
+        let served_bitmap = new_served_bitmap(&ranges);
+        served_bitmap[0].set_bit(0);
+        let pages_loading = Mutex::new(HashSet::new());
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut source: Box<dyn UffdMemorySource> = Box::new(RecordingUffdMemorySource {
+            attempts: Arc::clone(&attempts),
+            fail_next: false,
+        });
+        let uffd_file = tempfile::tempfile().unwrap();
+        let mut range_idx = 0;
+        let mut page_idx = 0;
+
+        assert_eq!(
+            MemoryManager::uffd_prefault(
+                uffd_file.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                &ranges,
+                &mut source,
+                &served_bitmap,
+                &pages_loading,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!((range_idx, page_idx), (0, 2));
+
+        assert_eq!(
+            MemoryManager::uffd_prefault(
+                uffd_file.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                &ranges,
+                &mut source,
+                &served_bitmap,
+                &pages_loading,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!((range_idx, page_idx), (1, 1));
+
+        assert_eq!(
+            MemoryManager::uffd_prefault(
+                uffd_file.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                &ranges,
+                &mut source,
+                &served_bitmap,
+                &pages_loading,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!((range_idx, page_idx), (1, 1));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![(ranges[0].host_addr, 1), (ranges[1].host_addr, 0)]
+        );
+    }
+
+    #[test]
+    fn uffd_prefault_retries_page_after_source_failure() {
+        let page = page_size();
+        let ranges = [UffdRange {
+            host_addr: 0x10_0000,
+            length: page,
+            source_offset: 0,
+            page_size: page,
+        }];
+        let served_bitmap = new_served_bitmap(&ranges);
+        let pages_loading = Mutex::new(HashSet::new());
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut source: Box<dyn UffdMemorySource> = Box::new(RecordingUffdMemorySource {
+            attempts: Arc::clone(&attempts),
+            fail_next: true,
+        });
+        let uffd_file = tempfile::tempfile().unwrap();
+        let mut range_idx = 0;
+        let mut page_idx = 0;
+
+        let error = MemoryManager::uffd_prefault(
+            uffd_file.as_fd(),
+            &mut range_idx,
+            &mut page_idx,
+            &ranges,
+            &mut source,
+            &served_bitmap,
+            &pages_loading,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "test source failure");
+        assert_eq!((range_idx, page_idx), (0, 0));
+        assert!(pages_loading.lock().unwrap().is_empty());
+        assert!(!served_bitmap[0].is_bit_set(0));
+
+        assert_eq!(
+            MemoryManager::uffd_prefault(
+                uffd_file.as_fd(),
+                &mut range_idx,
+                &mut page_idx,
+                &ranges,
+                &mut source,
+                &served_bitmap,
+                &pages_loading,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!((range_idx, page_idx), (0, 1));
+        assert!(pages_loading.lock().unwrap().is_empty());
+        assert!(served_bitmap[0].is_bit_set(0));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![(ranges[0].host_addr, 0), (ranges[0].host_addr, 0)]
+        );
+    }
+
+    #[test]
+    fn cow_restore_maps_data_and_reads_holes_as_zero() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xabu8; page as usize]).unwrap();
+        file.set_len(2 * page).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+
+        assert!(is_restore_cow_compatible(&gm, &table));
+        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * page - 1)).unwrap(), 0);
+
+        // Copy-on-write: guest writes must not reach the file.
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        let mut back = [0u8; 1];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut back).unwrap();
+        assert_eq!(back[0], 0xab);
+    }
+
+    #[test]
+    fn cow_restore_rejects_unaligned_or_out_of_region_ranges() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
+
+        let mut unaligned = MemoryRangeTable::default();
+        unaligned.push(MemoryRange {
+            gpa: 1,
+            length: page,
+        });
+        assert!(!is_restore_cow_compatible(&gm, &unaligned));
+
+        let mut spanning = MemoryRangeTable::default();
+        spanning.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+        assert!(!is_restore_cow_compatible(&gm, &spanning));
+    }
+
+    #[test]
+    fn cow_restore_rejects_file_backed_region() {
+        let page = page_size();
+        let backing = tempfile::tempfile().unwrap();
+        backing.set_len(page).unwrap();
+        let region = MmapRegion::build(
+            Some(FileOffset::new(backing, 0)),
+            page as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .unwrap();
+        let gm = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: page,
+        });
+        assert!(!is_restore_cow_compatible(&gm, &table));
+    }
+
+    #[test]
+    fn cow_restore_honors_region_reserve_and_thp() {
+        let page = page_size();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xcdu8; page as usize]).unwrap();
+
+        for extra_flags in [0, libc::MAP_NORESERVE] {
+            let region = MmapRegion::build(
+                None,
+                page as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra_flags,
+            )
+            .unwrap();
+            let gm = GuestMemoryMmap::from_regions(vec![
+                GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+            ])
+            .unwrap();
+
+            let mut table = MemoryRangeTable::default();
+            table.push(MemoryRange {
+                gpa: 0,
+                length: page,
+            });
+            do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
+            assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
+        }
     }
 }

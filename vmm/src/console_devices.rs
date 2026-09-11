@@ -14,7 +14,6 @@ use std::fs::{File, OpenOptions, read_link};
 use std::mem::zeroed;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{io, result};
@@ -24,6 +23,7 @@ use thiserror::Error;
 use vmm_sys_util::errno;
 
 use crate::Vmm;
+use crate::locked_unix_listener::{LockedUnixListener, LockedUnixListenerError};
 use crate::sigwinch_listener::listen_for_sigwinch_on_tty;
 use crate::vm_config::ConsoleOutputMode;
 
@@ -40,6 +40,18 @@ pub enum ConsoleDeviceError {
     /// No socket option support for console device
     #[error("No socket option support for console device")]
     NoSocketOptionSupportForConsoleDevice,
+
+    /// The serial socket is already in use by another running instance
+    #[error("Serial socket {0:?} is already in use by another running instance")]
+    SerialSocketInUse(PathBuf),
+
+    /// The console socket is already in use by another running instance
+    #[error("Console socket {0:?} is already in use by another running instance")]
+    ConsoleSocketInUse(PathBuf),
+
+    /// Socket path missing for socket console mode
+    #[error("Socket path missing for socket console mode")]
+    MissingSocketPath,
 
     /// Error setting pty raw mode
     #[error("Error setting pty raw mode")]
@@ -62,7 +74,7 @@ pub enum ConsoleTransport {
     Pty(Arc<File>),
     Tty(Arc<File>),
     Null,
-    Socket(Arc<UnixListener>),
+    Socket(Arc<LockedUnixListener>),
     Off,
 }
 
@@ -177,6 +189,10 @@ fn dup_stdout() -> errno::Result<File> {
 }
 
 pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<ConsoleInfo> {
+    // Drop the previous VM's console handles. The VMM serial socket listener
+    // remains available for reuse across reboot and shutdown followed by boot.
+    vmm.console_info = None;
+
     let vm_config = vmm.vm_config.as_mut().unwrap().clone();
     let mut vmconfig = vm_config.lock().unwrap();
     let mut original_termios_opt = vmm.original_termios_opt.lock().unwrap();
@@ -221,7 +237,27 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 ConsoleTransport::Tty(Arc::new(stdout))
             }
             ConsoleOutputMode::Socket => {
-                return Err(ConsoleDeviceError::NoSocketOptionSupportForConsoleDevice);
+                let socket_path = vmconfig
+                    .console
+                    .common
+                    .socket
+                    .as_ref()
+                    .ok_or(ConsoleDeviceError::MissingSocketPath)?;
+                if let Some(listener) = vmm.console_socket_listener.as_ref()
+                    && listener.path() == socket_path
+                {
+                    ConsoleTransport::Socket(Arc::clone(listener))
+                } else {
+                    let listener = LockedUnixListener::bind(socket_path).map_err(|e| match e {
+                        LockedUnixListenerError::InUse(path) => {
+                            ConsoleDeviceError::ConsoleSocketInUse(path)
+                        }
+                        LockedUnixListenerError::Io(e) => {
+                            ConsoleDeviceError::CreateConsoleDevice(e)
+                        }
+                    })?;
+                    ConsoleTransport::Socket(Arc::new(listener))
+                }
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
@@ -256,9 +292,22 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 ConsoleTransport::Tty(Arc::new(stdout))
             }
             ConsoleOutputMode::Socket => {
-                let listener = UnixListener::bind(vmconfig.serial.common.socket.as_ref().unwrap())
-                    .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::Socket(Arc::new(listener))
+                let socket_path = vmconfig.serial.common.socket.as_ref().unwrap();
+                if let Some(listener) = vmm.serial_socket_listener.as_ref()
+                    && listener.path() == socket_path
+                {
+                    ConsoleTransport::Socket(Arc::clone(listener))
+                } else {
+                    let listener = LockedUnixListener::bind(socket_path).map_err(|e| match e {
+                        LockedUnixListenerError::InUse(path) => {
+                            ConsoleDeviceError::SerialSocketInUse(path)
+                        }
+                        LockedUnixListenerError::Io(e) => {
+                            ConsoleDeviceError::CreateConsoleDevice(e)
+                        }
+                    })?;
+                    ConsoleTransport::Socket(Arc::new(listener))
+                }
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
@@ -289,6 +338,16 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
         },
+    };
+
+    vmm.serial_socket_listener = match &console_info.serial {
+        ConsoleTransport::Socket(listener) => Some(Arc::clone(listener)),
+        _ => None,
+    };
+
+    vmm.console_socket_listener = match &console_info.console {
+        ConsoleTransport::Socket(listener) => Some(Arc::clone(listener)),
+        _ => None,
     };
 
     Ok(console_info)

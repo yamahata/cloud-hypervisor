@@ -50,10 +50,10 @@ const AMBA_ID_LOW: u64 = 0x3f8;
 const AMBA_ID_HIGH: u64 = 0x401;
 
 #[derive(Debug, Error)]
-pub enum Error {
-    #[error("pl011_write: Bad Write Offset: {0}")]
+pub(super) enum Error {
+    #[error("PL011 write: Bad write offset: {0}")]
     BadWriteOffset(u64),
-    #[error("pl011: DMA not implemented")]
+    #[error("PL011: DMA not implemented")]
     DmaNotImplemented,
     #[error("Failed to trigger interrupt")]
     InterruptFailure(#[source] io::Error),
@@ -454,7 +454,7 @@ impl Transportable for Pl011 {}
 impl Migratable for Pl011 {}
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::sync::Mutex;
 
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};

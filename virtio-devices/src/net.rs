@@ -222,8 +222,6 @@ pub enum Error {
     DuplicateTapFd(#[source] io::Error),
     #[error("Error creating EventFd")]
     CreateEventFd(#[source] io::Error),
-    #[error("Error cloning EventFd")]
-    CloneEventFd(#[source] io::Error),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -892,7 +890,11 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone(), self.announce.pending.clone()),
+                ctrl_q: CtrlQueue::new(
+                    self.taps.clone(),
+                    self.announce.pending.clone(),
+                    self.config.max_virtqueue_pairs,
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform(),
@@ -1145,7 +1147,7 @@ pub(crate) struct VirtioNetGuestAnnounceOps {
 }
 
 impl VirtioNetGuestAnnounceOps {
-    pub fn new(
+    pub(crate) fn new(
         interrupt_cb: Arc<dyn VirtioInterrupt>,
         guest_announce_negotiated: bool,
         announce: &AnnouncementState,
@@ -1187,7 +1189,7 @@ struct VirtioNetHostAnnounceOps {
 }
 
 impl VirtioNetHostAnnounceOps {
-    pub fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, taps: Box<[Tap]>) -> Self {
+    pub(crate) fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, taps: Box<[Tap]>) -> Self {
         Self {
             rarp_announce,
             taps,
@@ -1219,7 +1221,7 @@ impl AnnounceOps for VirtioNetHostAnnounceOps {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::mem::{offset_of, size_of};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

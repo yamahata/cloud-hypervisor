@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::{NonZeroU32, ParseIntError};
@@ -13,7 +15,7 @@ use std::result::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -34,6 +36,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::sync_utils::Gate;
+use crate::util::flatten_error_chain_to_string;
 use crate::{GuestMemoryMmap, VmMigrationConfig};
 
 /// Hard upper bound for migration worker connections on both the sender and
@@ -143,6 +146,16 @@ pub(crate) enum SocketStream {
     Unix(UnixStream),
     Tcp(TcpStream),
     Tls(Box<TlsStream>),
+}
+
+impl Debug for SocketStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            SocketStream::Unix(_) => write!(f, "Unix"),
+            SocketStream::Tcp(_) => write!(f, "Tcp"),
+            SocketStream::Tls(_) => write!(f, "Tls"),
+        }
+    }
 }
 
 impl Read for SocketStream {
@@ -291,7 +304,7 @@ fn wait_for_readable(fd: &impl AsFd, abort_event: &impl AsRawFd) -> Result<bool,
 /// [`Self::cleanup`] is called.
 #[derive(Debug)]
 pub(crate) struct ReceiveAdditionalConnections {
-    accept_thread: Option<thread::JoinHandle<Result<(), MigratableError>>>,
+    accept_thread: Option<JoinHandle<Result<(), MigratableError>>>,
 
     /// Shared kill eventfd for the accept thread and memory workers.
     kill_evt: EventFd,
@@ -396,7 +409,7 @@ impl ReceiveAdditionalConnections {
         kill_evt: &EventFd,
         guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
         fault_tx: &Sender<SocketStream>,
-        threads: &mut Vec<thread::JoinHandle<Result<(), MigratableError>>>,
+        threads: &mut Vec<JoinHandle<Result<(), MigratableError>>>,
         seccomp_filter: &BpfProgram,
     ) -> Result<(), MigratableError> {
         loop {
@@ -476,7 +489,7 @@ impl ReceiveAdditionalConnections {
         kill_evt: &EventFd,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
         seccomp_filter: &BpfProgram,
-    ) -> Result<thread::JoinHandle<Result<(), MigratableError>>, MigratableError> {
+    ) -> Result<JoinHandle<Result<(), MigratableError>>, MigratableError> {
         let kill_evt = kill_evt
             .try_clone()
             .context("Error cloning kill_evt fd")
@@ -488,21 +501,21 @@ impl ReceiveAdditionalConnections {
             .spawn(move || {
                 if !seccomp_filter_t.is_empty() {
                     apply_filter(&seccomp_filter_t)
-                        .context("Error applying migration TCP worker seccomp filter")
+                        .context("Error applying migration receive-memory seccomp filter")
                         .map_err(MigratableError::MigrateReceive)?;
                 }
                 Self::worker_receive_memory(&mut socket, &kill_evt, &guest_memory)
             })
             .map_err(|e| {
-                error!("Error spawning receive-memory thread: {e}");
+                error!("Error spawning receive-memory worker: {e}");
                 MigratableError::MigrateReceive(
-                    anyhow!(e).context("Error spawning receive-memory thread"),
+                    anyhow!(e).context("Error spawning receive-memory worker"),
                 )
             })
     }
 
     fn join_memory_threads(
-        threads: Vec<thread::JoinHandle<Result<(), MigratableError>>>,
+        threads: Vec<JoinHandle<Result<(), MigratableError>>>,
         mut first_err: Result<(), MigratableError>,
     ) -> Result<(), MigratableError> {
         for thread in threads {
@@ -510,12 +523,12 @@ impl ReceiveAdditionalConnections {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => Some(e),
                 Err(panic) => Some(MigratableError::MigrateReceive(anyhow!(
-                    "receive-memory thread panicked: {panic:?}"
+                    "receive-memory worker panicked: {panic:?}"
                 ))),
             };
 
             if let Some(e) = err {
-                warn!("Error in receive-memory thread: {e}");
+                warn!("Error in receive-memory worker: {e}");
 
                 if first_err.is_ok() {
                     first_err = Err(e);
@@ -639,7 +652,7 @@ enum SendMemoryThreadNotify {
 /// This struct keeps track of additional threads we use to send VM memory.
 pub(crate) struct SendAdditionalConnections {
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
-    threads: Vec<thread::JoinHandle<Result<(), MigratableError>>>,
+    threads: Vec<JoinHandle<Result<(), MigratableError>>>,
     /// Sender to all workers. The receiver is shared by all workers.
     message_tx: SyncSender<SendMemoryThreadMessage>,
     /// If an error occurs in one of the memory sending threads, the main thread signals
@@ -653,30 +666,24 @@ pub(crate) struct SendAdditionalConnections {
 }
 
 impl SendAdditionalConnections {
-    /// How many requests can be queued for each connection before the main
-    /// thread has to wait for workers to catch up. This bounded [`SyncChannel`]
-    /// provides backpressure, so send_chunk() re-checks worker_error promptly
-    /// instead of queueing all memory descriptors up front and only noticing
-    /// failures at the next gate synchronization point.
+    /// Number of queued memory send requests per thread in the bounded
+    /// [`sync_channel`]. This balances batching performance with timely
+    /// backpressure, allowing [Self::enqueue_chunk] to detect worker errors
+    /// promptly.
     const BUFFERED_REQUESTS_PER_THREAD: usize = 64;
 
     /// The size of each chunk of memory to send.
     ///
-    /// We want to make this large, because each chunk is acknowledged and we wait
-    /// for the ack before sending the next chunk. The challenge is that if it is
-    /// _too_ large, we become more sensitive to network issues, like packet drops
-    /// in individual connections, because large amounts of data can pool when
-    /// throughput on one connection is temporarily reduced.
+    /// Trade-off between high throughput and reliability as each chunk is
+    /// acknowledged.
     ///
-    /// We can consider making this configurable, but a better network protocol that
-    /// doesn't require ACKs would be more efficient.
-    ///
-    /// The best-case throughput per connection can be estimated via:
-    /// chunk_size / (chunk_size / throughput_per_connection + round_trip_time)
-    ///
-    /// This chunk size together with eight connections is sufficient to saturate a 100G link.
+    /// It should be set large enough so that even very fast links need some
+    /// milliseconds to send it. This chunk size together with eight connections
+    /// is sufficient to saturate a 100G link.
     const CHUNK_SIZE: u64 = 64 /* MiB */ << 20;
 
+    /// Returns a ready-to-use thread pool when multiple connections are
+    /// configured, or a threadless instance when only one connection is required.
     pub(crate) fn new(
         destination: &str,
         connections: NonZeroU32,
@@ -721,8 +728,8 @@ impl SendAdditionalConnections {
                 .spawn(move || {
                     if !seccomp_filter.is_empty() {
                         apply_filter(&seccomp_filter)
-                            .context("Error applying migration TCP worker seccomp filter")
-                            .map_err(MigratableError::MigrateReceive)?;
+                            .context("Error applying send-memory worker seccomp filter")
+                            .map_err(MigratableError::MigrateSend)?;
                     }
 
                     Self::worker_send_memory(
@@ -734,15 +741,9 @@ impl SendAdditionalConnections {
                     )
                 })
                 .inspect_err(|_| {
-                    // If an error occurs here, we still do some light cleanup.
-                    for _ in 0..threads.len() {
-                        message_tx.send(SendMemoryThreadMessage::Disconnect).ok();
-                    }
-                    threads.drain(..).for_each(|thread| {
-                        thread.join().ok();
-                    });
+                    Self::cleanup_workers_internal(&mut threads, &message_tx).ok();
                 })
-                .context("Error spawning send-memory thread")
+                .context("Error spawning send-memory worker")
                 .map_err(MigratableError::MigrateSend)?;
             threads.push(thread);
         }
@@ -756,6 +757,7 @@ impl SendAdditionalConnections {
         })
     }
 
+    /// The lifecycle loop a TCP worker thread executes.
     fn worker_send_memory(
         socket: &mut SocketStream,
         guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
@@ -771,22 +773,26 @@ impl SendAdditionalConnections {
                 .lock()
                 .map_err(|_| MigratableError::MigrateSend(anyhow!("message_rx mutex is poisoned")))
                 .inspect_err(|_| {
-                    worker_error.store(true, Ordering::Relaxed);
+                    worker_error.store(true, Ordering::Release);
                     // We ignore errors during error handling.
                     notify_tx.send(SendMemoryThreadNotify::Error).ok();
                 })?
                 .recv()
-                .context("Error receiving message from main thread")
+                .context("Error receiving message from coordination thread")
                 .map_err(MigratableError::MigrateSend)
                 .inspect_err(|_| {
-                    worker_error.store(true, Ordering::Relaxed);
+                    worker_error.store(true, Ordering::Release);
                     notify_tx.send(SendMemoryThreadNotify::Error).ok();
                 })?;
             match message {
                 SendMemoryThreadMessage::Memory(table) => {
+                    if worker_error.load(Ordering::Acquire) {
+                        continue;
+                    }
+
                     send_memory_ranges(guest_memory, &table, socket)
                         .inspect_err(|_| {
-                            worker_error.store(true, Ordering::Relaxed);
+                            worker_error.store(true, Ordering::Release);
                             notify_tx.send(SendMemoryThreadNotify::Error).ok();
                         })
                         .context("Error sending memory to receiver side")
@@ -795,12 +801,12 @@ impl SendAdditionalConnections {
                 SendMemoryThreadMessage::Gate(gate) => {
                     notify_tx
                         .send(SendMemoryThreadNotify::Gate)
-                        .context("Error sending gate notification to main thread")
+                        .context("Error sending gate notification to coordination thread")
                         .map_err(MigratableError::MigrateSend)
                         .inspect_err(|_| {
                             // Sending via `notify_tx` just failed, so we don't try to send another
                             // message via it.
-                            worker_error.store(true, Ordering::Relaxed);
+                            worker_error.store(true, Ordering::Release);
                         })?;
                     gate.wait();
                 }
@@ -831,22 +837,21 @@ impl SendAdditionalConnections {
             return Ok(true);
         }
 
-        // The chunk size is chosen to be big enough so that even very fast links need some
-        // milliseconds to send it.
         for chunk in table.partition(Self::CHUNK_SIZE) {
-            self.send_chunk(chunk)?;
+            self.enqueue_chunk(chunk)?;
         }
 
         self.wait_for_pending_data()?;
         Ok(true)
     }
 
-    fn send_chunk(&mut self, chunk: MemoryRangeTable) -> Result<(), MigratableError> {
+    /// Enqueues a request to send a memory range table for the send workers.
+    fn enqueue_chunk(&mut self, chunk: MemoryRangeTable) -> Result<(), MigratableError> {
         let mut chunk = SendMemoryThreadMessage::Memory(chunk);
-        // [`Self::message_tx`] has a limited size, so we may have to retry sending the chunk
+        // `message_tx` has a limited size, so we may have to retry sending the chunk
         loop {
-            if self.worker_error.load(Ordering::Relaxed) {
-                return self.cleanup();
+            if self.worker_error.load(Ordering::Acquire) {
+                return self.cleanup_workers();
             }
 
             // Use try_send() so we can keep checking worker_error while the
@@ -863,9 +868,11 @@ impl SendAdditionalConnections {
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     // The workers didn't disconnect for no reason, thus we do a cleanup.
-                    return Err(self.cleanup().err().unwrap_or(MigratableError::MigrateSend(
-                        anyhow!("All sending threads disconnected, but none returned an error?"),
-                    )));
+                    return Err(self.cleanup_workers().err().unwrap_or(
+                        MigratableError::MigrateSend(anyhow!(
+                            "All sending threads disconnected, but none returned an error?"
+                        )),
+                    ));
                 }
             }
         }
@@ -900,47 +907,57 @@ impl SendAdditionalConnections {
                     }
                 }
                 SendMemoryThreadNotify::Error => {
-                    // If an error occurred in one of the worker threads, we open
-                    // the gate to make sure that no thread hangs. After that, we
-                    // receive the error from Self::cleanup() and return it.
+                    // On worker error, open the gate to unblock all threads.
+                    // cleanup_workers() propagates the error.
                     gate.open();
-                    return self.cleanup();
+                    return self.cleanup_workers();
                 }
             }
         }
     }
 
-    /// Sends disconnect messages to all workers and joins them.
-    pub(crate) fn cleanup(&mut self) -> Result<(), MigratableError> {
+    fn cleanup_workers_internal(
+        threads: &mut Vec<JoinHandle<Result<(), MigratableError>>>,
+        message_tx: &SyncSender<SendMemoryThreadMessage>,
+    ) -> Result<(), MigratableError> {
         // Send disconnect messages to all workers.
-        for _ in 0..self.threads.len() {
-            // All threads may have terminated, leading to a dropped receiver. Thus we ignore
-            // errors here.
-            self.message_tx
-                .try_send(SendMemoryThreadMessage::Disconnect)
-                .ok();
+        for _ in 0..threads.len() {
+            // Use send() over try_send() as the bounded queue may be still
+            // fully populated with enqueued chunks.
+            if message_tx
+                .send(SendMemoryThreadMessage::Disconnect)
+                .is_err()
+            {
+                debug!("Failed to send disconnect message to send-memory worker");
+            }
         }
 
-        let mut first_err = Ok(());
-        self.threads.drain(..).for_each(|thread| {
+        let mut first_err = None;
+        for (idx, thread) in threads.drain(..).enumerate() {
             let err = match thread.join() {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e),
-                Err(panic) => Some(MigratableError::MigrateSend(anyhow!(
-                    "send-memory thread panicked: {panic:?}"
-                ))),
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(panic) => MigratableError::MigrateSend(anyhow!(
+                    "send-memory worker #{idx} panicked: {panic:?}"
+                )),
             };
 
-            if let Some(e) = err {
-                warn!("Error in send-memory thread: {e}");
+            let err_msg = flatten_error_chain_to_string(&err);
+            // The first error will also be logged higher up, but log all errors
+            // here for better debuggability, accepting a possible duplicate.
+            error!("Error in send-memory worker #{idx}: {err_msg}");
 
-                if first_err.is_ok() {
-                    first_err = Err(e);
-                }
-            }
-        });
+            first_err.get_or_insert(err);
+        }
+        first_err.map_or(Ok(()), Err)
+    }
 
-        first_err
+    /// Sends disconnect messages to all workers and joins them.
+    ///
+    /// Returns the first error that any worker encounters. Calling this is
+    /// idempotent.
+    pub(crate) fn cleanup_workers(&mut self) -> Result<(), MigratableError> {
+        Self::cleanup_workers_internal(&mut self.threads, &self.message_tx)
     }
 }
 
@@ -948,7 +965,7 @@ impl Drop for SendAdditionalConnections {
     fn drop(&mut self) {
         if !self.threads.is_empty() {
             warn!(
-                "SendAdditionalConnections was not cleaned up! Either cleanup() was never called (programming error) or it failed before completing."
+                "SendAdditionalConnections was not cleaned up! Either cleanup_workers() was never called (programming error) or it failed before completing."
             );
         }
     }
@@ -993,7 +1010,7 @@ pub enum TcpAddressParseError {
 /// The expected format is `<host>:<port>` for hostnames and IPv4 addresses, or
 /// `[<ipv6-address>]:<port>` for IPv6 addresses. The host and port must both be
 /// present, and the port must parse as a `u16`.
-pub fn tcp_address_to_server_name(address: &str) -> Result<&str, TcpAddressParseError> {
+pub(crate) fn tcp_address_to_server_name(address: &str) -> Result<&str, TcpAddressParseError> {
     let (host, port) = if let Some(rest) = address.strip_prefix('[') {
         let (host, rest) = rest
             .split_once(']')
@@ -1274,6 +1291,14 @@ pub(crate) fn receive_memory_ranges(
                 )
                 .context("Error receiving memory from socket")
                 .map_err(MigratableError::MigrateReceive)?;
+
+            // EOF: Don't spin forever on closed connection
+            if bytes_read == 0 {
+                return Err(MigratableError::MigrateReceive(anyhow!(
+                    "Connection closed while receiving memory: EOF"
+                )));
+            }
+
             offset += bytes_read as u64;
 
             if offset == range.length {

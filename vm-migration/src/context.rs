@@ -101,13 +101,13 @@ impl CompletedMigrationContext {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum MigrationContextError {
     /// The memory migration context was not finalized before transition.
-    #[error("memory migration context should be finalized before pausing the VM")]
+    #[error("Memory migration context should be finalized before pausing the VM")]
     MemoryContextNotFinalized,
     /// The transition to `VmPaused` was attempted from an invalid state.
-    #[error("memory migration should only advance from the Begin state")]
+    #[error("Memory migration should only advance from the Begin state")]
     InvalidVmPausedTransition,
     /// Finalization was attempted before memory migration completed.
-    #[error("migration should only finalize after memory migration completed")]
+    #[error("Migration should only finalize after memory migration completed")]
     InvalidFinalizeTransition,
 }
 
@@ -288,7 +288,8 @@ impl MemoryMigrationContext {
 
     /// Returns an empty finalized block.
     ///
-    /// This can be used if no memory was transferred (e.g., local migration).
+    /// This can be used if no memory was transferred eagerly (e.g., local or
+    /// postcopy migration).
     pub fn empty_finalized() -> Self {
         let mut this = Self::new();
         this.finalize();
@@ -452,7 +453,7 @@ impl Display for MemoryMigrationContext {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     /// Tests for [`CompletedMigrationContext`] and [`OngoingMigrationContext`].

@@ -195,7 +195,7 @@ impl PciSegment {
         ))
     }
 
-    pub fn reserve_legacy_interrupts_for_pci_devices(
+    pub(crate) fn reserve_legacy_interrupts_for_pci_devices(
         address_manager: &Arc<AddressManager>,
         pci_irq_slots: &mut [u8; 32],
     ) -> DeviceManagerResult<()> {
@@ -228,7 +228,7 @@ impl PciSegment {
     /// An [`AddressManager`] would otherwise be required to create
     /// [`PciBus`] instances. Instead, we use any struct that implements
     /// [`DeviceRelocation`] to instantiate a [`PciBus`].
-    pub(crate) fn new_without_address_manager(
+    fn new_without_address_manager(
         id: u16,
         numa_node: u32,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
@@ -553,7 +553,7 @@ impl Aml for PciSegment {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io;
     use std::result::Result;
 
@@ -566,6 +566,7 @@ mod unit_tests {
     impl DeviceRelocation for MockDeviceRelocation {
         fn move_bar(
             &self,
+            _bar_idx: usize,
             _old_base: u64,
             _new_base: u64,
             _len: u64,

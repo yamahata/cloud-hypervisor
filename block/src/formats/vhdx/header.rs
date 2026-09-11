@@ -40,8 +40,6 @@ const MDR_GUID: [u8; 16] = [
 #[sorted]
 #[derive(Error, Debug)]
 pub enum VhdxHeaderError {
-    #[error("Failed to calculate checksum")]
-    CalculateChecksum,
     #[error("BAT entry is not unique")]
     DuplicateBATEntry,
     #[error("Metadata region entry is not unique")]
@@ -58,14 +56,10 @@ pub enum VhdxHeaderError {
     InvalidVHDXSign,
     #[error("No valid header found")]
     NoValidHeader,
-    #[error("Cannot read checksum")]
-    ReadChecksum,
     #[error("Failed to read File Type Identifier {0}")]
     ReadFileTypeIdentifier(#[source] io::Error),
     #[error("Failed to read headers {0}")]
     ReadHeader(#[source] io::Error),
-    #[error("Failed to read metadata {0}")]
-    ReadMetadata(#[source] io::Error),
     #[error("Failed to read region table entries {0}")]
     ReadRegionTableEntries(#[source] io::Error),
     #[error("Failed to read region table header {0}")]
@@ -78,6 +72,8 @@ pub enum VhdxHeaderError {
     RegionOverlap,
     #[error("Reserved region has non-zero value")]
     ReservedIsNonZero,
+    #[error("Header sequence number would overflow")]
+    SequenceNumberOverflow,
     #[error("We do not recognize this entry")]
     UnrecognizedRegionEntry,
     #[error("Failed to write header {0}")]
@@ -164,10 +160,15 @@ impl Header {
             file_write_guid
         };
 
+        let sequence_number = current_header
+            .sequence_number
+            .checked_add(1)
+            .ok_or(VhdxHeaderError::SequenceNumberOverflow)?;
+
         let mut new_header = Header {
             signature: current_header.signature,
             checksum: 0,
-            sequence_number: current_header.sequence_number + 1,
+            sequence_number,
             file_write_guid,
             data_write_guid,
             log_guid: current_header.log_guid,
@@ -237,7 +238,6 @@ fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 pub(super) struct RegionInfo {
     pub bat_entry: RegionTableEntry,
     pub mdr_entry: RegionTableEntry,
-    pub region_entries: BTreeMap<u64, u64>,
 }
 
 impl RegionInfo {
@@ -314,7 +314,6 @@ impl RegionInfo {
         Ok(RegionInfo {
             bat_entry,
             mdr_entry,
-            region_entries,
         })
     }
 }

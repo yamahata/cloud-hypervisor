@@ -41,7 +41,7 @@ use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{GuestAddress, GuestMemoryBackend};
 use vm_virtio::VirtioDeviceType;
 
-pub use self::balloon::Balloon;
+pub use self::balloon::{Balloon, BalloonStats, BalloonStatsSnapshot};
 pub use self::block::{Block, BlockState};
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
@@ -115,8 +115,6 @@ pub enum ActivateError {
     CreateEventFd(#[source] io::Error),
     #[error("Failed to spawn thread")]
     ThreadSpawn(#[source] io::Error),
-    #[error("Failed to setup vhost-user-fs daemon")]
-    VhostUserFsSetup(#[source] vhost_user::Error),
     #[error("Failed to setup vhost-user daemon")]
     VhostUserSetup(#[source] vhost_user::Error),
     #[error("Failed to create seccomp filter")]

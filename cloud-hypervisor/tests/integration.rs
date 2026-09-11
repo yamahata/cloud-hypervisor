@@ -12,6 +12,7 @@ use std::fs::{File, OpenOptions, copy};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::string::String;
@@ -44,7 +45,7 @@ mod common_parallel {
     use std::sync::mpsc;
 
     use test_infra::GuestFactory;
-    use vmm::api::TimeoutStrategy;
+    use vmm::api::{BalloonStatsResponse, TimeoutStrategy};
 
     use crate::*;
 
@@ -1706,6 +1707,125 @@ mod common_parallel {
         _test_virtio_block_direct_io_data_disk_4k(ImageType::FlatVmdk);
     }
 
+    fn _test_virtio_block_guest_block_size(image_type: ImageType, direct: bool) {
+        let (qemu_fmt, ext): (&str, &str) = match image_type {
+            ImageType::Raw => ("raw", "raw"),
+            ImageType::Qcow2 => ("qcow2", "qcow2"),
+            _ => panic!("unsupported image_type {image_type}"),
+        };
+        let image_type_str = image_type.to_string();
+
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+
+        // The advertised 4096 geometry comes entirely from the override and
+        // not from the backend. Direct I/O needs an O_DIRECT capable
+        // backing, so place it on the workloads filesystem rather than the
+        // default tmpfs.
+        let workloads_dir = direct.then(|| {
+            let mut workloads_path = dirs::home_dir().unwrap();
+            workloads_path.push("workloads");
+            TempDir::new_in(workloads_path.as_path()).unwrap()
+        });
+        let test_disk = match &workloads_dir {
+            Some(dir) => dir.as_path().join(format!("lbs-test.{ext}")),
+            None => guest.tmp_dir.as_path().join(format!("lbs-test.{ext}")),
+        };
+        let test_disk_path = test_disk.to_str().unwrap().to_owned();
+        let res = run_qemu_img(&test_disk, &["create", "-f", qemu_fmt], Some(&["64M"]));
+        assert!(res.status.success(), "qemu-img create failed: {res:?}");
+
+        let direct_opt = if direct { ",direct=on" } else { "" };
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .args([
+                "--disk",
+                format!(
+                    "path={test_disk_path},image_type={image_type_str},\
+                     guest_block_size=4096{direct_opt}"
+                )
+                .as_str(),
+            ])
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            // LOG-SEC column
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk -t | grep vdc | awk '{print $6}'")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                4096
+            );
+
+            // MIN-IO column
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk -t | grep vdc | awk '{print $3}'")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                4096
+            );
+
+            // PHY-SEC column
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk -t | grep vdc | awk '{print $5}'")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                4096
+            );
+
+            // Guest direct I/O aligns to the advertised block size while
+            // the host side stays buffered.
+            guest
+                .ssh_command(
+                    "sudo dd if=/dev/urandom of=/tmp/pattern bs=4096 count=8 && \
+                     sudo dd if=/tmp/pattern of=/dev/vdc bs=4096 count=8 seek=1 \
+                         oflag=direct conv=fsync && \
+                     sudo dd if=/dev/vdc of=/tmp/readback bs=4096 count=8 skip=1 \
+                         iflag=direct && \
+                     cmp /tmp/pattern /tmp/readback",
+                )
+                .expect("4k logical block size round trip failed");
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_virtio_block_guest_block_size_raw() {
+        _test_virtio_block_guest_block_size(ImageType::Raw, false);
+    }
+
+    #[test]
+    fn test_virtio_block_guest_block_size_qcow2() {
+        _test_virtio_block_guest_block_size(ImageType::Qcow2, false);
+    }
+
+    #[test]
+    fn test_virtio_block_guest_block_size_raw_direct() {
+        _test_virtio_block_guest_block_size(ImageType::Raw, true);
+    }
+
     #[test]
     fn test_virtio_block_qcow2_dirty_bit_unclean_shutdown() {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME_QCOW2.to_string());
@@ -2725,18 +2845,32 @@ mod common_parallel {
         handle_child_output(r, &output);
     }
 
-    #[test]
-    fn test_serial_socket_interaction() {
+    #[derive(Clone, Copy)]
+    enum ConsoleKind {
+        Serial,
+        Console,
+    }
+
+    fn _test_socket_interaction(kind: ConsoleKind) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
-        let serial_socket = guest.tmp_dir.as_path().join("serial.socket");
-        let serial_socket_pty = guest.tmp_dir.as_path().join("serial.pty");
-        let serial_option = if cfg!(target_arch = "x86_64") {
-            " console=ttyS0"
-        } else {
-            " console=ttyAMA0"
+        let socket = guest.tmp_dir.as_path().join("socket");
+        let socket_pty = guest.tmp_dir.as_path().join("socket.pty");
+
+        let mut cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_owned();
+        if let ConsoleKind::Serial = kind {
+            cmdline += if cfg!(target_arch = "x86_64") {
+                " console=ttyS0"
+            } else {
+                " console=ttyAMA0"
+            };
+        }
+
+        let socket_arg = format!("socket={}", socket.to_str().unwrap());
+        let (serial, console) = match kind {
+            ConsoleKind::Serial => (socket_arg.as_str(), "null"),
+            ConsoleKind::Console => ("null", socket_arg.as_str()),
         };
-        let cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_owned() + serial_option;
 
         let mut child = GuestCommand::new(&guest)
             .default_cpus()
@@ -2745,6 +2879,94 @@ mod common_parallel {
             .args(["--cmdline", &cmdline])
             .default_disks()
             .default_net()
+            .args(["--serial", serial])
+            .args(["--console", console])
+            .spawn()
+            .unwrap();
+
+        let boot = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+        });
+
+        let mut socat_command = Command::new("socat");
+        let socat_args = [
+            &format!("pty,link={},raw,echo=0", socket_pty.display()),
+            &format!("UNIX-CONNECT:{}", socket.display()),
+        ];
+        socat_command.args(socat_args);
+
+        let mut socat_child = socat_command.spawn().unwrap();
+        thread::sleep(Duration::new(1, 0));
+
+        let interaction = panic::catch_unwind(|| {
+            _test_pty_interaction(socket_pty);
+        });
+
+        let _ = socat_child.kill();
+        let _ = socat_child.wait();
+
+        let shutdown = panic::catch_unwind(|| {
+            guest.ssh_command("sudo shutdown -h now").unwrap();
+        });
+
+        let _ = child.wait_timeout(Duration::from_secs(20));
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(boot.and(interaction).and(shutdown), &output);
+
+        let r = panic::catch_unwind(|| {
+            // Check that the cloud-hypervisor binary actually terminated
+            if !output.status.success() {
+                panic!(
+                    "Cloud Hypervisor process failed to terminate gracefully: {:?}",
+                    output.status
+                );
+            }
+        });
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_serial_socket_interaction() {
+        _test_socket_interaction(ConsoleKind::Serial);
+    }
+
+    #[test]
+    fn test_console_socket_interaction() {
+        _test_socket_interaction(ConsoleKind::Console);
+    }
+
+    fn _test_serial_socket_stale_cleanup(reboot: bool) {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let serial_socket = guest.tmp_dir.as_path().join("serial.socket");
+        let serial_option = if cfg!(target_arch = "x86_64") {
+            " console=ttyS0"
+        } else {
+            " console=ttyAMA0"
+        };
+        let cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_owned() + serial_option;
+
+        // Leave a socket behind on the path, as a crashed instance would:
+        // binding and dropping a UnixListener closes the fd but keeps the file.
+        {
+            let _stale = UnixListener::bind(&serial_socket).unwrap();
+        }
+        assert!(serial_socket.exists());
+
+        // The VM must remove the stale socket under the lock and bind anew;
+        // without the cleanup this would fail with EADDRINUSE.
+        let mut cmd = GuestCommand::new(&guest);
+        cmd.default_cpus()
+            .default_memory()
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", &cmdline])
+            .default_disks()
+            .default_net();
+        // The arm64 runner does not support the required Landlock ABI V3 yet.
+        #[cfg(not(target_arch = "aarch64"))]
+        cmd.args(["--landlock"]);
+        let mut child = cmd
             .args(["--console", "null"])
             .args([
                 "--serial",
@@ -2753,28 +2975,11 @@ mod common_parallel {
             .spawn()
             .unwrap();
 
-        let _ = panic::catch_unwind(|| {
-            guest.wait_vm_boot().unwrap();
-        });
-
-        let mut socat_command = Command::new("socat");
-        let socat_args = [
-            &format!("pty,link={},raw,echo=0", serial_socket_pty.display()),
-            &format!("UNIX-CONNECT:{}", serial_socket.display()),
-        ];
-        socat_command.args(socat_args);
-
-        let mut socat_child = socat_command.spawn().unwrap();
-        thread::sleep(Duration::new(1, 0));
-
-        let _ = panic::catch_unwind(|| {
-            _test_pty_interaction(serial_socket_pty);
-        });
-
-        let _ = socat_child.kill();
-        let _ = socat_child.wait();
-
         let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            if reboot {
+                guest.reboot_linux(0);
+            }
             guest.ssh_command("sudo shutdown -h now").unwrap();
         });
 
@@ -2793,6 +2998,16 @@ mod common_parallel {
             }
         });
         handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_serial_socket_stale_cleanup() {
+        _test_serial_socket_stale_cleanup(false);
+    }
+
+    #[test]
+    fn test_serial_socket_landlock_reboot() {
+        _test_serial_socket_stale_cleanup(true);
     }
 
     #[test]
@@ -2918,7 +3133,10 @@ mod common_parallel {
             GuestNetworkConfig::wait_vm_boot_from(
                 guest.network.l2_tcp_listener_port,
                 &guest.network.l2_guest_ip2,
-                DEFAULT_TCP_LISTENER_TIMEOUT,
+                // Nested L2 guests can exceed the default 120s timeout on loaded
+                // hosts. The listener still returns immediately once the guest
+                // reports in.
+                300,
             )
             .unwrap();
 
@@ -5314,6 +5532,68 @@ mod common_parallel {
     }
 
     #[test]
+    fn test_virtio_balloon_stats() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .default_cpus()
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--balloon", "size=0,free_page_reporting=on"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            let balloon_stats = || -> Option<BalloonStatsResponse> {
+                let (success, output, _) =
+                    remote_command_w_output(&api_socket, "balloon-stats", None);
+                if !success {
+                    return None;
+                }
+
+                serde_json::from_slice(&output).ok()
+            };
+
+            let initial_last_update = Cell::new(0);
+            assert!(wait_until(Duration::from_secs(20), || {
+                let Some(response) = balloon_stats() else {
+                    return false;
+                };
+                if response.balloon_actual != 0
+                    || response.last_update == 0
+                    || response.stats.total_memory.unwrap_or_default() == 0
+                {
+                    return false;
+                }
+
+                initial_last_update.set(response.last_update);
+                true
+            }));
+
+            // The API returns the cached sample and requests a refresh for the
+            // next call.
+            assert!(wait_until(Duration::from_secs(20), || {
+                balloon_stats()
+                    .is_some_and(|response| response.last_update > initial_last_update.get())
+            }));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_virtio_balloon_free_page_reporting() {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -6597,15 +6877,15 @@ mod common_parallel {
         handle_child_output(r, &output);
     }
 
-    // This test exercises the local live-migration between two Cloud Hypervisor VMs on the
-    // same host. It ensures the following behaviors:
+    // This helper exercises migration between two Cloud Hypervisor VMs on the
+    // same host:
     // 1. The source VM is up and functional (including various virtio-devices are working properly);
     // 2. The 'send-migration' and 'receive-migration' command finished successfully;
     // 3. The source VM terminated gracefully after live migration;
     // 4. The destination VM is functional (including various virtio-devices are working properly) after
     //    live migration;
     // Note: This test does not use vsock as we can't create two identical vsock on the same host.
-    fn _test_live_migration(upgrade_test: bool, local: bool, paused: bool) {
+    fn _test_live_migration(upgrade_test: bool, memfds: bool, paused: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -6616,7 +6896,7 @@ mod common_parallel {
             net_id, guest.network.guest_mac0, guest.network.host_ip0
         );
 
-        let memory_param: &[&str] = if local {
+        let memory_param: &[&str] = if memfds {
             &["--memory", "size=1500M,shared=on"]
         } else {
             &["--memory", "size=1500M"]
@@ -6704,8 +6984,9 @@ mod common_parallel {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
-                    paused
+                    memfds,
+                    paused,
+                    upgrade_test
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -6853,6 +7134,7 @@ mod common_parallel {
                     &src_api_socket,
                     &dest_api_socket,
                     true,
+                    false,
                     false
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
@@ -6916,21 +7198,6 @@ mod common_parallel {
             .port()
     }
 
-    fn start_live_migration_tcp(
-        src_api_socket: &str,
-        dest_api_socket: &str,
-        dest_event_path: &str,
-        connections: NonZeroU32,
-    ) -> bool {
-        start_live_migration_tcp_with_flags(
-            src_api_socket,
-            dest_api_socket,
-            dest_event_path,
-            connections,
-            false,
-        )
-    }
-
     fn start_live_migration_tcp_with_flags(
         src_api_socket: &str,
         dest_api_socket: &str,
@@ -6942,14 +7209,10 @@ mod common_parallel {
         let migration_port = get_available_port();
         let host_ip = "127.0.0.1";
 
-        let receive_arg = if postcopy {
-            format!("receiver_url=tcp:0.0.0.0:{migration_port},memory_mode=postcopy")
-        } else {
-            format!("receiver_url=tcp:0.0.0.0:{migration_port}")
-        };
+        let receive_arg = format!("receiver_url=tcp:0.0.0.0:{migration_port}");
 
         // Start the 'receive-migration' command on the destination
-        let mut receive_migration = Command::new(clh_command("ch-remote"))
+        let receive_migration = Command::new(clh_command("ch-remote"))
             .args([
                 &format!("--api-socket={dest_api_socket}"),
                 "receive-migration",
@@ -6978,7 +7241,7 @@ mod common_parallel {
         } else {
             ""
         };
-        let mut send_migration = Command::new(clh_command("ch-remote"))
+        let send_migration = Command::new(clh_command("ch-remote"))
             .args([
                 &format!("--api-socket={src_api_socket}"),
                 "send-migration",
@@ -6992,47 +7255,58 @@ mod common_parallel {
             .spawn()
             .unwrap();
 
-        // Check if the 'send-migration' command executed successfully
-        let send_success = if let Some(status) = send_migration
-            .wait_timeout(Duration::from_secs(60))
-            .unwrap()
-        {
-            status.success()
-        } else {
-            false
-        };
+        let send_success = wait_for_migration_command(send_migration, "send_migration");
+        let receive_success = wait_for_migration_command(receive_migration, "receive_migration");
 
-        if !send_success {
-            let _ = send_migration.kill();
-            let output = send_migration.wait_with_output().unwrap();
-            eprintln!(
-                "\n\n==== Start 'send_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'send_migration' output ====\n\n",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Check if the 'receive-migration' command executed successfully
-        let receive_success = if let Some(status) = receive_migration
-            .wait_timeout(Duration::from_secs(60))
-            .unwrap()
-        {
-            status.success()
-        } else {
-            false
-        };
-
-        if !receive_success {
-            let _ = receive_migration.kill();
-            let output = receive_migration.wait_with_output().unwrap();
-            eprintln!(
-                "\n\n==== Start 'receive_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'receive_migration' output ====\n\n",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if send_success && receive_success {
+            let expected_events = [
+                &MetaEvent {
+                    event: "migration-receive-ready".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "migration-receive-starting".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "migration-receive-started".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "migration-receive-finished".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(wait_for_sequential_events(
+                Duration::from_secs(30),
+                &expected_events,
+                dest_event_path
+            ));
         }
 
         send_success && receive_success
+    }
+
+    /// Helper to wait for `{send,receive}-migration` to exit.
+    fn wait_for_migration_command(mut command: Child, command_name: &str) -> bool {
+        let command_success =
+            if let Some(status) = command.wait_timeout(Duration::from_secs(60)).unwrap() {
+                status.success()
+            } else {
+                false
+            };
+
+        if !command_success {
+            let _ = command.kill();
+            let output = command.wait_with_output().unwrap();
+            eprintln!(
+                "\n\n==== Start '{command_name}' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End '{command_name}' output ====\n\n",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        command_success
     }
 
     fn _test_live_migration_tcp(connections: NonZeroU32) {
@@ -7106,11 +7380,12 @@ mod common_parallel {
             guest.add_test_disk(&src_api_socket);
             // Start TCP live migration
             assert!(
-                start_live_migration_tcp(
+                start_live_migration_tcp_with_flags(
                     &src_api_socket,
                     &dest_api_socket,
                     &dest_event_path,
-                    connections
+                    connections,
+                    false
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -7279,7 +7554,7 @@ mod common_parallel {
         let src_api_socket = temp_api_path(&guest.tmp_dir);
         let event_path = temp_event_monitor_path(&guest.tmp_dir);
         let src_event_path = format!("{event_path}.src");
-        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let dest_event_path = format!("{event_path}.dst");
         let mut src_vm_cmd = GuestCommand::new_with_binary_path(&guest, &src_vm_path);
         src_vm_cmd
             .args(["--cpus", format!("boot={boot_vcpus}").as_str()])
@@ -7310,17 +7585,7 @@ mod common_parallel {
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
 
-            let stress_worker = boot_vcpus - 1;
-            let stress_mem_per_worker =
-                (memory_size_mb as f64 * 0.75 / stress_worker as f64) as u64;
-            // Start a memory stressor in the background to keep pages dirty,
-            // ensuring the precopy loop cannot converge within the 1s timeout.
-            let stress_cmd = format!(
-                "nohup stress --vm {stress_worker} --vm-bytes {stress_mem_per_worker}M --vm-keep &>/dev/null &"
-            );
-            guest.ssh_command(&stress_cmd).unwrap();
-            // Give stress a moment to actually start dirtying memory
-            thread::sleep(Duration::from_secs(4));
+            start_stress_in_vm(&guest);
 
             let migration_port = get_available_port();
             let host_ip = "127.0.0.1";
@@ -7402,6 +7667,10 @@ mod common_parallel {
 
                     let expected_events = [
                         &MetaEvent {
+                            event: "migration-starting".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
                             event: "migration-started".to_string(),
                             device_id: None,
                         },
@@ -7414,6 +7683,30 @@ mod common_parallel {
                         Duration::from_secs(30),
                         &expected_events,
                         &src_event_path
+                    ));
+
+                    let expected_events = [
+                        &MetaEvent {
+                            event: "migration-receive-ready".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-starting".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-started".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-failed".to_string(),
+                            device_id: None,
+                        },
+                    ];
+                    assert!(wait_for_sequential_events(
+                        Duration::from_secs(30),
+                        &expected_events,
+                        &dest_event_path
                     ));
 
                     // Check that even after a few seconds, the VMM is still
@@ -7433,6 +7726,10 @@ mod common_parallel {
 
                     let expected_events = [
                         &MetaEvent {
+                            event: "migration-starting".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
                             event: "migration-started".to_string(),
                             device_id: None,
                         },
@@ -7445,6 +7742,30 @@ mod common_parallel {
                         Duration::from_secs(30),
                         &expected_events,
                         &src_event_path
+                    ));
+
+                    let expected_events = [
+                        &MetaEvent {
+                            event: "migration-receive-ready".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-starting".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-started".to_string(),
+                            device_id: None,
+                        },
+                        &MetaEvent {
+                            event: "migration-receive-finished".to_string(),
+                            device_id: None,
+                        },
+                    ];
+                    assert!(wait_for_sequential_events(
+                        Duration::from_secs(30),
+                        &expected_events,
+                        &dest_event_path
                     ));
 
                     assert!(
@@ -7476,7 +7797,7 @@ mod common_parallel {
     }
 
     #[test]
-    fn test_live_migration_local() {
+    fn test_live_migration_memfds() {
         _test_live_migration(false, true, false);
     }
 
@@ -7486,7 +7807,7 @@ mod common_parallel {
     }
 
     #[test]
-    fn test_live_migration_local_paused() {
+    fn test_live_migration_memfds_paused() {
         _test_live_migration(false, true, true);
     }
 
@@ -7524,7 +7845,7 @@ mod common_parallel {
     }
 
     #[test]
-    fn test_live_upgrade_local() {
+    fn test_live_upgrade_memfds() {
         _test_live_migration(true, true, false);
     }
 
@@ -7534,7 +7855,7 @@ mod common_parallel {
         _test_live_migration_with_landlock();
     }
 
-    fn _test_live_migration_virtio_fs(local: bool) {
+    fn _test_live_migration_virtio_fs(memfds: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -7645,7 +7966,8 @@ mod common_parallel {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
+                    memfds,
+                    false,
                     false
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
@@ -7720,7 +8042,7 @@ mod common_parallel {
     }
 
     #[test]
-    fn test_live_migration_virtio_fs_local() {
+    fn test_live_migration_virtio_fs_memfds() {
         _test_live_migration_virtio_fs(true);
     }
 }
@@ -7850,7 +8172,7 @@ mod ivshmem {
 
     use crate::*;
 
-    fn _test_live_migration_ivshmem(local: bool) {
+    fn _test_live_migration_ivshmem(memfds: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -7861,7 +8183,7 @@ mod ivshmem {
             net_id, guest.network.guest_mac0, guest.network.host_ip0
         );
 
-        let memory_param: &[&str] = if local {
+        let memory_param: &[&str] = if memfds {
             &["--memory", "size=4G,shared=on"]
         } else {
             &["--memory", "size=4G"]
@@ -7967,7 +8289,8 @@ mod ivshmem {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
+                    memfds,
+                    false,
                     false
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
@@ -8236,7 +8559,7 @@ mod ivshmem {
     }
 
     #[test]
-    fn test_live_migration_ivshmem_local() {
+    fn test_live_migration_ivshmem_memfds() {
         _test_live_migration_ivshmem(true);
     }
 
@@ -8262,6 +8585,17 @@ mod ivshmem {
         snapshot_restore_common::_test_snapshot_restore(
             snapshot_restore_common::SnapshotRestoreTest {
                 use_resume_option: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_copyonwrite() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                memory_restore_mode: Some("copyonwrite"),
                 ..Default::default()
             },
         );
@@ -8386,7 +8720,7 @@ mod ivshmem {
 }
 
 mod snapshot_restore_common {
-    use std::fs::remove_dir_all;
+    use std::fs::{read_to_string, remove_dir_all};
     use std::process::Command;
 
     use crate::*;
@@ -8452,6 +8786,7 @@ mod snapshot_restore_common {
         pub use_hotplug: bool,
         pub use_resume_option: bool,
         pub check_clock: bool,
+        pub memory_restore_mode: Option<&'static str>,
     }
 
     pub(crate) fn _test_snapshot_restore(cfg: SnapshotRestoreTest) {
@@ -8459,6 +8794,7 @@ mod snapshot_restore_common {
             use_hotplug,
             use_resume_option,
             check_clock,
+            memory_restore_mode,
         } = cfg;
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -8606,7 +8942,13 @@ mod snapshot_restore_common {
             ])
             .args([
                 "--restore",
-                format!("source_url=file://{snapshot_dir},resume={use_resume_option}").as_str(),
+                format!(
+                    "source_url=file://{snapshot_dir},resume={use_resume_option}{}",
+                    memory_restore_mode
+                        .map(|m| format!(",memory_restore_mode={m}"))
+                        .unwrap_or_default()
+                )
+                .as_str(),
             ])
             .capture_output()
             .spawn()
@@ -8674,8 +9016,16 @@ mod snapshot_restore_common {
             None
         )));
 
-        // Remove the snapshot dir
-        let _ = remove_dir_all(snapshot_dir.as_str());
+        if memory_restore_mode == Some("copyonwrite") {
+            // Copy-on-write restore must map the snapshot file itself (a silent
+            // fallback to copy keeps RAM anonymous), and the mapped file must
+            // outlive the VM.
+            let maps = read_to_string(format!("/proc/{}/maps", child.id())).unwrap();
+            assert!(maps.contains(&format!("{snapshot_dir}/memory-ranges")));
+        } else {
+            // Remove the snapshot dir
+            let _ = remove_dir_all(snapshot_dir.as_str());
+        }
 
         let r = panic::catch_unwind(|| {
             if use_resume_option {
@@ -9112,8 +9462,8 @@ mod snapshot_restore_common {
     }
 
     // Round-trip via the reference offload daemon over the existing
-    // `vm.send-migration local=on` / `vm.receive-migration` endpoints,
-    // proving parity with `vm.snapshot`/`vm.restore`.
+    // `vm.send-migration memory_mode=memfds` / `vm.receive-migration`
+    // endpoints, proving parity with `vm.snapshot`/`vm.restore`.
     pub(crate) fn _test_snapshot_restore_offload(virtio_mem: bool, ondemand: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -9205,7 +9555,7 @@ mod snapshot_restore_common {
             assert!(remote_command(
                 &api_socket_source,
                 "send-migration",
-                Some(format!("destination_url=unix:{snapshot_socket},local=on").as_str(),),
+                Some(format!("destination_url=unix:{snapshot_socket},memory_mode=memfds").as_str(),),
             ));
 
             // The daemon should exit cleanly after persisting the snapshot.
@@ -9265,17 +9615,13 @@ mod snapshot_restore_common {
             )));
 
             // receive-migration blocks until done. Run it in a thread so
-            // we can start the daemon as the sender in parallel. On demand
-            // mode adds `memory_mode=postcopy`.
+            // we can start the daemon as the sender in parallel. The daemon
+            // announces on-demand (postcopy) mode through the migration
+            // protocol, so the receive call is identical in both modes.
             let api_socket_restored_clone = api_socket_restored.clone();
             let restore_socket_clone = restore_socket.clone();
-            let ondemand_for_thread = ondemand;
             let restore_thread = thread::spawn(move || {
-                let arg = if ondemand_for_thread {
-                    format!("receiver_url=unix:{restore_socket_clone},memory_mode=postcopy")
-                } else {
-                    format!("receiver_url=unix:{restore_socket_clone}")
-                };
+                let arg = format!("receiver_url=unix:{restore_socket_clone}");
                 remote_command(&api_socket_restored_clone, "receive-migration", Some(&arg))
             });
 
@@ -9466,6 +9812,8 @@ mod snapshot_restore_common {
 
                 // Pause, then snapshot while asking to preserve the source.
                 assert!(remote_command(&api_socket, "pause", None));
+                // Deliberately uses the deprecated `local=on` flag so the
+                // compatibility layer stays covered end-to-end.
                 assert!(remote_command(
                     &api_socket,
                     "send-migration",
@@ -9965,7 +10313,7 @@ mod common_sequential {
         let _ = fs::remove_file(shared_dir.join("post_restore_file"));
     }
 
-    fn _test_live_migration_balloon(upgrade_test: bool, local: bool) {
+    fn _test_live_migration_balloon(upgrade_test: bool, memfds: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -9976,7 +10324,7 @@ mod common_sequential {
             net_id, guest.network.guest_mac0, guest.network.host_ip0
         );
 
-        let memory_param: &[&str] = if local {
+        let memory_param: &[&str] = if memfds {
             &[
                 "--memory",
                 "size=4G,hotplug_method=virtio-mem,hotplug_size=8G,shared=on",
@@ -10089,8 +10437,9 @@ mod common_sequential {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
-                    false
+                    memfds,
+                    false,
+                    upgrade_test
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -10157,7 +10506,7 @@ mod common_sequential {
         handle_child_output(r, &dest_output);
     }
 
-    fn _test_live_migration_numa(upgrade_test: bool, local: bool) {
+    fn _test_live_migration_numa(upgrade_test: bool, memfds: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -10168,7 +10517,7 @@ mod common_sequential {
             net_id, guest.network.guest_mac0, guest.network.host_ip0
         );
 
-        let memory_param: &[&str] = if local {
+        let memory_param: &[&str] = if memfds {
             &[
                 "--memory",
                 "size=0,hotplug_method=virtio-mem,shared=on",
@@ -10305,8 +10654,9 @@ mod common_sequential {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
-                    false
+                    memfds,
+                    false,
+                    upgrade_test
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -10403,7 +10753,7 @@ mod common_sequential {
     }
 
     #[cfg(not(feature = "mshv"))]
-    fn _test_live_migration_ovs_dpdk(upgrade_test: bool, local: bool) {
+    fn _test_live_migration_ovs_dpdk(upgrade_test: bool, memfds: bool) {
         let ovs_disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let ovs_guest = Guest::new(Box::new(ovs_disk_config));
 
@@ -10443,8 +10793,9 @@ mod common_sequential {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
-                    false
+                    memfds,
+                    false,
+                    upgrade_test
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -10516,7 +10867,7 @@ mod common_sequential {
     }
 
     #[test]
-    fn test_live_migration_balloon_local() {
+    fn test_live_migration_balloon_memfds() {
         _test_live_migration_balloon(false, true);
     }
 
@@ -10526,7 +10877,7 @@ mod common_sequential {
     }
 
     #[test]
-    fn test_live_upgrade_balloon_local() {
+    fn test_live_upgrade_balloon_memfds() {
         _test_live_migration_balloon(true, true);
     }
 
@@ -10536,7 +10887,7 @@ mod common_sequential {
     }
 
     #[test]
-    fn test_live_migration_numa_local() {
+    fn test_live_migration_numa_memfds() {
         _test_live_migration_numa(false, true);
     }
 
@@ -10546,7 +10897,7 @@ mod common_sequential {
     }
 
     #[test]
-    fn test_live_upgrade_numa_local() {
+    fn test_live_upgrade_numa_memfds() {
         _test_live_migration_numa(true, true);
     }
 
@@ -10563,7 +10914,7 @@ mod common_sequential {
     #[ignore = "See #5532 and #7689"]
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "mshv"))]
-    fn test_live_migration_ovs_dpdk_local() {
+    fn test_live_migration_ovs_dpdk_memfds() {
         _test_live_migration_ovs_dpdk(false, true);
     }
 
@@ -10579,11 +10930,11 @@ mod common_sequential {
     #[ignore = "See #5532"]
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "mshv"))]
-    fn test_live_upgrade_ovs_dpdk_local() {
+    fn test_live_upgrade_ovs_dpdk_memfds() {
         _test_live_migration_ovs_dpdk(true, true);
     }
 
-    fn _test_live_migration_watchdog(upgrade_test: bool, local: bool) {
+    fn _test_live_migration_watchdog(upgrade_test: bool, memfds: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -10594,7 +10945,7 @@ mod common_sequential {
             net_id, guest.network.guest_mac0, guest.network.host_ip0
         );
 
-        let memory_param: &[&str] = if local {
+        let memory_param: &[&str] = if memfds {
             &["--memory", "size=1500M,shared=on"]
         } else {
             &["--memory", "size=1500M"]
@@ -10698,8 +11049,9 @@ mod common_sequential {
                     &migration_socket,
                     &src_api_socket,
                     &dest_api_socket,
-                    local,
-                    false
+                    memfds,
+                    false,
+                    upgrade_test
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -12698,6 +13050,23 @@ mod vfio {
 mod aarch64_acpi {
     use crate::*;
 
+    fn kvm_exposes_split_l1_cache() -> bool {
+        const CTR_EL0_IDC: u64 = 1 << 28;
+        const CTR_EL0_DIC: u64 = 1 << 29;
+
+        let ctr_el0: u64;
+        // SAFETY: CTR_EL0 is read-only and this touches no memory or stack.
+        unsafe {
+            std::arch::asm!(
+                "mrs {}, ctr_el0",
+                out(reg) ctr_el0,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+
+        ctr_el0 & (CTR_EL0_IDC | CTR_EL0_DIC) == 0
+    }
+
     #[test]
     fn test_simple_launch_acpi() {
         let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
@@ -12729,6 +13098,41 @@ mod aarch64_acpi {
 
             handle_child_output(r, &output);
         });
+    }
+
+    #[test]
+    fn test_pmu_on_acpi() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .args(["--kernel", edk2_path().to_str().unwrap()])
+            .default_disks()
+            .default_net()
+            .args(["--serial", "tty", "--console", "off"])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            assert_eq!(
+                guest
+                    .ssh_command(GREP_PMU_IRQ_CMD)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
     }
 
     #[test]
@@ -12768,6 +13172,11 @@ mod aarch64_acpi {
 
     #[test]
     fn test_cache_topology() {
+        if !kvm_exposes_split_l1_cache() {
+            println!("SKIPPED: KVM does not expose a split L1 data and instruction cache");
+            return;
+        }
+
         let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
 
         vec![Box::new(jammy)].drain(..).for_each(|disk_config| {

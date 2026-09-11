@@ -1,5 +1,10 @@
 name: CI
-on: [pull_request, merge_group]
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - 'dev/*/*'
 permissions:
   contents: read
   pull-requests: read
@@ -10,17 +15,19 @@ jobs:
   preflight:
     name: preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       full: ${{ steps.classify.outputs.full }}
       rust: ${{ steps.changes.outputs.rust }}
       cargo: ${{ steps.changes.outputs.cargo }}
+      fuzz: ${{ steps.changes.outputs.fuzz }}
       openapi: ${{ steps.changes.outputs.openapi }}
       dockerfile: ${{ steps.changes.outputs.dockerfile }}
       shell: ${{ steps.changes.outputs.shell }}
       ci: ${{ steps.changes.outputs.ci }}
       docs: ${{ steps.changes.outputs.docs }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: changes
@@ -29,6 +36,7 @@ jobs:
           filters: |
             rust:
               - '**/*.rs'
+              - '!fuzz/**'
               - 'build.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
@@ -36,6 +44,10 @@ jobs:
             cargo:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - '!fuzz/Cargo.toml'
+              - '!fuzz/Cargo.lock'
+            fuzz:
+              - 'fuzz/**'
             openapi:
               - 'vmm/src/api/openapi/**'
             dockerfile:
@@ -68,10 +80,11 @@ jobs:
     name: dco
     needs: [preflight]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python 3.x
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.x'
       - name: Check DCO
@@ -88,15 +101,16 @@ jobs:
     # PR-only: gitlint needs GITHUB_BASE_REF, unset on merge_group.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # PR head, not the merge ref, so gitlint sees the PR's commits.
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - name: Set up Python 3.10
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
       - name: Install dependencies
@@ -111,9 +125,10 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.docs == 'true' || needs.preflight.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Get changed files in PR
@@ -149,9 +164,10 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.cargo == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
@@ -165,9 +181,10 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.cargo == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/audit@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1.2.7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
   shlint:
@@ -175,9 +192,10 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.shell == 'true' || needs.preflight.outputs.ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run the shell script checkers
         uses: luizm/action-sh-checker@883217215b11c1fabbf00eb1a9a041f62d74c744 # v0.10.0
         env:
@@ -188,11 +206,12 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.dockerfile == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: ./resources/Dockerfile
           format: tty
@@ -204,15 +223,17 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.cargo == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: REUSE Compliance Check
-        uses: fsfe/reuse-action@v6
+        uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
   formatting:
     name: formatting
     needs: [preflight]
-    if: needs.preflight.outputs.full == 'true'
+    if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         rust: [nightly]
@@ -223,13 +244,26 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - name: Install Rust toolchain (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           components: rustfmt
+      - name: Bisectability Check (rustfmt)
+        if: ${{ github.event_name == 'pull_request' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          set -eufo pipefail
+          commits=$(git rev-list origin/${{ github.base_ref }}..${{ github.sha }})
+          for commit in $commits; do
+            git checkout $commit
+            cargo fmt --all -- --check
+            cargo fmt --all --manifest-path fuzz/Cargo.toml -- --check
+          done
+          git checkout ${{ github.sha }}
       - name: Formatting (rustfmt)
         run: cargo fmt --all -- --check
       - name: Formatting (fuzz) (rustfmt)
@@ -237,11 +271,12 @@ jobs:
   package-consistency:
     name: package-consistency
     needs: [preflight]
-    if: needs.preflight.outputs.full == 'true'
+    if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install dependencies
@@ -261,8 +296,9 @@ jobs:
   fuzz-build:
     name: fuzz-build
     needs: [preflight]
-    if: needs.preflight.outputs.full == 'true'
+    if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         rust: [nightly]
@@ -271,26 +307,32 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
+          components: clippy
       - name: Install Cargo fuzz
         run: cargo install cargo-fuzz
       - name: Fuzz Build
         run: cargo fuzz build
       - name: Fuzz Check
         run: cargo fuzz check
+      - name: Clippy
+        env:
+          RUSTFLAGS: --cfg fuzzing
+        run: cargo clippy --locked --bins --manifest-path fuzz/Cargo.toml -- -D warnings
   openapi:
     name: openapi
     needs: [preflight]
     if: needs.preflight.outputs.openapi == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     container: openapitools/openapi-generator-cli
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate OpenAPI
         run: |
           /usr/local/bin/docker-entrypoint.sh validate -i vmm/src/api/openapi/cloud-hypervisor.yaml
@@ -299,14 +341,16 @@ jobs:
     needs: [preflight]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
   quality:
     name: quality
     needs: [preflight]
     if: needs.preflight.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Beta clippy is non-blocking; continue-on-error below keeps the
     # aggregated needs.quality.result green when only beta fails.
     continue-on-error: ${{ matrix.experimental }}
@@ -328,7 +372,7 @@ jobs:
             experimental: false
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install Rust toolchain (${{ matrix.rust }})
@@ -346,63 +390,63 @@ jobs:
           for commit in $commits; do git checkout $commit; cargo check --tests --examples --all --target=${{ matrix.target }}; done
           git checkout ${{ github.sha }}
       - name: Clippy (kvm)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm" -- -D warnings
       - name: Clippy (mshv)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv" -- -D warnings
       - name: Clippy (mshv + kvm)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,kvm" -- -D warnings
       - name: Clippy (default features)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples -- -D warnings
       - name: Clippy (default features + guest_debug)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples --features "guest_debug" -- -D warnings
       - name: Clippy (default features + pvmemcontrol)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples --features "pvmemcontrol" -- -D warnings
       - name: Clippy (default features + tracing)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples --features "tracing" -- -D warnings
       - name: Clippy (default features + fw_cfg)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --target=${{ matrix.target }} --locked --all --all-targets --tests --examples --features "fw_cfg" -- -D warnings
       - name: Clippy (default features + ivshmem)
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -410,7 +454,7 @@ jobs:
           args: --locked --all --all-targets --tests --examples --features "ivshmem" -- -D warnings
       - name: Clippy (kvm + sev_snp)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -418,7 +462,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,sev_snp" -- -D warnings
       - name: Clippy (mshv + sev_snp)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -426,7 +470,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,sev_snp" -- -D warnings
       - name: Clippy (mshv + igvm + sev_snp)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -434,7 +478,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm,sev_snp" -- -D warnings
       - name: Clippy (kvm + igvm)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -442,7 +486,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm" -- -D warnings
       - name: Clippy (mshv + igvm)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           toolchain: ${{ matrix.rust }}
@@ -450,7 +494,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm" -- -D warnings
       - name: Clippy (kvm + igvm + sev_snp + fw_cfg)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
@@ -459,7 +503,7 @@ jobs:
           args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm,sev_snp,fw_cfg" -- -D warnings
       - name: Clippy (default features + sev_snp + igvm + fw_cfg)
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
           command: clippy
           cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
@@ -473,6 +517,7 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -486,7 +531,7 @@ jobs:
           - x86_64-unknown-linux-musl
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install musl-gcc
@@ -535,6 +580,7 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -545,7 +591,7 @@ jobs:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install riscv64 cross linker
@@ -559,50 +605,35 @@ jobs:
         run: cargo build --locked --package cloud-hypervisor --no-default-features --features "kvm" --target riscv64gc-unknown-linux-gnu
       - name: Check build did not modify any files
         run: test -z "$(git status --porcelain)"
-  # garm-jammy + gnu: runs on PR and MQ. Other 3 matrix entries are in
-  # integration-x86-64-mq (sibling, MQ-only, runs in parallel).
+  # Run x86 unit tests on GitHub-hosted runners to save self-hosted capacity.
+  # aarch64 stays self-hosted because hosted arm64 runners do not provide KVM.
+  unit-tests-x86-64:
+    name: unit-tests-x86-64
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [gnu, musl]
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify KVM is available
+        run: |
+          set -eufo pipefail
+          test -e /dev/kvm || { echo "::error::/dev/kvm missing on runner"; exit 1; }
+      - name: Run unit tests
+        run: scripts/dev_cli.sh tests --unit --libc ${{ matrix.libc }}
+  # PR-only: delay integration testing until the build and quality gates pass.
   integration-x86-64-pr:
     name: integration-x86-64-pr
     needs: [preflight, dco, quality, build]
     if: >-
-      needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
-    timeout-minutes: 80
-    env:
-      # Our runner has 16 cores (nproc).
-      # We limit parallelism only to avoid exhausting disk space and memory
-      # resources, not to save CPU resources.
-      PARALLEL_INTEGRATION_TESTS_NUM: 12
-    runs-on: garm-jammy-16
-    steps:
-      - name: Code checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Install Docker
-        run: |
-          set -eufo pipefail
-          sudo apt-get update
-          sudo apt-get -y install ca-certificates curl gnupg
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-          sudo chmod a+r /usr/share/keyrings/docker-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update
-          sudo apt install -y docker-ce docker-ce-cli
-      - name: Prepare for VDPA
-        run: scripts/prepare_vdpa.sh
-      - name: Run unit tests
-        run: scripts/dev_cli.sh tests --unit --libc gnu
-      - name: Load openvswitch module
-        run: sudo modprobe openvswitch
-      - name: Run integration tests
-        timeout-minutes: 60
-        run: scripts/dev_cli.sh tests --integration --libc gnu
-  # MQ-only: the 3 matrix entries that integration-x86-64-pr does not cover.
-  integration-x86-64-mq:
-    name: integration-x86-64-mq
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+      github.event_name == 'pull_request' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
     timeout-minutes: 80
     env:
       # Our runner has 16 cores (nproc).
@@ -613,14 +644,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {runner: garm-jammy, libc: musl}
-          - {runner: garm-jammy-amd, libc: gnu}
-          - {runner: garm-jammy-amd, libc: musl}
+          - {runner: garm-noble, libc: gnu}
     # format() because `${{ matrix.runner }}-16` is not valid in runs-on.
     runs-on: ${{ format('{0}-16', matrix.runner) }}
-    steps:
+    steps: &integration-x86-64-steps
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install Docker
@@ -635,18 +664,39 @@ jobs:
           sudo apt install -y docker-ce docker-ce-cli
       - name: Prepare for VDPA
         run: scripts/prepare_vdpa.sh
-      - name: Run unit tests
-        run: scripts/dev_cli.sh tests --unit --libc ${{ matrix.libc }}
       - name: Load openvswitch module
         run: sudo modprobe openvswitch
       - name: Run integration tests
         timeout-minutes: 60
         run: scripts/dev_cli.sh tests --integration --libc ${{ matrix.libc }}
+  # MQ and dev branch pushes start all four matrix entries after preflight, in
+  # parallel with the build and quality jobs. The PR job keeps existing gates.
+  integration-x86-64-mq:
+    name: integration-x86-64-mq
+    needs: [preflight]
+    if: &mq-if >-
+      (github.event_name == 'merge_group' || github.event_name == 'push') && needs.preflight.outputs.full == 'true'
+    timeout-minutes: 80
+    env:
+      # Our runner has 16 cores (nproc).
+      # We limit parallelism only to avoid exhausting disk space and memory
+      # resources, not to save CPU resources.
+      PARALLEL_INTEGRATION_TESTS_NUM: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: garm-noble, libc: gnu}
+          - {runner: garm-noble, libc: musl}
+          - {runner: garm-noble-amd, libc: gnu}
+          - {runner: garm-noble-amd, libc: musl}
+    # format() because `${{ matrix.runner }}-16` is not valid in runs-on.
+    runs-on: ${{ format('{0}-16', matrix.runner) }}
+    steps: *integration-x86-64-steps
   integration-arm64:
     name: integration-arm64
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    needs: [preflight]
+    if: *mq-if
     timeout-minutes: 120
     env:
       # Our runner has 80 cores (nproc).
@@ -659,7 +709,7 @@ jobs:
       - name: Fix workspace permissions
         run: sudo chown -R runner:runner ${GITHUB_WORKSPACE}
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Run unit tests (musl)
@@ -698,12 +748,38 @@ jobs:
       - name: Run Windows guest integration tests
         timeout-minutes: 30
         run: scripts/dev_cli.sh tests --integration-windows --libc musl
+  integration-graviton:
+    name: integration-graviton
+    needs: [preflight]
+    if: *mq-if
+    timeout-minutes: 120
+    env:
+      # Our runner has 96 cores (nproc).
+      # We limit parallelism only to avoid exhausting disk space and memory
+      # resources, not to save CPU resources.
+      PARALLEL_INTEGRATION_TESTS_NUM: 25
+    runs-on: noble-graviton
+    steps:
+      # arm64 runner user is "runner" (vfio's is "github-runner").
+      - name: Fix workspace permissions
+        run: sudo chown -R runner:runner ${GITHUB_WORKSPACE}
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Run unit tests (musl)
+        run: scripts/dev_cli.sh tests --unit --libc musl
+      - name: Load openvswitch module
+        run: sudo modprobe openvswitch
+      - name: Run integration tests (musl)
+        timeout-minutes: 60
+        run: scripts/dev_cli.sh tests --integration --libc musl
   integration-vfio:
     name: integration-vfio
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    needs: [preflight]
+    if: *mq-if
     runs-on: vfio-nvidia
+    timeout-minutes: 40
     env:
       AUTH_DOWNLOAD_TOKEN: ${{ secrets.AUTH_DOWNLOAD_TOKEN }}
     steps:
@@ -711,7 +787,7 @@ jobs:
       - name: Fix workspace permissions
         run: sudo chown -R github-runner:github-runner "${GITHUB_WORKSPACE}"
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Run VFIO integration tests
@@ -723,13 +799,17 @@ jobs:
     #   run: scripts/dev_cli.sh tests --integration-vfio --libc musl
   integration-windows:
     name: integration-windows
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
-    runs-on: garm-jammy-16
+    needs: [preflight]
+    if: *mq-if
+    runs-on: garm-noble-16
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [gnu, musl]
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install Docker
@@ -757,15 +837,11 @@ jobs:
           az storage blob download --container-name private-images --file "$HOME/workloads/windows-server-2025-amd64-1.raw" --name windows-server-2025-amd64-1.raw --connection-string "${{ secrets.CH_PRIVATE_IMAGES }}"
       - name: Run Windows guest integration tests
         timeout-minutes: 15
-        run: scripts/dev_cli.sh tests --integration-windows
-      - name: Run Windows guest integration tests for musl
-        timeout-minutes: 15
-        run: scripts/dev_cli.sh tests --integration-windows --libc musl
+        run: scripts/dev_cli.sh tests --integration-windows --libc ${{ matrix.libc }}
   integration-mshv-x86-64:
     name: integration-mshv-x86-64
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    needs: [preflight]
+    if: *mq-if
     timeout-minutes: 50
     runs-on: mshv
     steps:
@@ -775,7 +851,7 @@ jobs:
           sudo chown -R lsgrunner:lsgrunner ${GITHUB_WORKSPACE}
           sudo chmod 666 /var/run/docker.sock
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Prepare for VDPA
@@ -802,9 +878,8 @@ jobs:
   #       run: scripts/dev_cli.sh tests --integration-rate-limiter
   integration-sev-snp:
     name: integration-sev-snp
-    needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    needs: [preflight]
+    if: *mq-if
     timeout-minutes: 30
     runs-on: noble-sevsnp
     steps:
@@ -813,7 +888,7 @@ jobs:
       - name: Fix workspace permissions
         run: sudo chown -R "$(id -un):$(id -gn)" "${GITHUB_WORKSPACE}"
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Sanity-check SEV-SNP prerequisites
@@ -854,10 +929,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VILLAIN_REPO: https://github.com/weltling/virtio-villain.git
-      VILLAIN_REF: v0.9.0
+      VILLAIN_REF: v1.0.0
     steps:
       - name: Code checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Verify KVM is available
@@ -883,7 +958,7 @@ jobs:
           echo "sha=$(git -C virtio-villain rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Cache virtio-villain build
         id: villain-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: virtio-villain/target
           key: virtio-villain-${{ runner.os }}-${{ runner.arch }}-${{ steps.villain-src.outputs.sha }}
@@ -919,7 +994,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload virtio-villain logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: virtio-villain-logs
           path: virtio-villain/villain-logs
@@ -937,6 +1012,7 @@ jobs:
       - gitlint
       - hadolint
       - integration-arm64
+      - integration-graviton
       - integration-sev-snp
       - integration-vfio
       - integration-mshv-x86-64
@@ -951,6 +1027,7 @@ jobs:
       - shlint
       - taplo
       - typos
+      - unit-tests-x86-64
     if: always()
     runs-on: ubuntu-latest
     steps:

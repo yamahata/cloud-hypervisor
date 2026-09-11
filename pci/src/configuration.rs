@@ -14,8 +14,8 @@ use thiserror::Error;
 use vm_device::PciBarType;
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
+use crate::MsixConfig;
 use crate::device::BarReprogrammingParams;
-use crate::{MsixConfig, PciInterruptPin};
 
 // The number of 32bit registers in the config space, 4096 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 1024;
@@ -37,8 +37,6 @@ const NUM_BAR_REGS: usize = 6;
 const CAPABILITY_LIST_HEAD_OFFSET: usize = 0x34;
 const FIRST_CAPABILITY_OFFSET: usize = 0x40;
 const CAPABILITY_MAX_OFFSET: usize = 192;
-
-const INTERRUPT_LINE_PIN_REG: usize = 15;
 
 pub const PCI_CONFIGURATION_ID: &str = "pci_configuration";
 
@@ -88,7 +86,7 @@ pub trait PciSubclass {
 /// Subclasses of the MultimediaController class.
 #[expect(dead_code)]
 #[derive(Copy, Clone)]
-pub enum PciMultimediaSubclass {
+enum PciMultimediaSubclass {
     VideoController = 0x00,
     AudioController = 0x01,
     TelephonyDevice = 0x02,
@@ -105,7 +103,7 @@ impl PciSubclass for PciMultimediaSubclass {
 /// Subclasses of the BridgeDevice
 #[expect(dead_code)]
 #[derive(Copy, Clone)]
-pub enum PciBridgeSubclass {
+pub(crate) enum PciBridgeSubclass {
     HostBridge = 0x00,
     IsaBridge = 0x01,
     EisaBridge = 0x02,
@@ -494,42 +492,40 @@ pub struct PciBarConfiguration {
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("address {0} size {1} too big")]
+    #[error("Address {0} size {1} too big")]
     BarAddressInvalid(u64, u64),
-    #[error("bar {0} already used")]
+    #[error("BAR {0} already used")]
     BarInUse(usize),
-    #[error("64bit bar {0} already used (requires two regs)")]
+    #[error("64-bit BAR {0} already used (requires two regs)")]
     BarInUse64(usize),
-    #[error("bar {0} invalid, max {max}", max = NUM_BAR_REGS - 1)]
+    #[error("BAR {0} invalid, max {max}", max = NUM_BAR_REGS - 1)]
     BarInvalid(usize),
-    #[error("64bitbar {0} invalid, requires two regs, max {max}", max = NUM_BAR_REGS - 1)]
+    #[error("64-bit BAR {0} invalid, requires two regs, max {max}", max = NUM_BAR_REGS - 1)]
     BarInvalid64(usize),
-    #[error("bar address {0} not a power of two")]
+    #[error("BAR address {0} not a power of two")]
     BarSizeInvalid(u64),
-    #[error("empty capabilities are invalid")]
+    #[error("Empty capabilities are invalid")]
     CapabilityEmpty,
-    #[error("Invalid capability length {0}")]
-    CapabilityLengthInvalid(usize),
-    #[error("capability of size {0} doesn't fit")]
+    #[error("Capability of size {0} doesn't fit")]
     CapabilitySpaceFull(usize),
-    #[error("failed to decode 32 bits BAR size")]
+    #[error("Failed to decode 32-bit BAR size")]
     Decode32BarSize,
-    #[error("failed to decode 64 bits BAR size")]
+    #[error("Failed to decode 64-bit BAR size")]
     Decode64BarSize,
-    #[error("failed to encode 32 bits BAR size")]
+    #[error("Failed to encode 32-bit BAR size")]
     Encode32BarSize,
-    #[error("failed to encode 64 bits BAR size")]
+    #[error("Failed to encode 64-bit BAR size")]
     Encode64BarSize,
-    #[error("address {0} size {1} too big")]
+    #[error("Address {0} size {1} too big")]
     RomBarAddressInvalid(u64, u64),
-    #[error("rom bar {0} already used")]
+    #[error("ROM BAR {0} already used")]
     RomBarInUse(usize),
-    #[error("rom bar {0} invalid, max {max}", max = NUM_BAR_REGS - 1)]
+    #[error("ROM BAR {0} invalid, max {max}", max = NUM_BAR_REGS - 1)]
     RomBarInvalid(usize),
-    #[error("rom bar address {0} not a power of two")]
+    #[error("ROM BAR address {0} not a power of two")]
     RomBarSizeInvalid(u64),
 }
-pub type Result<T> = result::Result<T, Error>;
+pub(crate) type Result<T> = result::Result<T, Error>;
 
 impl PciConfiguration {
     #[expect(clippy::too_many_arguments)]
@@ -838,16 +834,6 @@ impl PciConfiguration {
         addr
     }
 
-    /// Configures the IRQ line and pin used by this device.
-    pub fn set_irq(&mut self, line: u8, pin: PciInterruptPin) {
-        // `pin` is 1-based in the pci config space.
-        let pin_idx = (pin as u32) + 1;
-        self.registers[INTERRUPT_LINE_PIN_REG] = (self.registers[INTERRUPT_LINE_PIN_REG]
-            & 0xffff_0000)
-            | (pin_idx << 8)
-            | u32::from(line);
-    }
-
     /// Adds the capability `cap_data` to the list of capabilities.
     /// `cap_data` should include the two-byte PCI capability header (type, next),
     /// but not populate it. Correct values will be generated automatically based
@@ -1013,6 +999,7 @@ impl PciConfiguration {
                 self.bars[bar_idx].addr = value;
 
                 return Some(BarReprogrammingParams {
+                    bar_idx: Some(bar_idx),
                     old_base,
                     new_base,
                     len,
@@ -1041,6 +1028,9 @@ impl PciConfiguration {
                 self.bars[bar_idx - 1].addr = self.registers[reg_idx - 1];
 
                 return Some(BarReprogrammingParams {
+                    // The high-dword write completes the move for a 64-bit BAR.
+                    // Report the low slot.
+                    bar_idx: Some(bar_idx - 1),
                     old_base,
                     new_base,
                     len,
@@ -1069,6 +1059,7 @@ impl PciConfiguration {
             self.rom_bar_addr = value;
 
             return Some(BarReprogrammingParams {
+                bar_idx: Some(ROM_BAR_IDX),
                 old_base,
                 new_base,
                 len,
@@ -1247,10 +1238,16 @@ impl PciBarConfiguration {
     pub fn prefetchable(&self) -> PciBarPrefetchable {
         self.prefetchable
     }
+
+    pub fn addr_of_idx(bars: &[PciBarConfiguration], idx: usize) -> Option<u64> {
+        bars.iter()
+            .find(|bar| bar.idx() == idx)
+            .map(PciBarConfiguration::addr)
+    }
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use vm_memory::ByteValued;
 
     use super::*;
@@ -1425,5 +1422,169 @@ mod unit_tests {
 
         assert!(reprogram.is_empty());
         assert_eq!(cfg.get_bar_addr(0), bar_addr);
+    }
+
+    const RELOC_BAR_SIZE: u64 = 0x8_0000;
+
+    fn reloc_config(state: Option<PciConfigurationState>) -> PciConfiguration {
+        PciConfiguration::new(
+            0x1234,
+            0x5678,
+            0x1,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            None,
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            None,
+            state,
+        )
+    }
+
+    /// Adds a 32-bit memory BAR at `idx` and enables memory space decoding, so
+    /// that subsequent BAR writes are reported as reprogramming requests.
+    fn add_reloc_bar(cfg: &mut PciConfiguration, idx: usize, addr: u64) {
+        let bar = PciBarConfiguration::new(
+            idx,
+            RELOC_BAR_SIZE,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(addr);
+        cfg.add_pci_bar(&bar).unwrap();
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+    }
+
+    #[test]
+    fn bar_reprogramming_reports_the_moved_bar_index() {
+        let mut cfg = reloc_config(None);
+        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
+        add_reloc_bar(&mut cfg, 1, 0xd000_0000);
+
+        let reprogram = cfg.write_config_register(BAR0_REG + 1, 0, &0xe000_0000u32.to_le_bytes());
+
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].bar_idx, Some(1));
+        assert_eq!(reprogram[0].old_base, 0xd000_0000);
+        assert_eq!(reprogram[0].new_base, 0xe000_0000);
+        assert_eq!(reprogram[0].len, RELOC_BAR_SIZE);
+    }
+
+    #[test]
+    fn bar_reprogramming_distinguishes_bars_sharing_a_base() {
+        let mut cfg = reloc_config(None);
+        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
+        add_reloc_bar(&mut cfg, 1, 0xd000_0000);
+
+        // Point BAR 0 at BAR 1's base. A guest is free to do this, and both
+        // BARs now read back the same address.
+        let aliased = cfg.write_config_register(BAR0_REG, 0, &0xd000_0000u32.to_le_bytes());
+        assert_eq!(aliased.len(), 1);
+        assert_eq!(aliased[0].bar_idx, Some(0));
+        assert_eq!(cfg.get_bar_addr(0), cfg.get_bar_addr(1));
+
+        // Moving BAR 1 away must name BAR 1, even though its old base no
+        // longer identifies it: an address comparison would match BAR 0 too.
+        let reprogram = cfg.write_config_register(BAR0_REG + 1, 0, &0xe000_0000u32.to_le_bytes());
+
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].bar_idx, Some(1));
+        assert_eq!(reprogram[0].old_base, 0xd000_0000);
+        assert_eq!(reprogram[0].new_base, 0xe000_0000);
+        assert_eq!(cfg.get_bar_addr(0), 0xd000_0000);
+    }
+
+    #[test]
+    fn bar_reprogramming_of_64bit_bar_reports_the_low_slot() {
+        let mut cfg = reloc_config(None);
+        let bar = PciBarConfiguration::new(
+            0,
+            RELOC_BAR_SIZE,
+            PciBarRegionType::Memory64BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0x4_0000_0000);
+        cfg.add_pci_bar(&bar).unwrap();
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+
+        // The low-dword write alone must not move anything: the address is
+        // only complete once the high dword lands.
+        assert!(
+            cfg.write_config_register(BAR0_REG, 0, &0u32.to_le_bytes())
+                .is_empty()
+        );
+
+        // The high-dword write completes the move. It must report the low
+        // slot, which is the slot devices record their BAR under.
+        let reprogram = cfg.write_config_register(BAR0_REG + 1, 0, &8u32.to_le_bytes());
+
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].bar_idx, Some(0));
+        assert_eq!(reprogram[0].old_base, 0x4_0000_0000);
+        assert_eq!(reprogram[0].new_base, 0x8_0000_0000);
+    }
+
+    #[test]
+    fn rom_bar_reprogramming_reports_the_rom_slot() {
+        let mut cfg = reloc_config(None);
+        let bar = PciBarConfiguration::new(
+            ROM_BAR_IDX,
+            RELOC_BAR_SIZE,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0xf000_0000);
+        cfg.add_pci_rom_bar(&bar, 0).unwrap();
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+
+        let reprogram = cfg.write_config_register(ROM_BAR_REG, 0, &0xf100_0000u32.to_le_bytes());
+
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].bar_idx, Some(ROM_BAR_IDX));
+        assert_eq!(reprogram[0].old_base, 0xf000_0000);
+        assert_eq!(reprogram[0].new_base, 0xf100_0000);
+    }
+
+    fn bar_with_idx_and_addr(idx: usize, addr: u64) -> PciBarConfiguration {
+        PciBarConfiguration::new(
+            idx,
+            0x1000,
+            PciBarRegionType::Memory64BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(addr)
+    }
+
+    #[test]
+    fn addr_of_idx_returns_the_matching_bar_address() {
+        // The list is not ordered by index, so the lookup must not rely on
+        // the BAR's position in it.
+        let bars = [
+            bar_with_idx_and_addr(2, 0xd000_0000),
+            bar_with_idx_and_addr(0, 0xc000_0000),
+            bar_with_idx_and_addr(4, 0xe000_0000),
+        ];
+
+        assert_eq!(
+            PciBarConfiguration::addr_of_idx(&bars, 0),
+            Some(0xc000_0000)
+        );
+        assert_eq!(
+            PciBarConfiguration::addr_of_idx(&bars, 2),
+            Some(0xd000_0000)
+        );
+        assert_eq!(
+            PciBarConfiguration::addr_of_idx(&bars, 4),
+            Some(0xe000_0000)
+        );
+    }
+
+    #[test]
+    fn addr_of_idx_returns_none_on_missing_bar() {
+        let bars = [bar_with_idx_and_addr(0, 0xc000_0000)];
+
+        assert_eq!(PciBarConfiguration::addr_of_idx(&bars, 2), None);
+        assert_eq!(PciBarConfiguration::addr_of_idx(&[], 0), None);
     }
 }

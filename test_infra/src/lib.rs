@@ -166,11 +166,11 @@ impl ProcessRegistry {
 
 #[derive(Error, Debug)]
 pub enum WaitTimeoutError {
-    #[error("timeout")]
+    #[error("Timeout")]
     Timedout,
-    #[error("exit status indicates failure")]
+    #[error("Exit status indicates failure")]
     ExitStatus,
-    #[error("general failure")]
+    #[error("General failure")]
     General(#[source] io::Error),
 }
 
@@ -178,21 +178,21 @@ pub enum WaitTimeoutError {
 pub enum Error {
     #[error("Failed to parse")]
     Parsing(#[source] num::ParseIntError),
-    #[error("ssh command failed")]
+    #[error("SSH command failed")]
     SshCommand(#[from] SshCommandError),
-    #[error("waiting for boot failed")]
+    #[error("Waiting for boot failed")]
     WaitForBoot(#[source] WaitForBootError),
-    #[error("reading log file failed")]
+    #[error("Reading log file failed")]
     EthrLogFile(#[source] io::Error),
-    #[error("parsing log file failed")]
+    #[error("Parsing log file failed")]
     EthrLogParse,
-    #[error("parsing fio output failed")]
+    #[error("Parsing fio output failed")]
     FioOutputParse,
-    #[error("parsing iperf3 output failed")]
+    #[error("Parsing iperf3 output failed")]
     Iperf3Parse,
-    #[error("spawning process failed")]
+    #[error("Spawning process failed")]
     Spawn(#[source] io::Error),
-    #[error("waiting for timeout failed")]
+    #[error("Waiting for timeout failed")]
     WaitTimeout(#[source] WaitTimeoutError),
 }
 
@@ -266,7 +266,7 @@ pub enum WaitForBootError {
     Listen(#[source] io::Error),
     #[error("Epoll wait timeout")]
     EpollWaitTimeout,
-    #[error("wrong guest address")]
+    #[error("Wrong guest address")]
     WrongGuestAddr,
     #[error("Failed to accept a TCP request")]
     Accept(#[source] io::Error),
@@ -816,37 +816,37 @@ pub const DEFAULT_SSH_TIMEOUT: u8 = 10;
 
 #[derive(Error, Debug)]
 pub enum SshCommandError {
-    #[error("ssh connection failed")]
+    #[error("SSH connection failed")]
     Connection(#[source] io::Error),
-    #[error("ssh handshake failed")]
+    #[error("SSH handshake failed")]
     Handshake(#[source] ssh2::Error),
-    #[error("ssh authentication failed")]
+    #[error("SSH authentication failed")]
     Authentication(#[source] ssh2::Error),
-    #[error("ssh channel session failed")]
+    #[error("SSH channel session failed")]
     ChannelSession(#[source] ssh2::Error),
-    #[error("ssh command failed")]
+    #[error("SSH command failed")]
     Command(#[source] ssh2::Error),
-    #[error("retrieving exit status from ssh command failed")]
+    #[error("Retrieving exit status from SSH command failed")]
     ExitStatus(#[source] ssh2::Error),
-    #[error("the exit code indicates failure: {0}")]
+    #[error("The exit code indicates failure: {0}")]
     NonZeroExitStatus(i32),
-    #[error("failed to read file")]
+    #[error("Failed to read file")]
     FileRead(#[source] io::Error),
-    #[error("failed to read metadata")]
+    #[error("Failed to read metadata")]
     FileMetadata(#[source] io::Error),
-    #[error("scp send failed")]
+    #[error("SCP send failed")]
     ScpSend(#[source] ssh2::Error),
-    #[error("scp write failed")]
+    #[error("SCP write failed")]
     WriteAll(#[source] io::Error),
-    #[error("scp send EOF failed")]
+    #[error("SCP send EOF failed")]
     SendEof(#[source] ssh2::Error),
-    #[error("scp wait EOF failed")]
+    #[error("SCP wait EOF failed")]
     WaitEof(#[source] ssh2::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum WaitForSshError {
-    #[error("timed out after {timeout:?} waiting for ssh command {command:?} on {ip}: {source}")]
+    #[error("Timed out after {timeout:?} waiting for SSH command {command:?} on {ip}: {source}")]
     Timeout {
         command: String,
         ip: String,
@@ -1485,6 +1485,7 @@ impl Guest {
             .map_err(Error::Parsing)
     }
 
+    /// Returns the guest memory size in kb.
     pub fn get_total_memory(&self) -> Result<u32, Error> {
         self.ssh_command("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
             .trim()
@@ -2531,11 +2532,9 @@ pub fn parse_ethr_latency_output(output: &[u8]) -> Result<Vec<f64>, Error> {
             let v: Value = serde_json::from_str(l).expect("'ethr' parse error: invalid json line");
             // Skip header/summary lines
             if let Some(avg) = v["Avg"].as_str() {
-                // Assume the latency unit is always "us"
+                // Normalize latency measurements to microseconds.
                 latency.push(
-                    avg.split("us").collect::<Vec<&str>>()[0]
-                        .parse::<f64>()
-                        .expect("'ethr' parse error: invalid 'Avg' entry"),
+                    parse_ethr_duration_us(avg).expect("'ethr' parse error: invalid 'Avg' entry"),
                 );
             }
         }
@@ -2554,6 +2553,20 @@ pub fn parse_ethr_latency_output(output: &[u8]) -> Result<Vec<f64>, Error> {
         );
         Error::EthrLogParse
     })
+}
+
+fn parse_ethr_duration_us(s: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(µs|us|ns|ms|s)\s*$").unwrap();
+    let caps = re.captures(s)?;
+    let value: f64 = caps.get(1)?.as_str().parse().ok()?;
+    let mult_us = match caps.get(2)?.as_str() {
+        "µs" | "us" => 1.0,
+        "ns" => 1.0 / 1_000.0,
+        "ms" => 1_000.0,
+        "s" => 1_000_000.0,
+        _ => return None,
+    };
+    Some(value * mult_us)
 }
 
 pub fn measure_virtio_net_latency(guest: &Guest, test_timeout: u32) -> Result<Vec<f64>, Error> {
@@ -2612,30 +2625,6 @@ pub fn measure_virtio_net_latency(guest: &Guest, test_timeout: u32) -> Result<Ve
     // Parse the ethr latency test output
     let content = fs::read(log_file).map_err(Error::EthrLogFile)?;
     parse_ethr_latency_output(&content)
-}
-
-// parse the bar address from the output of `lspci -vv`
-
-pub fn extract_bar_address(output: &str, device_desc: &str, bar_index: usize) -> Option<String> {
-    let devices: Vec<&str> = output.split("\n\n").collect();
-
-    for device in devices {
-        if device.contains(device_desc) {
-            for line in device.lines() {
-                let line = line.trim();
-                let line_start_str = format!("Region {bar_index}: Memory at");
-                // for example: Region 2: Memory at 200000000 (64-bit, non-prefetchable) [size=1M]
-                if line.starts_with(line_start_str.as_str()) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        let addr_str = parts[4];
-                        return Some(String::from(addr_str));
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 #[derive(PartialEq, Clone, Copy, Default)]
@@ -2725,6 +2714,30 @@ pub fn edk2_path() -> PathBuf {
     edk2_path
 }
 
+/// Starts a memory-intensive stress workload in the VM.
+///
+/// Useful for slowing down migrations, e.g., to force multiple precopy
+/// iterations. Leaves one vCPU idle to keep the VM responsive.
+pub fn start_stress_in_vm(guest: &Guest) {
+    let memory_size_mb = guest
+        .get_total_memory()
+        .expect("guest should be responsive via SSH")
+        .div_ceil(1024);
+    let stress_worker = guest
+        .get_cpu_count()
+        .expect("guest should be responsive via SSH")
+        .saturating_sub(1)
+        .max(1);
+    // Maximize memory usage (thus writes) but leave headroom to prevent OOM.
+    let stress_mem_per_worker = (memory_size_mb as f64 * 0.75 / stress_worker as f64) as u64;
+    let stress_cmd = format!(
+        "nohup stress --vm {stress_worker} --vm-bytes {stress_mem_per_worker}M --vm-keep &>/dev/null &"
+    );
+    guest.ssh_command(&stress_cmd).unwrap();
+    // Give stress a moment to actually start dirtying memory
+    thread::sleep(Duration::from_secs(4));
+}
+
 pub const DIRECT_KERNEL_BOOT_CMDLINE: &str =
     "root=/dev/vda1 console=hvc0 rw systemd.journald.forward_to_console=1";
 
@@ -2785,7 +2798,7 @@ pub mod aarch64 {
 pub use aarch64::*;
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     fn is_alive(pid: u32) -> bool {

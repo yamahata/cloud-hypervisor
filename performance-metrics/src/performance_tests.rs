@@ -15,26 +15,26 @@ use crate::{ImageFormat, PerformanceTestControl, PerformanceTestOverrides, mean}
 
 #[derive(Error, Debug)]
 enum Error {
-    #[error("boot time could not be parsed")]
+    #[error("Boot time could not be parsed")]
     BootTimeParse,
-    #[error("infrastructure failure")]
+    #[error("Infrastructure failure")]
     Infra(#[from] InfraError),
-    #[error("restore time could not be parsed")]
+    #[error("Restore time could not be parsed")]
     RestoreTimeParse,
 }
 
 // The test image cannot be created on tmpfs (e.g. /tmp) filesystem,
 // as tmpfs does not support O_DIRECT
-pub const BLK_IO_TEST_IMG: &str = "/var/tmp/ch-blk-io-test.img";
+pub(crate) const BLK_IO_TEST_IMG: &str = "/var/tmp/ch-blk-io-test.img";
 const QCOW2_BACKING_FILE: &str = "/var/tmp/ch-blk-io-test-qcow2-backing.qcow2";
-pub const OVERLAY_WITH_QCOW2_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-qcow2.qcow2";
+pub(crate) const OVERLAY_WITH_QCOW2_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-qcow2.qcow2";
 const RAW_BACKING_FILE: &str = "/var/tmp/ch-blk-io-test-raw-backing.raw";
-pub const OVERLAY_WITH_RAW_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-raw.qcow2";
-pub const QCOW2_UNCOMPRESSED_IMG: &str = "/var/tmp/ch-blk-io-test-uncompressed.qcow2";
-pub const QCOW2_ZLIB_IMG: &str = "/var/tmp/ch-blk-io-test-zlib.qcow2";
-pub const QCOW2_ZSTD_IMG: &str = "/var/tmp/ch-blk-io-test-zstd.qcow2";
+pub(crate) const OVERLAY_WITH_RAW_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-raw.qcow2";
+pub(crate) const QCOW2_UNCOMPRESSED_IMG: &str = "/var/tmp/ch-blk-io-test-uncompressed.qcow2";
+pub(crate) const QCOW2_ZLIB_IMG: &str = "/var/tmp/ch-blk-io-test-zlib.qcow2";
+pub(crate) const QCOW2_ZSTD_IMG: &str = "/var/tmp/ch-blk-io-test-zstd.qcow2";
 
-pub fn init_tests(overrides: &PerformanceTestOverrides) {
+pub(crate) fn init_tests(overrides: &PerformanceTestOverrides) {
     let mut cmd = format!("dd if=/dev/zero of={BLK_IO_TEST_IMG} bs=1M count=4096");
 
     if let Some(o) = overrides.test_image_format {
@@ -92,7 +92,7 @@ pub fn init_tests(overrides: &PerformanceTestOverrides) {
     assert!(exec_host_command_output(&cmd).status.success());
 }
 
-pub fn cleanup_tests() {
+pub(crate) fn cleanup_tests() {
     fs::remove_file(BLK_IO_TEST_IMG)
         .unwrap_or_else(|_| panic!("Failed to remove file '{BLK_IO_TEST_IMG}'."));
     fs::remove_file(QCOW2_BACKING_FILE)
@@ -130,7 +130,7 @@ fn performance_test_new_guest(
     guest
 }
 
-pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
     let test_timeout = control.test_timeout;
     let (rx, bandwidth) = control.net_control.unwrap();
 
@@ -173,7 +173,7 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
     }
 }
 
-pub fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
     let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
     let mut guest = performance_test_new_guest(Box::new(jammy), control);
 
@@ -320,7 +320,7 @@ fn measure_boot_time(cmd: &mut GuestCommand, guest: &Guest) -> Result<f64, Error
     })
 }
 
-pub fn performance_boot_time(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_boot_time(control: &PerformanceTestControl) -> f64 {
     let r = panic::catch_unwind(|| {
         let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = performance_test_new_guest(Box::new(jammy), control);
@@ -345,7 +345,7 @@ pub fn performance_boot_time(control: &PerformanceTestControl) -> f64 {
     }
 }
 
-pub fn performance_boot_time_pmem(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_boot_time_pmem(control: &PerformanceTestControl) -> f64 {
     let r = panic::catch_unwind(|| {
         let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = performance_test_new_guest(Box::new(jammy), control);
@@ -378,7 +378,7 @@ pub fn performance_boot_time_pmem(control: &PerformanceTestControl) -> f64 {
     }
 }
 
-pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_block_io(control: &PerformanceTestControl) -> f64 {
     let test_timeout = control.test_timeout;
     let num_queues = control.num_queues.unwrap();
     let queue_size = control.queue_size.unwrap();
@@ -516,7 +516,7 @@ fn measure_restore_time(
     })
 }
 
-pub fn performance_restore_latency(control: &PerformanceTestControl) -> f64 {
+pub(crate) fn performance_restore_latency(control: &PerformanceTestControl) -> f64 {
     let r = panic::catch_unwind(|| {
         let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = performance_test_new_guest(Box::new(jammy), control);
@@ -574,7 +574,7 @@ pub fn performance_restore_latency(control: &PerformanceTestControl) -> f64 {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -651,6 +651,18 @@ mod unit_tests {
 
         let ret = parse_ethr_latency_output(output.as_bytes()).unwrap();
         let reference = vec![80.712_f64, 79.826_f64, 78.239_f64];
+        assert_eq!(ret, reference);
+    }
+
+    #[test]
+    fn test_parse_ethr_latency_output_mixed_units() {
+        let output = r#"{"Time":"2026-08-26T00:40:37Z","Title":"","Type":"INFO","Message":"Using destination: 172.19.0.2, ip: 172.19.0.2, port: 8888"}
+{"Time":"2026-08-26T00:40:38Z","Title":"","Type":"LatencyResult","RemoteAddr":"172.19.0.2","Protocol":"TCP","Avg":"971.230us","Min":"452.887us","P50":"43.396ms","Max":"42.165ms"}
+{"Time":"2026-08-26T00:40:40Z","Title":"","Type":"LatencyResult","RemoteAddr":"172.19.0.2","Protocol":"TCP","Avg":"1.619ms","Min":"430.866us","P50":"99.767ms","Max":"60.616ms"}
+{"Time":"2026-08-26T00:40:42Z","Title":"","Type":"LatencyResult","RemoteAddr":"172.19.0.2","Protocol":"TCP","Avg":"1.5s","Min":"430.866us","P50":"99.767ms","Max":"60.616ms"}"#;
+
+        let ret = parse_ethr_latency_output(output.as_bytes()).unwrap();
+        let reference = vec![971.230_f64, 1_619.0_f64, 1_500_000.0_f64];
         assert_eq!(ret, reference);
     }
 

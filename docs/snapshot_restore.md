@@ -19,7 +19,7 @@ First thing, we must run a Cloud Hypervisor VM:
     --memory size=4G \
     --kernel vmlinux \
     --cmdline "root=/dev/vda1 console=hvc0 rw" \
-    --disk path=focal-server-cloudimg-amd64.raw
+    --disk path=focal-server-cloudimg-amd64.raw,image_type=raw
 ```
 
 At any point in time when the VM is running, one might choose to pause it:
@@ -143,6 +143,47 @@ Setting `vm.unprivileged_userfaultfd=1` also works, but it enables
 `userfaultfd(2)` for every process on the host, whereas the ACL grants access
 to one user.
 
+### Copy-on-write restore
+
+With `memory_restore_mode=copyonwrite`, guest RAM is created by mapping the snapshot
+memory file copy-on-write before any KVM memslot or device consumes the
+mapping: nothing is copied up front, pages fault in from the page cache — so
+many VMs restored from the same snapshot share it — and guest writes stay
+private to each VM.
+
+Current constraints for `memory_restore_mode=copyonwrite`:
+
+- Plain private guest RAM only. Anything else falls back to the eager copy
+  (logged): `shared=on` or hugepages (global or per-zone), zones with
+  `host_numa_node`, `reserve`, `mergeable` or hotplug fields (a purely static
+  `id`+`size` zone is fine), resizable RAM (`hotplug_size`, virtio-mem), KSM
+  (`mergeable=on`), `--pvmemcontrol`, device passthrough
+  (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
+  page-aligned single-region extents. Each region's `reserve` policy and the
+  THP policy are re-applied to the mapped region.
+- A snapshot memory file shorter than the saved ranges is rejected up front (it
+  would otherwise fault `SIGBUS` at run time).
+- `prefault` is rejected.
+- The snapshot memory file must remain on disk **and unchanged** for the
+  entire lifetime of the VM. This is stronger than `ondemand`: UFFD copies each
+  page into the original anonymous mapping and stops needing the file once every
+  page is populated, and a read error there is a controlled VM exit; the
+  copy-on-write region stays file-backed forever, so truncating it delivers a
+  synchronous `SIGBUS` and any in-place edit corrupts the guest. The length
+  check only rejects a file that is already short at restore time.
+- `virtio-balloon` operates normally. Balloon inflation uses `MADV_DONTNEED`,
+  which is valid on the private file mapping: the kernel releases the private
+  page copies and the host reclaims the memory. A released page reads from the
+  snapshot file again on the next access. The guest must not expect specific
+  content in a page that returns from the balloon, so this is correct.
+  (`pvmemcontrol` differs: it issues operations that are only valid on
+  anonymous memory, which is why it is on the fallback list above.)
+- A device that is hot-plugged after the restore and that pins guest memory
+  (VFIO, vfio-user, vDPA) write-faults every guest page when its IOMMU mapping
+  is created. Every page becomes a private copy: the VM stays correct, but the
+  page-cache sharing is lost for that VM and host memory use grows to the
+  eager-copy level. The same applies to `ondemand` restores.
+
 ## Restore a VM with new Net FDs
 For a VM created with FDs explicitly passed to NetConfig, a set of valid FDs
 need to be provided along with the VM restore command in the following syntax:
@@ -182,16 +223,17 @@ peer role:
   would for a local live migration. Passing `preserve_source=on` instead
   leaves the source VM paused and owned by the VMM once the snapshot
   completes, so it can be resumed afterwards. Memory is transferred via
-  `SCM_RIGHTS`, CH handing off the daemon one memfd per guest-memory slot.
+  `SCM_RIGHTS`, with CH handing the daemon one guest memory backing FD per
+  slot.
 - On restore, CH acts as the migration receiver and the daemon acts as the
-  sender. The daemon provides one memfd per slot, populated from its
-  storage, and CH uses those memfds directly as guest RAM backing.
+  sender. The daemon provides one populated guest memory backing FD per slot,
+  and CH uses those files directly as guest RAM backing.
 
 In practice, this means offload is driven through the existing
-`vm.send-migration` / `vm.receive-migration` endpoints (with `local=on`
-and a `unix:<path>` URL). The daemon is just another peer of these
-endpoints. This requires the VM to be configured with shared-memory
-backing, which is the same precondition that applies to local live
+`vm.send-migration` / `vm.receive-migration` endpoints (with
+`memory_mode=memfds` and a `unix:<path>` URL). The daemon is just another peer
+of these endpoints. Every guest memory region must use shared memory or
+hugepage backing, which is the same precondition that applies to local live
 migration today.
 
 ### Snapshot offload usage
@@ -204,7 +246,7 @@ migration today.
     --memory size=1G,shared=on \
     --kernel vmlinux \
     --cmdline "root=/dev/vda1 console=hvc0 rw" \
-    --disk path=focal-server-cloudimg-amd64.raw
+    --disk path=focal-server-cloudimg-amd64.raw,image_type=raw
 
 # 2. Start your offload daemon. The reference implementation is shipped as
 #    `offload_daemon` and persists snapshot data to a local directory.
@@ -216,19 +258,19 @@ migration today.
 #    /tmp/offload.sock, streams the snapshot, and exits on success.
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock pause
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
-    send-migration destination_url=unix:/tmp/offload.sock,local=on
+    send-migration destination_url=unix:/tmp/offload.sock,memory_mode=memfds
 ```
 
 ### Preserve the source VM
 
 By default an offload snapshot destroys the source VM on success. If you want
 to preserve the source VM, add `preserve_source=on` (only valid together
-with `local=on`) to the `send-migration` command:
+with `memory_mode=memfds`) to the `send-migration` command:
 
 ```bash
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock pause
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
-    send-migration destination_url=unix:/tmp/offload.sock,local=on,preserve_source=on
+    send-migration destination_url=unix:/tmp/offload.sock,memory_mode=memfds,preserve_source=on
 # The source VMM keeps running, the VM is left paused. Resume it when ready:
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock resume
 ```
@@ -267,13 +309,14 @@ you might end up in an undefined state leading to possible bugs.
 For speeding up a VM restore, the daemon's `--ondemand` mode hands CH
 empty memfds and serves page contents on demand via userfaultfd.
 
-This requires `memory_mode=postcopy` on the receive-migration call so CH
+The daemon announces postcopy mode through the migration protocol, so CH
 registers userfaultfd on the memfds before resuming vCPUs and keeps
-the daemon's socket open for `PageFault` requests:
+the daemon's socket open for `PageFault` requests. The receive-migration
+call is the same as for a regular restore:
 
 ```bash
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
-    receive-migration receiver_url=unix:/tmp/restore.sock,memory_mode=postcopy &
+    receive-migration receiver_url=unix:/tmp/restore.sock &
 
 ./offload_daemon restore \
     --socket /tmp/restore.sock \
@@ -291,9 +334,15 @@ The daemon implements the local live-migration wire protocol defined in
   `MemoryFd` command, receive a guest-memory fd via SCM_RIGHTS on the
   same UNIX socket.
 - Restore mode (migration sender): walk the same sequence in reverse,
-  emitting one `MemoryFd` per slot (with the memfd attached via SCM_RIGHTS)
-  before sending `Config` and `State`. Finish with either `CompletePaused`
-  (restored VM remains paused) or `Complete` (restored VM resumes).
+  emitting one `MemoryFd` per slot (with the guest memory backing FD attached
+  via SCM_RIGHTS) before sending `Config` and `State`. Finish with either
+  `CompletePaused` (restored VM remains paused) or `Complete` (restored VM
+  resumes).
+
+This also means that we publish live-migration events: Cloud Hypervisor will
+emit the same events as it does as in the context of a live migration. Please
+refer to [live_migration.md](live_migration.md#events) for more more
+information.
 
 ### Critical invariant on snapshot
 
@@ -316,8 +365,8 @@ production backend.
 
 ### Limitations
 
-- The VM must use shared-memory backing (`shared=on` or file-backed).
-  Anonymous memory is rejected with the same error message that local
+- Every guest memory region must use shared memory (`shared=on`) or hugepage
+  backing. Anonymous memory is rejected with the same error message that local
   live migration produces.
 - Orchestrator-supplied network FDs (today carried by `vm.restore`'s
   `net_fds` field) are not plumbed through `vm.receive-migration`,

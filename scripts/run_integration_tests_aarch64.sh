@@ -19,6 +19,7 @@ update_workloads() {
     for required in "$JAMMY_OS_RAW_IMAGE" "$JAMMY_OS_QCOW2_UNCOMPRESSED_IMAGE" \
         "$WORKLOADS_DIR/CLOUDHV_EFI.fd" \
         "$WORKLOADS_DIR/cloud-hypervisor-static-aarch64" \
+        "$WORKLOADS_DIR/ch-remote-static-aarch64" \
         "$WORKLOADS_DIR/alpine-minirootfs-aarch64.tar.gz" \
         "$WORKLOADS_DIR/Image-arm64"; do
         if [ ! -f "$required" ]; then
@@ -141,6 +142,9 @@ if [ $RES -ne 0 ]; then
     exit 1
 fi
 
+# Set number of open descriptors high enough for VFIO tests to run
+ulimit -n 4096
+
 # Common configuration for every test run
 export RUST_BACKTRACE=1
 export RUSTFLAGS="$RUSTFLAGS"
@@ -179,7 +183,7 @@ if [ $RES -eq 0 ]; then
     cargo build --features "mshv,dbus_api" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
     # integration tests now do not reply on build feature "dbus_api"
-    time cargo nextest run -p cloud-hypervisor $test_features --profile dbus --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "$test_filter" -- ${test_binary_args[*]}
+    time cargo nextest run -p cloud-hypervisor $test_features --profile dbus --no-tests=pass --test-threads="${PARALLEL_INTEGRATION_TESTS_NUM}" "$test_filter" -- ${test_binary_args[*]}
     RES=$?
 fi
 
@@ -187,14 +191,14 @@ fi
 if [ $RES -eq 0 ]; then
     cargo build --features "mshv,fw_cfg" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
-    time cargo nextest run -p cloud-hypervisor $test_features --profile fw_cfg --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "$test_filter" -- ${test_binary_args[*]}
+    time cargo nextest run -p cloud-hypervisor $test_features --profile fw_cfg --no-tests=pass --test-threads="${PARALLEL_INTEGRATION_TESTS_NUM}" "$test_filter" -- ${test_binary_args[*]}
     RES=$?
 fi
 
 if [ $RES -eq 0 ]; then
     cargo build --features "mshv,ivshmem" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
-    time cargo nextest run -p cloud-hypervisor $test_features --profile ivshmem --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "$test_filter" -- ${test_binary_args[*]}
+    time cargo nextest run -p cloud-hypervisor $test_features --profile ivshmem --no-tests=pass --test-threads="${PARALLEL_INTEGRATION_TESTS_NUM}" "$test_filter" -- ${test_binary_args[*]}
 
     RES=$?
 fi

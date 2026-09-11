@@ -53,7 +53,7 @@ use devices::interrupt_controller::InterruptController;
 #[cfg(target_arch = "x86_64")]
 use devices::ioapic;
 #[cfg(feature = "ivshmem")]
-use devices::ivshmem::{IvshmemError, IvshmemOps};
+use devices::ivshmem::{IVSHMEM_DATA_BAR_IDX, IvshmemError, IvshmemOps};
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::Pl011;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -96,7 +96,10 @@ use tracer::trace_scoped;
 use vfio_ioctls::VfioIommufd;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
 use virtio_devices::block::Error as VirtioBlockError;
-use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
+use virtio_devices::transport::{
+    VIRTIO_CONFIG_BAR_INDEX, VIRTIO_SHM_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator,
+    VirtioTransport,
+};
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
@@ -104,9 +107,7 @@ use virtio_devices::{
 };
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
-use vm_device::interrupt::{
-    InterruptIndex, InterruptManager, LegacyIrqGroupConfig, MsiIrqGroupConfig,
-};
+use vm_device::interrupt::{InterruptIndex, InterruptManager, LegacyIrqGroupConfig};
 use vm_device::{Bus, BusDevice, BusDeviceSync, Resource, UserspaceMapping};
 #[cfg(feature = "ivshmem")]
 use vm_memory::bitmap::AtomicBitmap;
@@ -125,13 +126,16 @@ use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
+use crate::console_devices::{ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
+use crate::locked_unix_listener::LockedUnixListener;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
+#[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+use crate::sev::SevSnpSharedPageTracker;
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
@@ -195,6 +199,10 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-blk device
     #[error("Cannot create virtio-blk device")]
     CreateVirtioBlock(#[source] io::Error),
+
+    /// Unsupported under direct I/O
+    #[error("Disk guest_block_size is below the required backend block size")]
+    GuestBlockSizeBelowBackend,
 
     /// Cannot create virtio-net device
     #[error("Cannot create virtio-net device")]
@@ -268,11 +276,6 @@ pub enum DeviceManagerError {
     #[error("Cannot create virtio-balloon device")]
     CreateVirtioBalloon(#[source] io::Error),
 
-    /// Cannot create pvmemcontrol device
-    #[cfg(feature = "pvmemcontrol")]
-    #[error("Cannot create pvmemcontrol device")]
-    CreatePvmemcontrol(#[source] io::Error),
-
     /// Cannot create virtio-watchdog device
     #[error("Cannot create virtio-watchdog device")]
     CreateVirtioWatchdog(#[source] io::Error),
@@ -285,17 +288,9 @@ pub enum DeviceManagerError {
     #[error("Cannot spawn serial manager thread")]
     SpawnSerialManager(#[source] SerialManagerError),
 
-    /// Cannot open tap interface
-    #[error("Cannot open tap interface")]
-    OpenTap(#[source] net_util::TapError),
-
     /// Cannot allocate IRQ.
     #[error("Cannot allocate IRQ")]
     AllocateIrq(#[from] InterruptAllocError),
-
-    /// Cannot configure the IRQ.
-    #[error("Cannot configure the IRQ")]
-    Irq(#[source] errno::Error),
 
     /// Cannot allocate PCI BARs
     #[error("Cannot allocate PCI BARs")]
@@ -341,43 +336,6 @@ pub enum DeviceManagerError {
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
 
-    /// Cannot find a memory range for virtio-fs
-    #[error("Cannot find a memory range for virtio-fs")]
-    FsRangeAllocation,
-
-    /// Error creating serial output file
-    #[error("Error creating serial output file")]
-    SerialOutputFileOpen(#[source] io::Error),
-
-    /// Error creating debug-console output file
-    #[cfg(target_arch = "x86_64")]
-    #[error("Error creating debug-console output file")]
-    DebugconOutputFileOpen(#[source] io::Error),
-
-    /// Error creating console output file
-    #[error("Error creating console output file")]
-    ConsoleOutputFileOpen(#[source] io::Error),
-
-    /// Error creating serial pty
-    #[error("Error creating serial pty")]
-    SerialPtyOpen(#[source] io::Error),
-
-    /// Error creating console pty
-    #[error("Error creating console pty")]
-    ConsolePtyOpen(#[source] io::Error),
-
-    /// Error creating debugcon pty
-    #[error("Error creating console pty")]
-    DebugconPtyOpen(#[source] io::Error),
-
-    /// Error setting pty raw mode
-    #[error("Error setting pty raw mode")]
-    SetPtyRaw(#[source] ConsoleDeviceError),
-
-    /// Error getting pty peer
-    #[error("Error getting pty peer")]
-    GetPtyPeer(#[source] errno::Error),
-
     /// Cannot create iommufd
     #[cfg(feature = "kvm")]
     #[error("Cannot create iommufd")]
@@ -407,17 +365,9 @@ pub enum DeviceManagerError {
     #[error("Failed to DMA map VFIO device")]
     VfioDmaMap(#[source] vfio_ioctls::VfioError),
 
-    /// Failed to DMA unmap VFIO device.
-    #[error("Failed to DMA unmap VFIO device")]
-    VfioDmaUnmap(#[source] pci::VfioPciError),
-
     /// Failed to create the passthrough device.
     #[error("Failed to create the passthrough device")]
     CreatePassthroughDevice(#[source] anyhow::Error),
-
-    /// Failed to memory map.
-    #[error("Failed to memory map")]
-    Mmap(#[source] io::Error),
 
     /// Cannot add legacy device to Bus.
     #[error("Cannot add legacy device to Bus")]
@@ -443,10 +393,6 @@ pub enum DeviceManagerError {
     #[error("Failed to create new interrupt source group")]
     CreateInterruptGroup(#[source] io::Error),
 
-    /// Failed to update interrupt source group.
-    #[error("Failed to update interrupt source group")]
-    UpdateInterruptGroup(#[source] io::Error),
-
     /// Failed to create interrupt controller.
     #[error("Failed to create interrupt controller")]
     CreateInterruptController(#[source] interrupt_controller::Error),
@@ -459,22 +405,6 @@ pub enum DeviceManagerError {
     #[error("Failed to clone a File")]
     CloneFile(#[source] io::Error),
 
-    /// Failed to create socket file
-    #[error("Failed to create socket file")]
-    CreateSocketFile(#[source] io::Error),
-
-    /// Failed to spawn the network backend
-    #[error("Failed to spawn the network backend")]
-    SpawnNetBackend(#[source] io::Error),
-
-    /// Failed to spawn the block backend
-    #[error("Failed to spawn the block backend")]
-    SpawnBlockBackend(#[source] io::Error),
-
-    /// Missing PCI bus.
-    #[error("Missing PCI bus")]
-    NoPciBus,
-
     /// Could not find an available device name.
     #[error("Could not find an available device name")]
     NoAvailableDeviceName,
@@ -482,6 +412,10 @@ pub enum DeviceManagerError {
     /// Missing PCI device.
     #[error("Missing PCI device")]
     MissingPciDevice,
+
+    /// Missing PCI BAR.
+    #[error("Missing PCI BAR at index {0:#x}")]
+    MissingPciBar(usize),
 
     /// Failed to remove a PCI device from the PCI bus.
     #[error("Failed to remove a PCI device from the PCI bus")]
@@ -494,10 +428,6 @@ pub enum DeviceManagerError {
     /// Failed to remove a bus device from the MMIO bus.
     #[error("Failed to remove a bus device from the MMIO bus")]
     RemoveDeviceFromMmioBus(#[source] vm_device::BusError),
-
-    /// Failed to find the device corresponding to a specific PCI b/d/f.
-    #[error("Failed to find the device corresponding to a specific PCI b/d/f: {0:#x}")]
-    UnknownPciBdf(u32),
 
     /// Not allowed to remove this type of device from the VM.
     #[error("Not allowed to remove this type of device from the VM: {0}")]
@@ -531,10 +461,6 @@ pub enum DeviceManagerError {
     #[error("Cannot create virtio-mem device")]
     CreateVirtioMem(#[source] io::Error),
 
-    /// Cannot find a memory range for virtio-mem memory
-    #[error("Cannot find a memory range for virtio-mem memory")]
-    VirtioMemRangeAllocation,
-
     /// Failed to update guest memory for VFIO PCI device.
     #[error("Failed to update guest memory for VFIO PCI device")]
     UpdateMemoryForVfioPciDevice(#[source] vfio_ioctls::VfioError),
@@ -567,13 +493,13 @@ pub enum DeviceManagerError {
     #[error("No support for device passthrough")]
     NoDevicePassthroughSupport,
 
-    /// No socket option support for console device
-    #[error("No socket option support for console device")]
-    NoSocketOptionSupportForConsoleDevice,
-
     /// Failed to resize virtio-balloon
     #[error("Failed to resize virtio-balloon")]
     VirtioBalloonResize(#[source] balloon::Error),
+
+    /// Failed to request virtio-balloon statistics.
+    #[error("Failed to request virtio-balloon statistics")]
+    VirtioBalloonStats(#[source] balloon::Error),
 
     /// Missing virtio-balloon, can't proceed as expected.
     #[error("Missing virtio-balloon, can't proceed as expected")]
@@ -591,10 +517,6 @@ pub enum DeviceManagerError {
     #[cfg(target_arch = "aarch64")]
     #[error("Failed to do AArch64 GPIO power button notification")]
     AArch64PowerButtonNotification(#[source] legacy::GpioDeviceError),
-
-    /// Failed to set O_DIRECT flag to file descriptor
-    #[error("Failed to set O_DIRECT flag to file descriptor")]
-    SetDirectIo,
     /// Failed to add DMA mapping handler to virtio-mem device.
     #[error("Failed to add DMA mapping handler to virtio-mem device")]
     AddDmaMappingHandlerVirtioMem(#[source] mem::Error),
@@ -602,6 +524,11 @@ pub enum DeviceManagerError {
     /// Failed to remove DMA mapping handler from virtio-mem device.
     #[error("Failed to remove DMA mapping handler from virtio-mem device")]
     RemoveDmaMappingHandlerVirtioMem(#[source] mem::Error),
+
+    /// Failed to add a DMA mapping handler to the SEV-SNP shared-page tracker.
+    #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+    #[error("Failed to add DMA mapping handler to SEV-SNP shared-page tracker")]
+    AddDmaMappingHandlerSevSnp(#[source] anyhow::Error),
 
     /// Failed to create vfio-user client
     #[error("Failed to create vfio-user client")]
@@ -619,13 +546,14 @@ pub enum DeviceManagerError {
     #[error("Failed to DMA map VFIO user device")]
     VfioUserDmaMap(#[source] VfioUserPciDeviceError),
 
-    /// Failed to DMA unmap VFIO user device.
-    #[error("Failed to DMA unmap VFIO user device")]
-    VfioUserDmaUnmap(#[source] VfioUserPciDeviceError),
-
     /// Failed to update memory mappings for VFIO user device
     #[error("Failed to update memory mappings for VFIO user device")]
     UpdateMemoryForVfioUserPciDevice(#[source] VfioUserPciDeviceError),
+
+    /// vfio-user cannot be hot-added while SEV-SNP shared-page tracking is active
+    #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+    #[error("Cannot hot-add a vfio-user device while SEV-SNP shared-page tracking is active")]
+    VfioUserHotplugSevSnpTracker,
 
     /// Cannot duplicate file descriptor
     #[error("Cannot duplicate file descriptor")]
@@ -676,17 +604,9 @@ pub enum DeviceManagerError {
     #[error("Cannot create a RateLimiterGroup")]
     RateLimiterGroupCreate(#[source] group::Error),
 
-    /// Cannot start sigwinch listener
-    #[error("Cannot start sigwinch listener")]
-    StartSigwinchListener(#[source] io::Error),
-
     // Invalid console info
     #[error("Invalid console info")]
     InvalidConsoleInfo,
-
-    // Invalid console fd
-    #[error("Invalid console fd")]
-    InvalidConsoleFd,
 
     /// Cannot lock images of all block devices.
     #[error("Cannot lock images of all block devices")]
@@ -700,15 +620,6 @@ pub enum DeviceManagerError {
     /// Disk resizing failed.
     #[error("Disk resize error")]
     DiskResize(#[source] VirtioBlockError),
-
-    /// Disk image type does not match expected type.
-    #[error(
-        "Disk image type does not match expected type: specified = {specified}, detected = {detected}"
-    )]
-    DiskImageTypeMismatch {
-        specified: ImageType,
-        detected: ImageType,
-    },
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -718,17 +629,11 @@ const DEVICE_MANAGER_ACPI_SIZE: usize = 0x10;
 #[derive(Default)]
 pub struct Console {
     console_resizer: Option<Arc<virtio_devices::ConsoleResizer>>,
+    resize_pipe: Option<Arc<File>>,
+    socket: Option<Arc<LockedUnixListener>>,
 }
 
 impl Console {
-    pub fn need_resize(&self) -> bool {
-        if let Some(_resizer) = self.console_resizer.as_ref() {
-            return true;
-        }
-
-        false
-    }
-
     pub fn update_console_size(&self) {
         if let Some(resizer) = self.console_resizer.as_ref() {
             resizer.update_console_size();
@@ -749,6 +654,7 @@ pub(crate) struct AddressManager {
 impl DeviceRelocation for AddressManager {
     fn move_bar(
         &self,
+        bar_idx: usize,
         old_base: u64,
         new_base: u64,
         len: u64,
@@ -839,9 +745,8 @@ impl DeviceRelocation for AddressManager {
             if let Some(node) = self.device_tree.lock().unwrap().get_mut(&id) {
                 let mut resource_updated = false;
                 for resource in node.resources.iter_mut() {
-                    if let Resource::PciBar { base, type_, .. } = resource
-                        && PciBarRegionType::from(*type_) == region_type
-                        && *base == old_base
+                    if let Resource::PciBar { index, base, .. } = resource
+                        && *index == bar_idx
                     {
                         *base = new_base;
                         resource_updated = true;
@@ -851,7 +756,7 @@ impl DeviceRelocation for AddressManager {
 
                 if !resource_updated {
                     return Err(io::Error::other(format!(
-                        "Couldn't find a resource with base 0x{old_base:x} for device {id}"
+                        "Couldn't find a resource for BAR {bar_idx} of device {id}"
                     )));
                 }
             } else {
@@ -863,8 +768,7 @@ impl DeviceRelocation for AddressManager {
 
         let any_dev = pci_dev.as_any_mut();
         if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
-            let bar_addr = virtio_pci_dev.config_bar_addr();
-            if bar_addr == new_base {
+            if bar_idx == VIRTIO_CONFIG_BAR_INDEX {
                 for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
                     let io_addr = IoEventAddress::Mmio(addr);
                     self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
@@ -879,12 +783,10 @@ impl DeviceRelocation for AddressManager {
                             io::Error::other(format!("failed to register ioevent: {e:?}"))
                         })?;
                 }
-            } else {
+            } else if bar_idx == VIRTIO_SHM_BAR_INDEX {
                 let virtio_dev = virtio_pci_dev.virtio_device();
                 let mut virtio_dev = virtio_dev.lock().unwrap();
-                if let Some(mut shm_regions) = virtio_dev.get_shm_regions()
-                    && shm_regions.addr.raw_value() == old_base
-                {
+                if let Some(mut shm_regions) = virtio_dev.get_shm_regions() {
                     // SAFETY: guaranteed by MmapRegion invariants
                     unsafe {
                         // Remove old mapping
@@ -894,7 +796,6 @@ impl DeviceRelocation for AddressManager {
                                 old_base,
                                 shm_regions.mapping.len(),
                                 shm_regions.mapping.as_ptr(),
-                                false,
                                 false,
                             )
                             .map_err(|e| {
@@ -912,6 +813,7 @@ impl DeviceRelocation for AddressManager {
                                 shm_regions.mapping.as_ptr(),
                                 false,
                                 false,
+                                hypervisor::MemoryVisibility::Shared,
                             )
                             .map_err(|e| {
                                 io::Error::other(format!(
@@ -929,7 +831,7 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(old_base, new_base)
+        pci_dev.move_bar(bar_idx, new_base)
     }
 }
 
@@ -1022,14 +924,11 @@ pub struct DeviceManager {
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
 
-    // Console abstraction
-    console: Arc<Console>,
+    // Console
+    console: Console,
 
     // Serial Manager
     serial_manager: Option<Arc<SerialManager>>,
-
-    // pty foreground status,
-    console_resize_pipe: Option<Arc<File>>,
 
     // To restore on exit.
     original_termios_opt: Arc<Mutex<Option<termios>>>,
@@ -1081,7 +980,7 @@ pub struct DeviceManager {
 
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     // MSI Interrupt Manager
-    msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
+    msi_interrupt_manager: Arc<MsiInterruptManager>,
 
     #[cfg_attr(feature = "mshv", allow(dead_code))]
     // Legacy Interrupt Manager
@@ -1094,6 +993,10 @@ pub struct DeviceManager {
     // Only one can be created, therefore it is stored as part of the
     // DeviceManager to be reused.
     vfio_ops: Option<Arc<dyn VfioOps>>,
+
+    // Number of active VFIO devices sharing `vfio_ops`.
+    #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+    shared_vfio_devices: usize,
 
     // Paravirtualized IOMMU
     iommu_device: Option<Arc<Mutex<virtio_devices::Iommu>>>,
@@ -1172,6 +1075,10 @@ pub struct DeviceManager {
     rate_limit_groups: HashMap<String, Arc<RateLimiterGroup>>,
 
     mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
+
+    // Track shared pages for SEV-SNP VFIO
+    #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+    sev_snp_shared_page_tracker: Option<Arc<SevSnpSharedPageTracker>>,
 
     #[cfg(feature = "fw_cfg")]
     fw_cfg: Option<Arc<Mutex<FwCfg>>>,
@@ -1322,11 +1229,10 @@ impl DeviceManager {
         // and then the legacy interrupt manager needs an IOAPIC. So we're
         // handling a linear dependency chain:
         // msi_interrupt_manager <- IOAPIC <- legacy_interrupt_manager.
-        let msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>> =
-            Arc::new(MsiInterruptManager::new(
-                Arc::clone(&address_manager.allocator),
-                vm,
-            ));
+        let msi_interrupt_manager = Arc::new(MsiInterruptManager::new(
+            Arc::clone(&address_manager.allocator),
+            vm,
+        ));
 
         let acpi_address = address_manager
             .allocator
@@ -1408,9 +1314,17 @@ impl DeviceManager {
             }
         }
 
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        let sev_snp_shared_page_tracker = Self::create_sev_snp_shared_page_tracker(
+            &address_manager,
+            &config,
+            &cpu_manager,
+            &memory_manager,
+        );
+
         let device_manager = DeviceManager {
             address_manager: Arc::clone(&address_manager),
-            console: Arc::new(Console::default()),
+            console: Console::default(),
             interrupt_controller: None,
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             cmdline_additions: Vec::new(),
@@ -1426,6 +1340,8 @@ impl DeviceManager {
             legacy_interrupt_manager: None,
             passthrough_device: None,
             vfio_ops: None,
+            #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+            shared_vfio_devices: 0,
             iommu_device: None,
             iommu_mapping: None,
             iommu_attached_devices: None,
@@ -1446,7 +1362,6 @@ impl DeviceManager {
             acpi_address,
             selected_segment: 0,
             serial_manager: None,
-            console_resize_pipe: None,
             original_termios_opt: Arc::new(Mutex::new(None)),
             virtio_mem_devices: Vec::new(),
             #[cfg(target_arch = "aarch64")]
@@ -1462,6 +1377,8 @@ impl DeviceManager {
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             rate_limit_groups,
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+            sev_snp_shared_page_tracker,
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
@@ -1484,7 +1401,7 @@ impl DeviceManager {
     }
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
-        self.console_resize_pipe.clone()
+        self.console.resize_pipe.clone()
     }
 
     pub fn create_interrupt_controller(
@@ -1555,7 +1472,7 @@ impl DeviceManager {
 
         self.original_termios_opt = original_termios_opt;
 
-        self.console = self.add_console_devices(
+        self.add_console_devices(
             legacy_interrupt_manager.as_ref(),
             console_info,
             console_resize_pipe,
@@ -1814,7 +1731,7 @@ impl DeviceManager {
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
                 self.config.lock().unwrap().cpus.boot_vcpus,
-                Arc::clone(&self.msi_interrupt_manager),
+                self.msi_interrupt_manager.clone(),
                 self.address_manager.vm.clone(),
             )
             .map_err(DeviceManagerError::CreateInterruptController)?,
@@ -1830,7 +1747,7 @@ impl DeviceManager {
                 .cpu_manager
                 .lock()
                 .unwrap()
-                .init_pmu(AARCH64_PMU_IRQ + 16)
+                .init_pmu(AARCH64_PMU_IRQ)
                 .is_err()
             {
                 info!("Failed to initialize PMU");
@@ -1867,7 +1784,7 @@ impl DeviceManager {
         let interrupt_controller: Arc<Mutex<aia::Aia>> = Arc::new(Mutex::new(
             aia::Aia::new(
                 self.config.lock().unwrap().cpus.boot_vcpus,
-                Arc::clone(&self.msi_interrupt_manager),
+                self.msi_interrupt_manager.clone(),
                 self.address_manager.vm.clone(),
             )
             .map_err(DeviceManagerError::CreateInterruptController)?,
@@ -2440,12 +2357,12 @@ impl DeviceManager {
         let endpoint = match transport {
             ConsoleTransport::File(file) => Endpoint::File(file),
             ConsoleTransport::Pty(file) => {
-                self.console_resize_pipe = resize_pipe;
+                self.console.resize_pipe = resize_pipe;
                 Endpoint::PtyPair(Arc::new(file.try_clone().unwrap()), file)
             }
             ConsoleTransport::Tty(stdout) => {
                 if stdout.is_terminal() {
-                    self.console_resize_pipe = resize_pipe;
+                    self.console.resize_pipe = resize_pipe;
                 }
 
                 // If an interactive TTY then we can accept input
@@ -2463,8 +2380,13 @@ impl DeviceManager {
                     Endpoint::File(stdout)
                 }
             }
-            ConsoleTransport::Socket(_) => {
-                return Err(DeviceManagerError::NoSocketOptionSupportForConsoleDevice);
+            ConsoleTransport::Socket(listener) => {
+                let inner = listener
+                    .listener()
+                    .try_clone()
+                    .map_err(DeviceManagerError::CreateVirtioConsole)?;
+                self.console.socket = Some(listener);
+                Endpoint::Socket(Arc::new(inner))
             }
             ConsoleTransport::Null => Endpoint::Null,
             ConsoleTransport::Off => return Ok(None),
@@ -2482,7 +2404,8 @@ impl DeviceManager {
         let (virtio_console_device, console_resizer) = virtio_devices::Console::new(
             id.clone(),
             endpoint,
-            self.console_resize_pipe
+            self.console
+                .resize_pipe
                 .as_ref()
                 .map(|p| p.try_clone().unwrap()),
             self.force_access_platform | console_config.pci_common.iommu,
@@ -2530,8 +2453,7 @@ impl DeviceManager {
         console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<Arc<File>>,
         snapshot: Option<&Snapshot>,
-    ) -> DeviceManagerResult<Arc<Console>> {
-        let serial_config = self.config.lock().unwrap().serial.clone();
+    ) -> DeviceManagerResult<()> {
         let Some(console_info) = console_info else {
             return Err(DeviceManagerError::InvalidConsoleInfo);
         };
@@ -2552,12 +2474,8 @@ impl DeviceManager {
                 ConsoleTransport::Pty(_)
                 | ConsoleTransport::Tty(_)
                 | ConsoleTransport::Socket(_) => {
-                    let serial_manager = SerialManager::new(
-                        serial,
-                        console_info.serial,
-                        serial_config.common.socket,
-                    )
-                    .map_err(DeviceManagerError::CreateSerialManager)?;
+                    let serial_manager = SerialManager::new(serial, console_info.serial)
+                        .map_err(DeviceManagerError::CreateSerialManager)?;
                     if let Some(mut serial_manager) = serial_manager {
                         serial_manager
                             .start_thread(
@@ -2590,10 +2508,10 @@ impl DeviceManager {
             }
         }
 
-        let console_resizer =
+        self.console.console_resizer =
             self.add_virtio_console_device(console_info.console, console_resize_pipe, snapshot)?;
 
-        Ok(Arc::new(Console { console_resizer }))
+        Ok(())
     }
 
     #[cfg(not(target_arch = "riscv64"))]
@@ -2742,56 +2660,26 @@ impl DeviceManager {
                 .as_ref()
                 .ok_or(DeviceManagerError::NoDiskPath)?;
 
-            let opened = open_disk(&DiskOpenOptions {
-                path: disk_path,
-                readonly: disk_cfg.readonly,
-                direct: disk_cfg.direct,
-                sparse: disk_cfg.sparse,
-                backing_files: disk_cfg.backing_files,
-                disable_io_uring: disk_cfg.disable_io_uring,
-                disable_aio: disk_cfg.disable_aio,
-            })
+            let disk = open_disk(
+                &DiskOpenOptions {
+                    path: disk_path,
+                    readonly: disk_cfg.readonly,
+                    direct: disk_cfg.direct,
+                    sparse: disk_cfg.sparse,
+                    backing_files: disk_cfg.backing_files,
+                    disable_io_uring: disk_cfg.disable_io_uring,
+                    disable_aio: disk_cfg.disable_aio,
+                },
+                disk_cfg.image_type,
+            )
             .map_err(DeviceManagerError::Disk)?;
 
-            let detected_image_type = opened.image_type;
-            let mut disable_sector0_writes = false;
-
-            if disk_cfg.image_type == ImageType::Unknown {
-                warn!(
-                    "DEPRECATION: auto-detection of disk image type is deprecated and will be \
-                    removed in a future release. Please specify image type explicitly."
-                );
-
-                warn!(
-                    "No image_type specified - detected as {detected_image_type}. \
-                    Configuration updated to persist type across reboots and migrations."
-                );
-
-                if detected_image_type == ImageType::Raw
-                    || detected_image_type == ImageType::FixedVhd
-                {
-                    warn!(
-                        "Autodetected {detected_image_type} image type. Disabling sector 0 writes."
-                    );
-                    disable_sector0_writes = true;
-                } else {
-                    warn!(
-                        "Non-raw image type detected. In the future it will be necessary \
-                        to specify image_type for non-raw files."
-                    );
-                }
-
-                if detected_image_type == ImageType::Qcow2 && disk_cfg.backing_files {
-                    warn!("QCOW2 image type autodetected. Disabling backing files");
-                    disk_cfg.backing_files = false;
-                }
-
-                disk_cfg.image_type = detected_image_type;
-            } else if disk_cfg.image_type != detected_image_type {
-                return Err(DeviceManagerError::DiskImageTypeMismatch {
-                    specified: disk_cfg.image_type,
-                    detected: detected_image_type,
-                });
+            if let Some(guest_block_size) = disk_cfg.guest_block_size
+                && disk_cfg.direct
+                && !disk_cfg.readonly
+                && u64::from(guest_block_size) < disk.topology().logical_block_size
+            {
+                return Err(DeviceManagerError::GuestBlockSizeBelowBackend);
             }
 
             if disk_cfg.image_type != ImageType::Qcow2 && disk_cfg.backing_files {
@@ -2841,7 +2729,7 @@ impl DeviceManager {
 
             let mut virtio_block = virtio_devices::Block::new(
                 id.clone(),
-                opened.disk,
+                disk,
                 disk_cfg
                     .path
                     .as_ref()
@@ -2861,8 +2749,8 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::RestoreGetState)?,
                 queue_affinity,
                 disk_cfg.sparse,
-                disable_sector0_writes,
                 disk_cfg.lock_granularity,
+                disk_cfg.guest_block_size,
             )
             .map_err(DeviceManagerError::CreateVirtioBlock)?;
 
@@ -3449,7 +3337,15 @@ impl DeviceManager {
             self.memory_manager
                 .lock()
                 .unwrap()
-                .create_userspace_mapping(region_base, region_size, host_addr, false, false, false)
+                .create_userspace_mapping(
+                    region_base,
+                    region_size,
+                    host_addr,
+                    false,
+                    false,
+                    false,
+                    hypervisor::MemoryVisibility::Shared,
+                )
                 .map_err(DeviceManagerError::MemoryManager)
         }?;
 
@@ -4062,6 +3958,11 @@ impl DeviceManager {
                 return Err(DeviceManagerError::MissingVirtualIommu);
             }
 
+            if let Some(mapping) = &self.iommu_mapping {
+                self.msi_interrupt_manager
+                    .register_remapping(pci_device_bdf.into(), mapping.clone());
+            }
+
             vfio_ops
         } else if let Some(vfio_ops) = &self.vfio_ops {
             Arc::clone(vfio_ops)
@@ -4094,32 +3995,60 @@ impl DeviceManager {
         };
 
         if needs_dma_mapping {
-            // Register DMA mapping in IOMMU.
-            // Do not register virtio-mem regions, as they are handled directly by
-            // virtio-mem device itself.
-            for zone in self.memory_manager.lock().unwrap().memory_zones().values() {
-                for region in zone.regions() {
-                    // vfio_dma_map is unsound and ought to be marked as unsafe
-                    #[allow(unused_unsafe)]
-                    // SAFETY: GuestMemoryMmap guarantees that region points
-                    // to len bytes of valid memory starting at as_ptr()
-                    // that will only be freed with munmap().
-                    unsafe {
-                        vfio_ops.vfio_dma_map(
-                            region.start_addr().raw_value(),
-                            region.len() as usize,
-                            region.as_ptr(),
-                        )
-                    }
-                    .map_err(DeviceManagerError::VfioDmaMap)?;
-                }
-            }
-
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
                 Arc::clone(&vfio_ops),
                 Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
                 Arc::clone(&self.mmio_regions),
             ));
+
+            #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+            let static_map_all_ram = match self.sev_snp_shared_page_tracker.as_ref() {
+                // Confidential VM over iommufd supports shared/private tracking.
+                Some(tracker) => {
+                    tracker
+                        .add_dma_mapping_handler(vfio_mapping.clone())
+                        .map_err(DeviceManagerError::AddDmaMappingHandlerSevSnp)?;
+                    false
+                }
+                None => {
+                    if self.config.lock().unwrap().is_sev_snp_enabled()
+                        && self.cpu_manager.lock().unwrap().hypervisor_type()
+                            == hypervisor::HypervisorType::Kvm
+                    {
+                        warn!(
+                            "SEV-SNP: static-pinning all guest RAM (no reclaim); per-page \
+                             shared-page tracking needs an iommufd backend, non-hugepage \
+                             RAM, and no vfio-user devices."
+                        );
+                    }
+                    true
+                }
+            };
+            #[cfg(not(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg")))]
+            let static_map_all_ram = true;
+
+            if static_map_all_ram {
+                // Statically map all guest RAM into the IOMMU. Do not register
+                // virtio-mem regions, as they are handled directly by the
+                // virtio-mem device itself.
+                for zone in self.memory_manager.lock().unwrap().memory_zones().values() {
+                    for region in zone.regions() {
+                        // vfio_dma_map is unsound and ought to be marked as unsafe
+                        #[allow(unused_unsafe)]
+                        // SAFETY: GuestMemoryMmap guarantees that region points
+                        // to len bytes of valid memory starting at as_ptr()
+                        // that will only be freed with munmap().
+                        unsafe {
+                            vfio_ops.vfio_dma_map(
+                                region.start_addr().raw_value(),
+                                region.len() as usize,
+                                region.as_ptr(),
+                            )
+                        }
+                        .map_err(DeviceManagerError::VfioDmaMap)?;
+                    }
+                }
+            }
 
             for virtio_mem_device in self.virtio_mem_devices.iter() {
                 virtio_mem_device
@@ -4224,6 +4153,11 @@ impl DeviceManager {
             pci_device_bdf,
             bars,
         )?;
+
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        if !device_cfg.pci_common.iommu {
+            self.shared_vfio_devices += 1;
+        }
 
         Ok((pci_device_bdf, vfio_name))
     }
@@ -4506,6 +4440,8 @@ impl DeviceManager {
                 pci_device_bdf.into(),
                 mapping.clone(),
             )));
+            self.msi_interrupt_manager
+                .register_remapping(pci_device_bdf.into(), mapping.clone());
         }
 
         // If SEV-SNP is enabled create the AccessPlatform from SevSnpPageAccessProxy
@@ -4584,7 +4520,8 @@ impl DeviceManager {
         let (bars, new_resources) =
             self.allocate_pci_bars(virtio_pci_device.clone(), pci_segment_id, resources)?;
 
-        let bar_addr = virtio_pci_device.lock().unwrap().config_bar_addr();
+        let bar_addr = PciBarConfiguration::addr_of_idx(&bars, VIRTIO_CONFIG_BAR_INDEX)
+            .ok_or(DeviceManagerError::MissingPciBar(VIRTIO_CONFIG_BAR_INDEX))?;
         for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
             let io_addr = IoEventAddress::Mmio(addr);
             self.address_manager
@@ -4690,7 +4627,8 @@ impl DeviceManager {
         let (bars, new_resources) =
             self.allocate_pci_bars(ivshmem_device.clone(), pci_segment_id, resources)?;
 
-        let start_addr = ivshmem_device.lock().unwrap().data_bar_addr();
+        let start_addr = PciBarConfiguration::addr_of_idx(&bars, IVSHMEM_DATA_BAR_IDX)
+            .ok_or(DeviceManagerError::MissingPciBar(IVSHMEM_DATA_BAR_IDX))?;
         let (region, mapping) = ivshmem_ops
             .lock()
             .unwrap()
@@ -4953,6 +4891,11 @@ impl DeviceManager {
             ));
         }
 
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        if self.sev_snp_shared_page_tracker.is_some() {
+            return Err(DeviceManagerError::VfioUserHotplugSevSnpTracker);
+        }
+
         let (bdf, device_name) = self.add_vfio_user_device(device_cfg, None)?;
 
         // Update the PCIU bitmap
@@ -5128,7 +5071,7 @@ impl DeviceManager {
             .free_device_id(device_id)
             .map_err(DeviceManagerError::FreePciDeviceId)?;
 
-        let (pci_device_handle, id) = {
+        let (pci_device_handle, id, pci_bar_resources) = {
             // Remove the device from the device tree along with its children.
             let mut device_tree = self.device_tree.lock().unwrap();
             let pci_device_node = device_tree
@@ -5154,7 +5097,7 @@ impl DeviceManager {
                 device_tree.remove(child);
             }
 
-            (pci_device_handle, id)
+            (pci_device_handle, id, pci_device_node.resources)
         };
 
         let mut iommu_attached = false;
@@ -5164,10 +5107,20 @@ impl DeviceManager {
             iommu_attached = true;
         }
 
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        let mut removed_shared_vfio_device = false;
+
         let (pci_device, bus_device, virtio_device, remove_dma_handler) = match pci_device_handle {
-            // VirtioMemMappingSource::Container cleanup is handled by
-            // cleanup_vfio_ops when the last VFIO device is removed.
+            // The container-wide VirtioMemMappingSource::Container mapping is
+            // shared across VFIO devices, so it is not removed per-device here.
+            // It goes away when cleanup_vfio_ops drops the container after the
+            // last shared VFIO device is removed.
             PciDeviceHandle::Vfio(vfio_pci_device) => {
+                #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+                {
+                    removed_shared_vfio_device = !vfio_pci_device.lock().unwrap().iommu_attached();
+                }
+
                 // Remove this device's MMIO regions from the DeviceManager's
                 // mmio_regions list. We match on UserMemoryRegion slot numbers
                 // rather than MmioRegion start addresses because move_bar()
@@ -5188,13 +5141,27 @@ impl DeviceManager {
             }
             PciDeviceHandle::Virtio(virtio_pci_device) => {
                 let dev = virtio_pci_device.lock().unwrap();
-                let bar_addr = dev.config_bar_addr();
-                for (event, addr) in dev.ioeventfds(bar_addr) {
-                    let io_addr = IoEventAddress::Mmio(addr);
-                    self.address_manager
-                        .vm
-                        .unregister_ioevent(event, &io_addr)
-                        .map_err(|e| DeviceManagerError::UnRegisterIoevent(e.into()))?;
+                let config_bar_idx = VIRTIO_CONFIG_BAR_INDEX;
+                let bar_addr = pci_bar_resources.iter().find_map(|r| match r {
+                    Resource::PciBar { index, base, .. } if *index == config_bar_idx => Some(*base),
+                    _ => None,
+                });
+                // The device was already removed from the device
+                // tree, so a missing resource must not abort the eject.
+                // Warn and leave the ioeventfds registered rather
+                // than bail out half way through.
+                if let Some(bar_addr) = bar_addr {
+                    for (event, addr) in dev.ioeventfds(bar_addr) {
+                        let io_addr = IoEventAddress::Mmio(addr);
+                        self.address_manager
+                            .vm
+                            .unregister_ioevent(event, &io_addr)
+                            .map_err(|e| DeviceManagerError::UnRegisterIoevent(e.into()))?;
+                    }
+                } else {
+                    warn!(
+                        "No BAR {config_bar_idx} resource for {id}, not unregistering ioeventfds"
+                    );
                 }
 
                 if let Some(dma_handler) = dev.dma_handler()
@@ -5245,6 +5212,9 @@ impl DeviceManager {
                 .unwrap()
                 .remove_external_mapping(pci_device_bdf.into());
         }
+
+        self.msi_interrupt_manager
+            .unregister_remapping(pci_device_bdf.into());
 
         if remove_dma_handler {
             for virtio_mem_device in self.virtio_mem_devices.iter() {
@@ -5351,6 +5321,15 @@ impl DeviceManager {
         // buses where it was stored. At the end of this function, after
         // any_device, bus_device and pci_device are released, the actual
         // device will be dropped.
+
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        if removed_shared_vfio_device {
+            if self.shared_vfio_devices == 0 {
+                error!("shared VFIO device count underflow on eject, falling to 0");
+            }
+            self.shared_vfio_devices = self.shared_vfio_devices.saturating_sub(1);
+        }
+
         Ok(())
     }
 
@@ -5510,6 +5489,18 @@ impl DeviceManager {
         0
     }
 
+    pub fn balloon_stats(&self) -> DeviceManagerResult<virtio_devices::BalloonStatsSnapshot> {
+        let balloon = self
+            .balloon
+            .as_ref()
+            .ok_or(DeviceManagerError::MissingVirtioBalloon)?;
+        balloon
+            .lock()
+            .unwrap()
+            .stats()
+            .map_err(DeviceManagerError::VirtioBalloonStats)
+    }
+
     pub fn resize_disk(&mut self, device_id: &str, new_size: u64) -> DeviceManagerResult<()> {
         for dev in &self.block_devices {
             let mut disk = dev.lock().unwrap();
@@ -5585,11 +5576,66 @@ impl DeviceManager {
     }
 
     fn cleanup_vfio_ops(&mut self) {
-        // Drop the VfioOps instance when "Self" is the only reference
+        // We need to release every other container reference before dropping
+        // `self.vfio_ops`, so its drop closes the container fd and unpins
+        // the shared pages.
+        #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+        if let Some(tracker) = &self.sev_snp_shared_page_tracker {
+            if self.vfio_ops.is_some() && self.shared_vfio_devices == 0 {
+                // Drop the tracker's handler. The tracker itself persists so a
+                // later VFIO attach replays the current shared set.
+                tracker.clear_dma_mapping_handler();
+                self.vfio_ops = None;
+            }
+            return;
+        }
+
+        // Drop the VfioOps instance when "Self" is the only reference.
         if let Some(1) = self.vfio_ops.as_ref().map(Arc::strong_count) {
             debug!("Drop VfioOps given no active VFIO devices.");
             self.vfio_ops = None;
         }
+    }
+
+    #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
+    fn create_sev_snp_shared_page_tracker(
+        address_manager: &Arc<AddressManager>,
+        config: &Arc<Mutex<VmConfig>>,
+        cpu_manager: &Arc<Mutex<CpuManager>>,
+        memory_manager: &Arc<Mutex<MemoryManager>>,
+    ) -> Option<Arc<SevSnpSharedPageTracker>> {
+        // The SEV-SNP per-page tracker is only supported over an iommufd backend
+        // with no vfio-user devices. Otherwise, confidential VFIO falls back to
+        // static-mapping all pages.
+        let sev_snp_config_enabled = {
+            let config = config.lock().unwrap();
+            config.is_sev_snp_enabled()
+                && config.platform.as_ref().is_some_and(|p| p.iommufd)
+                && config
+                    .user_devices
+                    .as_ref()
+                    .is_none_or(|devices| devices.is_empty())
+        };
+
+        if !sev_snp_config_enabled {
+            return None;
+        }
+
+        if cpu_manager.lock().unwrap().hypervisor_type() != hypervisor::HypervisorType::Kvm {
+            return None;
+        }
+
+        let tracker = Arc::new(SevSnpSharedPageTracker::new());
+        for zone in memory_manager.lock().unwrap().memory_zones().values() {
+            for region in zone.regions() {
+                tracker.register_region(region.start_addr().raw_value(), region.len());
+            }
+        }
+        address_manager
+            .vm
+            .register_memory_conversion_handler(tracker.clone());
+
+        Some(tracker)
     }
 }
 
@@ -5643,6 +5689,7 @@ impl IvshmemOps for IvshmemHandler {
                     false,
                     false,
                     false,
+                    hypervisor::MemoryVisibility::Shared,
                 )
             }
         }
@@ -6177,7 +6224,7 @@ impl Drop for DeviceManager {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     #[test]

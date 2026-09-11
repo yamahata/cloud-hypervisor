@@ -87,11 +87,7 @@ impl Landlock {
         Ok(Landlock { ruleset })
     }
 
-    pub(crate) fn add_rule(
-        &mut self,
-        path: &Path,
-        access: BitFlags<AccessFs>,
-    ) -> Result<(), LandlockError> {
+    fn add_rule(&mut self, path: &Path, access: BitFlags<AccessFs>) -> Result<(), LandlockError> {
         // path_beneath_rules in landlock crate handles file and directory access rules.
         // Incoming path/s are passed to path_beneath_rules, so that we don't
         // have to worry about the type of the path.
@@ -145,13 +141,13 @@ fn test_try_from_access() {
         | Truncate
     });
     let landlock_access = LandlockAccess::try_from("rw").unwrap();
-    assert!(landlock_access.access == read_access | write_access);
+    assert_eq!(landlock_access.access, read_access | write_access);
 
     let landlock_access = LandlockAccess::try_from("r").unwrap();
-    assert!(landlock_access.access == read_access);
+    assert_eq!(landlock_access.access, read_access);
 
     let landlock_access = LandlockAccess::try_from("w").unwrap();
-    assert!(landlock_access.access == write_access);
+    assert_eq!(landlock_access.access, write_access);
 
     LandlockAccess::try_from("").unwrap_err();
 }

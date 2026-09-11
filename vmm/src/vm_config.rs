@@ -265,7 +265,7 @@ pub struct MemoryZoneConfig {
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
-    pub reserve: bool,
+    pub reserve: Option<bool>,
     #[serde(default)]
     pub mergeable: bool,
 }
@@ -315,7 +315,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
-    pub reserve: bool,
+    pub reserve: Option<bool>,
     #[serde(default)]
     pub zones: Option<Vec<MemoryZoneConfig>>,
     #[serde(default = "default_memoryconfig_thp")]
@@ -336,7 +336,7 @@ impl Default for MemoryConfig {
             hugepages: false,
             hugepage_size: None,
             prefault: false,
-            reserve: false,
+            reserve: None,
             zones: None,
             thp: true,
         }
@@ -416,6 +416,8 @@ pub struct DiskConfig {
     pub image_type: ImageType,
     #[serde(default)]
     pub lock_granularity: LockGranularityChoice,
+    #[serde(default)]
+    pub guest_block_size: Option<u32>,
 }
 
 impl ApplyLandlock for DiskConfig {
@@ -712,7 +714,7 @@ pub struct ConsoleConfig {
 }
 
 impl ConsoleConfig {
-    pub const SYNTAX: &str = "Control (virtio) console: \"off|null|pty|tty|file=<path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+    pub const SYNTAX: &str = "Control (virtio) console: \"off|null|pty|tty|file=<path>|socket=<path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 }
 
 impl Default for ConsoleConfig {

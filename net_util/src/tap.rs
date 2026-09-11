@@ -49,7 +49,7 @@ pub enum Error {
     InvalidNetmask,
 }
 
-pub type Result<T> = result::Result<T, Error>;
+pub(crate) type Result<T> = result::Result<T, Error>;
 
 /// Handle for a network tap interface.
 ///
@@ -551,7 +551,7 @@ impl AsRawFd for Tap {
 
 #[cfg(test)]
 #[cfg(devcli_testenv)] // we need special permissions in the ENV to create Tap devices
-mod unit_tests {
+mod tests {
     use std::net::Ipv4Addr;
     use std::sync::{LazyLock, Mutex, mpsc};
     use std::time::Duration;

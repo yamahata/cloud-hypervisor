@@ -48,14 +48,15 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
+    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::device_manager::DeviceManager;
 use crate::landlock::Landlock;
+use crate::locked_unix_listener::LockedUnixListener;
 use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
@@ -67,6 +68,7 @@ use crate::migration::worker::{
 };
 use crate::migration::{recv_vm_config, recv_vm_state};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
+use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
@@ -89,6 +91,7 @@ mod gdb;
 mod igvm;
 pub mod interrupt;
 pub mod landlock;
+pub mod locked_unix_listener;
 pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
@@ -117,10 +120,6 @@ pub enum Error {
     /// API response send error
     #[error("Error sending API request")]
     ApiResponseSend(#[source] SendError<ApiResponse>),
-
-    /// Cannot bind to the UNIX domain socket path
-    #[error("Error binding to UNIX domain socket")]
-    Bind(#[source] io::Error),
 
     /// Cannot clone EventFd.
     #[error("Error cloning EventFd")]
@@ -155,14 +154,6 @@ pub enum Error {
     /// Cannot create `event-monitor` thread
     #[error("Error spawning `event-monitor` thread")]
     EventMonitorThreadSpawn(#[source] io::Error),
-
-    /// Cannot handle the VM STDIN stream
-    #[error("Error handling VM stdin")]
-    Stdin(#[source] VmError),
-
-    /// Cannot handle the VM pty stream
-    #[error("Error handling VM pty")]
-    Pty(#[source] VmError),
 
     /// Cannot reboot the VM
     #[error("Error rebooting VM")]
@@ -618,11 +609,26 @@ pub struct VmMigrationConfig {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     common_cpuid: Vec<x86::CpuIdEntry>,
     memory_manager_data: MemoryManagerSnapshotData,
+    /// The memory transfer mode the sender uses. The receiver derives its
+    /// behavior (e.g., serving page faults for postcopy).
+    #[serde(default)]
+    memory_mode: MigrationMode,
 }
 
 impl VmMigrationConfig {
     pub fn memory_manager_data(&self) -> &MemoryManagerSnapshotData {
         &self.memory_manager_data
+    }
+
+    pub fn memory_mode(&self) -> MigrationMode {
+        self.memory_mode
+    }
+
+    /// Override the memory transfer mode. Used by senders that replay a
+    /// persisted config, e.g. an offload daemon restoring a snapshot in
+    /// on-demand (postcopy) mode.
+    pub fn set_memory_mode(&mut self, memory_mode: MigrationMode) {
+        self.memory_mode = memory_mode;
     }
 }
 
@@ -709,6 +715,8 @@ pub struct Vmm {
     original_termios_opt: Arc<Mutex<Option<termios>>>,
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
+    serial_socket_listener: Option<Arc<LockedUnixListener>>,
+    console_socket_listener: Option<Arc<LockedUnixListener>>,
     no_shutdown: bool,
     check_migration_evt: EventFd,
 }
@@ -724,6 +732,9 @@ struct ReceiveMigrationConfiguredData {
     connections: ReceiveAdditionalConnections,
     shared_backing: bool,
     fault_rx: Receiver<SocketStream>,
+    /// The memory transfer mode announced by the sender in the received
+    /// [`VmMigrationConfig`].
+    memory_mode: MigrationMode,
 }
 
 /// The receiver's state machine behind the migration protocol.
@@ -938,6 +949,8 @@ impl Vmm {
             original_termios_opt: Arc::new(Mutex::new(None)),
             console_resize_pipe: None,
             console_info: None,
+            serial_socket_listener: None,
+            console_socket_listener: None,
             no_shutdown,
             check_migration_evt,
         })
@@ -988,7 +1001,7 @@ impl Vmm {
              memory_files: HashMap<u32, File>|
              -> result::Result<ReceiveMigrationConfiguredData, MigratableError> {
                 let shared_backing = !memory_files.is_empty();
-                let memory_manager =
+                let (memory_manager, memory_mode) =
                     self.vm_receive_config(req, socket, memory_files, receive_data_migration)?;
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
@@ -1011,6 +1024,7 @@ impl Vmm {
                     connections,
                     shared_backing,
                     fault_rx,
+                    memory_mode,
                 })
             };
 
@@ -1023,6 +1037,7 @@ impl Vmm {
             Ok(memory_files)
         };
 
+        #[expect(deprecated)] // last sent in v52
         if req.command() == Command::Abandon {
             info!("Abandon Command Received");
             return Ok(Aborted);
@@ -1069,9 +1084,7 @@ impl Vmm {
                     })?;
                     Ok(Configured(config_data))
                 }
-                Command::State => {
-                    self.vm_receive_state_command(req, socket, config_data, receive_data_migration)
-                }
+                Command::State => self.vm_receive_state_command(req, socket, config_data),
                 c => invalid_command(state_name, c),
             },
             StateReceived {
@@ -1111,17 +1124,81 @@ impl Vmm {
         }
     }
 
+    /// Runs the receiver side of the migration protocol.
+    fn vm_receive_migration_protocol(
+        &mut self,
+        mut listener: ReceiveListener,
+        receive_data_migration: &VmReceiveMigrationData,
+    ) -> result::Result<(), MigratableError> {
+        event!("vm", "migration-receive-ready");
+        // Accept the connection and get the socket
+        let mut socket = listener.accept()?;
+
+        event!("vm", "migration-receive-starting");
+        let mut state = ReceiveMigrationState::Established;
+
+        while !state.finished() {
+            let req = Request::read_from(&mut socket).inspect_err(|error| {
+                if matches!(
+                    error,
+                    MigratableError::MigrateSocket(io_error)
+                        if io_error.kind() == io::ErrorKind::UnexpectedEof
+                ) {
+                    error!("Failed to read migration request: sender likely failed, aborting");
+                }
+            })?;
+            debug!("Command '{:?}' received", req.command());
+
+            // If sender-side migration causes any error propagated here, the
+            // next loop iteration logs a helpful error when reading the next
+            // request (which will fail as the sender closed the socket).
+            let (response, new_state) = match self.vm_receive_migration_step(
+                &mut socket,
+                &listener,
+                state,
+                &req,
+                receive_data_migration,
+            ) {
+                Ok(next_state) => (Response::ok(), next_state),
+                Err(err) => {
+                    warn!(
+                        "Migration aborted as migration command {:?} failed: {}",
+                        req.command(),
+                        err
+                    );
+                    (Response::error(), ReceiveMigrationState::Aborted)
+                }
+            };
+
+            state = new_state;
+            assert_eq!(response.length(), 0);
+            response.write_to(&mut socket)?;
+
+            // Connection and handshake established
+            if matches!(state, ReceiveMigrationState::Started) {
+                event!("vm", "migration-receive-started");
+            }
+        }
+
+        match state {
+            ReceiveMigrationState::Aborted => Err(MigratableError::CompleteMigration(anyhow!(
+                "Migration was aborted"
+            ))),
+            ReceiveMigrationState::Completed => Ok(()),
+            _ => unreachable!("loop only exits in Completed or Aborted"),
+        }
+    }
+
     fn vm_receive_state_command(
         &mut self,
         req: &Request,
         socket: &mut SocketStream,
         mut config_data: ReceiveMigrationConfiguredData,
-        receive_data_migration: &VmReceiveMigrationData,
     ) -> result::Result<ReceiveMigrationState, MigratableError> {
         let state_receive_begin = Instant::now();
 
         // Serve faults before restore so accesses during restore resolve on demand.
-        if matches!(receive_data_migration.memory_mode, MigrationMode::Postcopy) {
+        if matches!(config_data.memory_mode, MigrationMode::Postcopy) {
             let shared_backing = config_data.shared_backing;
             let fault_stream = config_data
                 .fault_rx
@@ -1173,11 +1250,10 @@ impl Vmm {
         socket: &mut T,
         existing_memory_files: HashMap<u32, File>,
         receive_data_migration: &VmReceiveMigrationData,
-    ) -> result::Result<Arc<Mutex<MemoryManager>>, MigratableError>
+    ) -> result::Result<(Arc<Mutex<MemoryManager>>, MigrationMode), MigratableError>
     where
         T: Read,
     {
-        let mode = receive_data_migration.memory_mode;
         let zone_updates = &receive_data_migration.zone_updates;
 
         // Read in config data along with memory manager data
@@ -1190,6 +1266,8 @@ impl Vmm {
         let vm_migration_config: VmMigrationConfig = serde_json::from_slice(&data)
             .context("Error deserialising config")
             .map_err(MigratableError::MigrateReceive)?;
+
+        let mode = vm_migration_config.memory_mode();
 
         // Mirrors the vm_restore handling of RestoreConfig.vfio_fds. The
         // received VmConfig carries the source's device paths or stale FDs,
@@ -1282,7 +1360,7 @@ impl Vmm {
         .context("Error creating MemoryManager from snapshot")
         .map_err(MigratableError::MigrateReceive)?;
 
-        Ok(memory_manager)
+        Ok((memory_manager, mode))
     }
 
     /// Receives the final VM state (devices, vCPUs) and restores the VM.
@@ -1373,7 +1451,11 @@ impl Vmm {
 
             // Create VM
             vm.restore().map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {e}"))
+                // Inner error cannot be wrapped in anyhow::Error => print it
+                MigratableError::MigrateReceive(anyhow!(
+                    "Failed restoring the VM: {}",
+                    flatten_error_chain_to_string(&e)
+                ))
             })?;
 
             Ok(vm)
@@ -1525,7 +1607,7 @@ impl Vmm {
         Ok(false)
     }
 
-    /// Performs the memory migration including multiple iterations.
+    /// Performs precopy memory migration including multiple iterations.
     ///
     /// This includes:
     /// - initial memory - VM is running
@@ -1596,6 +1678,8 @@ impl Vmm {
         // State machine that is updated with more context as we progress.
         let mut ctx = OngoingMigrationContext::new();
 
+        let memory_mode = send_data_migration.effective_memory_mode();
+
         // Set up the socket connection
         let mut socket = transport::send_migration_socket(
             &send_data_migration.destination_url,
@@ -1608,6 +1692,10 @@ impl Vmm {
             Request::start(),
             MigratableError::MigrateSend(anyhow!("Error starting migration")),
         )?;
+
+        // Connection and handshake established
+        event!("vm", "migration-started");
+
         debug!("Using migration protocol {CURRENT_PROTOCOL_VERSION}");
 
         // Send config
@@ -1648,18 +1736,17 @@ impl Vmm {
             .map_err(MigratableError::MigrateSend)?
         };
 
-        if send_data_migration.local {
-            match &mut socket {
-                SocketStream::Unix(unix_socket) => {
-                    // Proceed with sending memory file descriptors over UNIX socket
-                    vm.send_memory_fds(unix_socket)?;
-                }
-                _ => {
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "--local option is only supported with UNIX sockets",
-                    )));
-                }
+        // Send memory FDs
+        match (&mut socket, memory_mode) {
+            (SocketStream::Unix(unix_socket), MigrationMode::MemFDs) => {
+                vm.send_memory_fds(unix_socket)?;
             }
+            (_, MigrationMode::MemFDs) => {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "Memory FD migration is only supported with UNIX sockets",
+                )));
+            }
+            (_, _) => (),
         }
 
         let vm_migration_config = VmMigrationConfig {
@@ -1667,6 +1754,7 @@ impl Vmm {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             common_cpuid,
             memory_manager_data: vm.memory_manager_data(),
+            memory_mode,
         };
         transport::send_config(&mut socket, &vm_migration_config)?;
 
@@ -1676,59 +1764,70 @@ impl Vmm {
             vm.start_migration()?;
         }
 
-        if send_data_migration.local
-            || matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
-            // Now pause VM (skip if already paused, e.g. migrating a paused VM)
-            let downtime_begin = Instant::now();
-            if vm.get_state() != VmState::Paused {
-                vm.pause()?;
+        // Memory transfer
+        match (memory_mode, &mut socket) {
+            (
+                MigrationMode::Precopy,
+                SocketStream::Unix(_) | SocketStream::Tcp(_) | SocketStream::Tls(_),
+            ) => {
+                let mut mem_send = SendAdditionalConnections::new(
+                    &send_data_migration.destination_url,
+                    send_data_migration.connections,
+                    send_data_migration.tls_dir.as_deref(),
+                    &vm.guest_memory(),
+                    &seccomp_filters.tcp_worker,
+                )?;
+
+                Self::do_memory_migration(
+                    vm,
+                    &mut socket,
+                    send_data_migration,
+                    &mut mem_send,
+                    &mut ctx,
+                )
+                .inspect_err(|_| {
+                    if let Err(e) = mem_send.cleanup_workers() {
+                        let msg = flatten_error_chain_to_string(&e);
+                        warn!("Error cleaning up migration connections: {msg}");
+                    }
+                })?;
+                mem_send.cleanup_workers()?;
             }
-            ctx.set_vm_paused(
-                downtime_begin,
-                // No memory was transferred
-                MemoryMigrationContext::empty_finalized(),
-            )
-            .expect("migration context should transition to VmPaused for local/postcopy migration");
-        } else {
-            let mut mem_send = transport::SendAdditionalConnections::new(
-                &send_data_migration.destination_url,
-                send_data_migration.connections,
-                send_data_migration.tls_dir.as_deref(),
-                &vm.guest_memory(),
-                &seccomp_filters.tcp_worker,
-            )?;
-
-            Self::do_memory_migration(
-                vm,
-                &mut socket,
-                send_data_migration,
-                &mut mem_send,
-                &mut ctx,
-            )
-            .inspect_err(|_| {
-                // Calling cleanup multiple times is fine, thus here we just make sure
-                // that it is called.
-                if let Err(e) = mem_send.cleanup() {
-                    warn!("Error cleaning up migration connections: {e}");
+            // No need for precopy: just pause VM
+            (MigrationMode::MemFDs, SocketStream::Unix(_)) | (MigrationMode::Postcopy, _) => {
+                let downtime_begin = Instant::now();
+                if vm.get_state() != VmState::Paused {
+                    vm.pause()?;
                 }
-            })?;
-
-            mem_send.cleanup()?;
+                ctx.set_vm_paused(
+                    downtime_begin,
+                    // No memory was transferred
+                    MemoryMigrationContext::empty_finalized(),
+                )
+                .expect(
+                    "migration context should transition to VmPaused for memfds/postcopy migration",
+                );
+            }
+            (socket, mode) => {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "Unexpected memory transfer configuration: socket:{socket:?}, mode:{mode:?}",
+                )));
+            }
         }
 
         // We release the locks early to enable locking them on the destination host.
         // The VM is already stopped.
         // Keep the locks held if the source VM must be preserved.
         if !send_data_migration.preserve_source {
-            vm.release_disk_locks()
-                .map_err(|e| MigratableError::UnlockError(anyhow!("{e}")))?;
+            // Inner error cannot be wrapped in anyhow::Error => print it
+            vm.release_disk_locks().map_err(|e| {
+                MigratableError::UnlockError(anyhow!("{}", flatten_error_chain_to_string(&e)))
+            })?;
         }
 
         // For postcopy, serve faults before sending State so the destination
         // can fault pages in during restore.
-        let postcopy_handle = if matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
+        let postcopy_handle = if matches!(memory_mode, MigrationMode::Postcopy) {
             let fault_stream = transport::open_fault_connection(
                 &send_data_migration.destination_url,
                 send_data_migration.tls_dir.as_deref(),
@@ -1745,7 +1844,7 @@ impl Vmm {
                         guest_memory,
                     )
                 })
-                .context("spawning postcopy serve thread")
+                .context("Spawning postcopy serve thread")
                 .map_err(MigratableError::MigrateSend)?;
             Some(handle)
         } else {
@@ -1757,9 +1856,7 @@ impl Vmm {
             let snapshot = vm.snapshot()?;
 
             // One final memory iteration to handle side effects from snapshot.
-            if !send_data_migration.local
-                && !matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-            {
+            if matches!(memory_mode, MigrationMode::Precopy) {
                 let memory_ranges = vm.dirty_log()?;
                 transport::send_memory_ranges(&vm.guest_memory(), &memory_ranges, &mut socket)?;
             }
@@ -1799,9 +1896,7 @@ impl Vmm {
         debug!("Downtime breakdown: {}", ctx.downtime_ctx);
 
         // Stop logging dirty pages
-        if !send_data_migration.local
-            && !matches!(send_data_migration.memory_mode, MigrationMode::Postcopy)
-        {
+        if matches!(memory_mode, MigrationMode::Precopy) {
             vm.stop_dirty_log()?;
         }
 
@@ -1885,11 +1980,6 @@ impl Vmm {
                     socket
                         .write_all(&buf[..len])
                         .map_err(MigratableError::MigrateSocket)?;
-                }
-                Command::Abandon => {
-                    Response::ok().write_to(&mut socket)?;
-                    info!("Postcopy: received Abandon, exiting serve loop");
-                    return Ok(());
                 }
                 c => {
                     return Err(MigratableError::MigrateSend(anyhow!(
@@ -2706,6 +2796,21 @@ impl RequestHandler for Vmm {
         })
     }
 
+    fn vm_balloon_stats(&self) -> result::Result<BalloonStatsResponse, VmError> {
+        match &self.vm {
+            VmOwnership::Owned(vm) if vm.get_state() == VmState::Running => {
+                let snapshot = vm.balloon_stats()?;
+                Ok(BalloonStatsResponse {
+                    balloon_actual: vm.balloon_size(),
+                    last_update: snapshot.last_update,
+                    stats: snapshot.stats,
+                })
+            }
+            VmOwnership::Owned(_) | VmOwnership::None => Err(VmError::VmNotRunning),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+        }
+    }
+
     fn vmm_ping(&self) -> VmmPingResponse {
         let VmmVersionInfo {
             build_version,
@@ -2734,6 +2839,9 @@ impl RequestHandler for Vmm {
             VmOwnership::None => {}
         }
 
+        self.console_info = None;
+        self.serial_socket_listener = None;
+        self.console_socket_listener = None;
         self.vm_config = None;
         event!("vm", "deleted");
 
@@ -3157,13 +3265,13 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), MigratableError> {
         match &self.vm {
             VmOwnership::Owned(_vm) => {
-                return Err(MigratableError::MigrateReceive(anyhow!(
-                    "Can't receive a migration when a VM is already created"
+                return Err(MigratableError::Conflict(anyhow!(
+                    "There is already an existing VM"
                 )));
             }
             VmOwnership::Migration { .. } => {
-                return Err(MigratableError::MigrateReceive(anyhow!(
-                    "There is already an ongoing migration"
+                return Err(MigratableError::Conflict(anyhow!(
+                    "A migration is already in progress"
                 )));
             }
             VmOwnership::None => {}
@@ -3181,7 +3289,7 @@ impl RequestHandler for Vmm {
             receive_data_migration.zone_updates,
         );
 
-        let mut listener = transport::receive_migration_listener(
+        let listener = transport::receive_migration_listener(
             &receive_data_migration.receiver_url,
             receive_data_migration.tls_dir.as_deref(),
         )?;
@@ -3190,69 +3298,16 @@ impl RequestHandler for Vmm {
             warn!("The existing VM config will be overwritten");
         }
 
-        event!("vm", "migration-receive-ready");
-        // Accept the connection and get the socket
-        let mut socket = listener.accept()?;
-
-        event!("vm", "migration-receive-started");
-
-        let mut state = ReceiveMigrationState::Established;
-
-        while !state.finished() {
-            let req = Request::read_from(&mut socket).inspect_err(|error| {
-                if matches!(
-                    error,
-                    MigratableError::MigrateSocket(io_error)
-                        if io_error.kind() == io::ErrorKind::UnexpectedEof
-                ) {
-                    error!("Failed to read migration request: sender likely failed, aborting");
-                }
-            })?;
-            debug!("Command '{:?}' received", req.command());
-
-            // If sender-side migration causes any error propagated here, the
-            // next loop iteration logs a helpful error when reading the next
-            // request (which will fail as the sender closed the socket).
-            let (response, new_state) = match self.vm_receive_migration_step(
-                &mut socket,
-                &listener,
-                state,
-                &req,
-                &receive_data_migration,
-            ) {
-                Ok(next_state) => (Response::ok(), next_state),
-                Err(err) => {
-                    warn!(
-                        "Migration aborted as migration command {:?} failed: {}",
-                        req.command(),
-                        err
-                    );
-                    (Response::error(), ReceiveMigrationState::Aborted)
-                }
-            };
-
-            state = new_state;
-            assert_eq!(response.length(), 0);
-            response.write_to(&mut socket)?;
-        }
-
-        match state {
-            ReceiveMigrationState::Aborted => {
+        self.vm_receive_migration_protocol(listener, &receive_data_migration)
+            .inspect(|_| {
+                // Serving and resume already happened in the protocol loop.
+                event!("vm", "migration-receive-finished");
+            })
+            .inspect_err(|_| {
                 event!("vm", "migration-receive-failed");
                 self.vm = VmOwnership::None;
                 self.vm_config = None;
-                return Err(MigratableError::CompleteMigration(anyhow!(
-                    "Migration was aborted"
-                )));
-            }
-            ReceiveMigrationState::Completed => {
-                // Serving and resume already happened in the protocol loop.
-                event!("vm", "migration-receive-finished");
-            }
-            _ => unreachable!("loop only exits in Completed or Aborted"),
-        }
-
-        Ok(())
+            })
     }
 
     /// Dispatches a migration.
@@ -3267,14 +3322,14 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref vm) => {
                 if vm.restoring() {
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Cannot migrate while on-demand memory restore is in progress"
+                    return Err(MigratableError::Conflict(anyhow!(
+                        "An on-demand memory restore is still in progress"
                     )));
                 }
             }
             VmOwnership::Migration { .. } => {
-                return Err(MigratableError::MigrateSend(anyhow!(
-                    "There is already an ongoing migration"
+                return Err(MigratableError::Conflict(anyhow!(
+                    "A migration is already in progress"
                 )));
             }
             VmOwnership::None => {
@@ -3288,9 +3343,9 @@ impl RequestHandler for Vmm {
             .map_err(MigratableError::MigrateSend)?;
 
         info!(
-            "Sending migration: destination_url={},local={},tls={},downtime={}ms,timeout={}s,timeout_strategy={:?}",
+            "Sending migration: destination_url={},memory_mode={:?},tls={},downtime={}ms,timeout={}s,timeout_strategy={:?}",
             send_data_migration.destination_url,
-            send_data_migration.local,
+            send_data_migration.effective_memory_mode(),
             send_data_migration.tls_dir.is_some(),
             send_data_migration.downtime().as_millis(),
             send_data_migration.timeout().as_secs(),
@@ -3304,10 +3359,10 @@ impl RequestHandler for Vmm {
             .lock()
             .unwrap()
             .backed_by_shared_memory()
-            && send_data_migration.local
+            && send_data_migration.effective_memory_mode() == MigrationMode::MemFDs
         {
             return Err(MigratableError::MigrateSend(anyhow!(
-                "Local migration requires shared memory or hugepages enabled"
+                "Memory FD migration requires shared memory or hugepages enabled"
             )));
         }
 
@@ -3418,7 +3473,7 @@ mod util {
     ///
     /// This mimics the error chain that we print on exit in CH or ch-remote for
     /// situations where we do not exit the program.
-    pub fn error_chain_messages(top_error: &dyn StdError) -> Vec<String> {
+    pub(crate) fn error_chain_messages(top_error: &dyn StdError) -> Vec<String> {
         iter::successors(Some(top_error), |sub_error| {
             // Dereference necessary to mitigate rustc compiler bug.
             // See <https://github.com/rust-lang/rust/issues/141673>
@@ -3432,13 +3487,13 @@ mod util {
 
     /// Flattens the chain of errors of a [`StdError`] into a single printable
     /// line.
-    pub fn flatten_error_chain_to_string(top_error: &dyn StdError) -> String {
+    pub(crate) fn flatten_error_chain_to_string(top_error: &dyn StdError) -> String {
         // Separator discussed here: https://github.com/cloud-hypervisor/cloud-hypervisor/issues/8510
         error_chain_messages(top_error).join(": ")
     }
 }
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::path::PathBuf;
 
     use arch::CpuProfile;
@@ -3493,7 +3548,7 @@ mod unit_tests {
                 hugepages: false,
                 hugepage_size: None,
                 prefault: false,
-                reserve: false,
+                reserve: None,
                 zones: None,
                 thp: true,
             },
@@ -3675,7 +3730,7 @@ mod unit_tests {
     #[test]
     fn test_vmm_vm_cold_add_disk() {
         let mut vmm = create_dummy_vmm();
-        let disk_config = DiskConfig::parse("path=/path/to_file").unwrap();
+        let disk_config = DiskConfig::parse("path=/path/to_file,image_type=raw").unwrap();
 
         assert!(matches!(
             vmm.vm_add_disk(disk_config.clone()),
@@ -4018,7 +4073,6 @@ mod unit_tests {
         VmReceiveMigrationData {
             receiver_url: "tcp:127.0.0.1:4321".to_string(),
             tls_dir: None,
-            memory_mode: MigrationMode::default(),
             vfio_fds,
             iommufd_fd,
             zone_updates: vec![],

@@ -199,6 +199,46 @@ pub(crate) fn cloud_hypervisor_release_path() -> String {
     ch_release_path.into_os_string().into_string().unwrap()
 }
 
+pub(crate) fn ch_remote_release_path() -> String {
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+
+    let mut ch_remote_release_path = workload_path;
+    #[cfg(target_arch = "x86_64")]
+    ch_remote_release_path.push("ch-remote-static");
+    #[cfg(target_arch = "aarch64")]
+    ch_remote_release_path.push("ch-remote-static-aarch64");
+
+    ch_remote_release_path
+        .into_os_string()
+        .into_string()
+        .unwrap()
+}
+
+fn remote_command_with_binary(
+    ch_remote: &str,
+    api_socket: &str,
+    command: &str,
+    arg: Option<&str>,
+) -> bool {
+    let mut cmd = Command::new(ch_remote);
+    cmd.args([&format!("--api-socket={api_socket}"), command]);
+
+    if let Some(arg) = arg {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().unwrap();
+    if output.status.success() {
+        true
+    } else {
+        eprintln!("Error running ch-remote command: {cmd:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("stderr: {stderr}");
+        false
+    }
+}
+
 pub(crate) fn prepare_vhost_user_net_daemon(
     tmp_dir: &TempDir,
     ip: &str,
@@ -482,7 +522,7 @@ pub(crate) fn setup_ovs_dpdk_guests(
     (child1, child2)
 }
 
-pub enum FwType {
+pub(crate) enum FwType {
     Ovmf,
     RustHypervisorFirmware,
 }
@@ -575,36 +615,6 @@ fn check_sequential_events_with_options(
     }
 
     ret
-}
-
-// Return true if all events from the input 'expected_events' are matched exactly
-// with events from the 'event_file'
-pub(crate) fn check_sequential_events_exact(
-    expected_events: &[&MetaEvent],
-    event_file: &str,
-) -> bool {
-    if !Path::new(event_file).exists() {
-        return false;
-    }
-    let json_events = parse_event_file(event_file);
-    if expected_events.len() > json_events.len() {
-        return false;
-    }
-    let json_events = &json_events[..expected_events.len()];
-
-    for (idx, e) in json_events.iter().enumerate() {
-        if !expected_events[idx].match_with_json_event(e) {
-            eprintln!(
-                "\n\n==== Start 'check_sequential_events_exact' failed ==== \
-                 \n\nexpected_events={expected_events:?}\nactual_events={json_events:?} \
-                 \n\n==== End 'check_sequential_events_exact' failed ====",
-            );
-
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Return true if events from the input 'latest_events' are matched exactly
@@ -754,7 +764,7 @@ pub(crate) fn process_rss_kib(pid: u32) -> usize {
 }
 
 #[derive(PartialEq, Eq, PartialOrd)]
-pub struct Counters {
+pub(crate) struct Counters {
     rx_bytes: u64,
     rx_frames: u64,
     tx_bytes: u64,
@@ -903,10 +913,7 @@ pub(crate) fn compute_backing_checksum(
     let path = resolve_disk_path(path_or_image_name);
 
     let mut file = File::open(&path).ok()?;
-    if !matches!(
-        block::detect_image_type(&mut file).ok()?,
-        block::ImageType::Qcow2
-    ) {
+    if !block::validate_image_type(&mut file, block::ImageType::Qcow2).ok()? {
         return None;
     }
 
@@ -1140,9 +1147,17 @@ pub(crate) fn start_live_migration(
     migration_socket: &str,
     src_api_socket: &str,
     dest_api_socket: &str,
-    local: bool,
+    memfds: bool,
     paused: bool,
+    upgrade_test: bool,
 ) -> bool {
+    // Control a release source VMM with ch-remote from the same release.
+    let source_ch_remote = if upgrade_test {
+        ch_remote_release_path()
+    } else {
+        clh_command("ch-remote")
+    };
+
     // Start to receive migration from the destination VM
     let mut receive_migration = Command::new(clh_command("ch-remote"))
         .args([
@@ -1159,25 +1174,30 @@ pub(crate) fn start_live_migration(
 
     if paused {
         // Test the migration of a paused VM.
-        let cmd_success = remote_command(src_api_socket, "pause", None);
+        let cmd_success =
+            remote_command_with_binary(&source_ch_remote, src_api_socket, "pause", None);
         if !cmd_success {
             let _ = receive_migration.kill();
             eprintln!("Failed to pause the source VM before live migration");
         }
     }
 
+    // The release client predates the memory_mode=memfds syntax.
+    let memory_option = if upgrade_test {
+        format!("local={}", if memfds { "on" } else { "off" })
+    } else {
+        format!("memory_mode={}", if memfds { "memfds" } else { "precopy" })
+    };
+
     // Start to send migration from the source VM
     let args = [
         format!("--api-socket={src_api_socket}"),
         "send-migration".to_string(),
-        format!(
-            "destination_url=unix:{migration_socket},local={}",
-            if local { "on" } else { "off" }
-        ),
+        format!("destination_url=unix:{migration_socket},{memory_option}"),
     ]
     .to_vec();
 
-    let mut send_migration = Command::new(clh_command("ch-remote"))
+    let mut send_migration = Command::new(source_ch_remote)
         .args(&args)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())

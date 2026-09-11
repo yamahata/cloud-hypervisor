@@ -21,6 +21,8 @@ use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::PathBuf;
 
+use crate::ImageType;
+
 /// Small, stable classification of block errors.
 ///
 /// Callers match on this for control flow. Adding new format specific
@@ -36,12 +38,10 @@ pub enum BlockErrorKind {
     UnsupportedFeature,
     /// The image is marked or detected as corrupt.
     CorruptImage,
-    /// An address, offset, or index is outside the valid range.
-    OutOfBounds,
-    /// A file or required internal structure could not be found.
-    NotFound,
     /// An internal counter or limit was exceeded.
     Overflow,
+    /// Image type mismatch
+    ImageTypeMismatch { specified: ImageType },
 }
 
 impl Display for BlockErrorKind {
@@ -51,9 +51,10 @@ impl Display for BlockErrorKind {
             Self::InvalidFormat => write!(f, "Invalid format"),
             Self::UnsupportedFeature => write!(f, "Unsupported feature"),
             Self::CorruptImage => write!(f, "Corrupt image"),
-            Self::OutOfBounds => write!(f, "Out of bounds"),
-            Self::NotFound => write!(f, "Not found"),
             Self::Overflow => write!(f, "Overflow"),
+            Self::ImageTypeMismatch { specified } => {
+                write!(f, "Image type mismatch: specified = {specified}")
+            }
         }
     }
 }
@@ -64,8 +65,8 @@ impl Display for BlockErrorKind {
 pub enum ErrorOp {
     /// Opening a disk image file.
     Open,
-    /// Detecting the image format.
-    DetectImageType,
+    /// Validating the image format.
+    ValidateImageType,
     /// Duplicating a backing-file descriptor.
     DupBackingFd,
     /// Resizing a disk image.
@@ -76,7 +77,7 @@ impl Display for ErrorOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Open => write!(f, "open"),
-            Self::DetectImageType => write!(f, "detect_image_type"),
+            Self::ValidateImageType => write!(f, "validate_image_type"),
             Self::DupBackingFd => write!(f, "dup_backing_fd"),
             Self::Resize => write!(f, "resize"),
         }
@@ -152,21 +153,6 @@ impl BlockError {
         }
     }
 
-    /// Attach or replace the source error (builder-style).
-    pub fn with_source<E>(mut self, source: E) -> Self
-    where
-        E: StdError + Send + Sync + 'static,
-    {
-        self.source = Some(Box::new(source));
-        self
-    }
-
-    /// Attach diagnostic context.
-    pub fn with_ctx(mut self, ctx: ErrorContext) -> Self {
-        self.ctx = Some(ctx);
-        self
-    }
-
     /// Replace the error classification (builder-style).
     pub fn with_kind(mut self, kind: BlockErrorKind) -> Self {
         self.kind = kind;
@@ -182,12 +168,6 @@ impl BlockError {
     /// Shorthand: attach a file path.
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.ctx.get_or_insert_with(ErrorContext::default).path = Some(path.into());
-        self
-    }
-
-    /// Shorthand: attach a byte offset.
-    pub fn with_offset(mut self, offset: u64) -> Self {
-        self.ctx.get_or_insert_with(ErrorContext::default).offset = Some(offset);
         self
     }
 

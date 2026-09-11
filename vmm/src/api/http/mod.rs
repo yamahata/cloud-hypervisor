@@ -5,16 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fs::{File, OpenOptions};
-use std::os::unix::io::{IntoRawFd, RawFd};
-use std::os::unix::net::UnixListener;
+use std::fs::File;
+use std::os::unix::io::{AsFd, IntoRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::mpsc::Sender;
-use std::{fs, panic, result, thread};
+use std::{panic, result, thread};
 
-use block::fcntl::{LockError, LockGranularity, LockType, try_acquire_lock};
 use log::{error, info};
 use micro_http::{
     Body, HttpServer, MediaType, Method, Request, Response, ServerError, StatusCode, Version,
@@ -22,9 +20,12 @@ use micro_http::{
 use seccompiler::{SeccompAction, apply_filter};
 use serde_json::Error as SerdeError;
 use thiserror::Error;
+use vm_migration::MigratableError;
 use vmm_sys_util::eventfd::EventFd;
 
-use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
+use self::http_endpoint::{
+    VmActionHandler, VmBalloonStats, VmCreate, VmInfo, VmmPing, VmmShutdown,
+};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
 use crate::api::{
@@ -36,6 +37,7 @@ use crate::api::{
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
 use crate::landlock::Landlock;
+use crate::locked_unix_listener::{LockedUnixListener, LockedUnixListenerError};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::{error_chain_messages, flatten_error_chain_to_string};
 use crate::vm::Error as VmError;
@@ -43,7 +45,11 @@ use crate::{Error as VmmError, Result};
 
 pub mod http_endpoint;
 
-pub type HttpApiHandle = (thread::JoinHandle<Result<()>>, EventFd);
+pub type HttpApiHandle = (
+    thread::JoinHandle<Result<()>>,
+    EventFd,
+    Option<LockedUnixListener>,
+);
 
 const HTTP_PAYLOAD_MAX_SIZE: usize = 4 << 20;
 
@@ -90,13 +96,24 @@ impl HttpError {
 
 /// Maps an [`ApiError`] to an HTTP [`StatusCode`].
 fn api_error_status_code(error: &ApiError) -> StatusCode {
-    match error.source().and_then(|e| e.downcast_ref::<VmError>()) {
+    let source = error.source();
+
+    // The migration endpoints report state conflicts with a `MigratableError`,
+    // which the `VmError` downcast below cannot see.
+    if let Some(MigratableError::Conflict(_)) =
+        source.and_then(|e| e.downcast_ref::<MigratableError>())
+    {
+        return StatusCode::Conflict;
+    }
+
+    match source.and_then(|e| e.downcast_ref::<VmError>()) {
         Some(
             VmError::VmNotCreated
             | VmError::VmMissingConfig
             | VmError::NoDeviceToRemove(_)
             | VmError::DeviceManager(DeviceManagerError::UnknownDeviceId(_)),
         ) => StatusCode::NotFound,
+        Some(VmError::VmMigrating | VmError::VmRestoring) => StatusCode::Conflict,
         Some(VmError::ConfigValidation(e)) => match e {
             ValidationError::IdentifierNotUnique(_) | ValidationError::DuplicateDevicePath(_) => {
                 StatusCode::Conflict
@@ -248,6 +265,8 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         endpoint!("/vm.boot"),
         Box::new(VmActionHandler::new(&VmBoot)),
     );
+    r.routes
+        .insert(endpoint!("/vm.balloon-stats"), Box::new(VmBalloonStats {}));
     r.routes.insert(
         endpoint!("/vm.counters"),
         Box::new(VmActionHandler::new(&VmCounters)),
@@ -352,7 +371,7 @@ fn start_http_thread(
     seccomp_action: &SeccompAction,
     exit_evt: EventFd,
     landlock_enable: bool,
-    api_socket_lock: Option<File>,
+    locked_listener: Option<LockedUnixListener>,
 ) -> Result<HttpApiHandle> {
     // Retrieve seccomp filter for API thread
     let api_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::HttpApi, None)
@@ -369,9 +388,6 @@ fn start_http_thread(
     let thread = thread::Builder::new()
         .name("http-server".to_string())
         .spawn(move || {
-            // Keep the API socket lock (if any) alive for the server thread.
-            let _api_socket_lock = api_socket_lock;
-
             // Apply seccomp filter for API thread.
             if !api_seccomp_filter.is_empty() {
                 apply_filter(&api_seccomp_filter)
@@ -428,29 +444,7 @@ fn start_http_thread(
         })
         .map_err(VmmError::HttpThreadSpawn)?;
 
-    Ok((thread, api_shutdown_fd))
-}
-
-/// Acquires an exclusive lock for the socket path.
-///
-/// This prevents opening (and potentially deleting) a socket that is in active
-/// use by another Cloud Hypervisor instance.
-fn acquire_api_socket_lock(socket_path: &Path) -> Result<File> {
-    let mut lock_path = socket_path.to_path_buf().into_os_string();
-    lock_path.push(".lock");
-
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(VmmError::CreateApiServerSocket)?;
-
-    match try_acquire_lock(&lock, LockType::Write, LockGranularity::WholeFile) {
-        Ok(()) => Ok(lock),
-        Err(LockError::AlreadyLocked) => Err(VmmError::ApiSocketInUse(socket_path.to_path_buf())),
-        Err(LockError::Io(e)) => Err(VmmError::CreateApiServerSocket(e)),
-    }
+    Ok((thread, api_shutdown_fd, locked_listener))
 }
 
 pub fn start_http_path_thread(
@@ -463,14 +457,18 @@ pub fn start_http_path_thread(
 ) -> Result<HttpApiHandle> {
     let socket_path = PathBuf::from(path);
 
-    let lock = acquire_api_socket_lock(&socket_path)?;
-    // We hold the lock, so any socket at this path is stale from a crashed
-    // run: remove it before bind. Ignore errors (it is usually not present).
-    let _ = fs::remove_file(&socket_path);
+    let locked_listener = LockedUnixListener::bind(&socket_path).map_err(|e| match e {
+        LockedUnixListenerError::InUse(path) => VmmError::ApiSocketInUse(path),
+        LockedUnixListenerError::Io(e) => VmmError::CreateApiServerSocket(e),
+    })?;
 
-    let socket_fd = UnixListener::bind(socket_path).map_err(VmmError::CreateApiServerSocket)?;
-    // SAFETY: Valid FD just opened
-    let server = unsafe { HttpServer::new_from_fd(socket_fd.into_raw_fd()) }
+    let server_fd = locked_listener
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(VmmError::CreateApiServerSocket)?;
+
+    // SAFETY: Valid FD just duplicated
+    let server = unsafe { HttpServer::new_from_fd(server_fd.into_raw_fd()) }
         .map_err(VmmError::CreateApiServer)?;
 
     start_http_thread(
@@ -480,7 +478,7 @@ pub fn start_http_path_thread(
         seccomp_action,
         exit_evt,
         landlock_enable,
-        Some(lock),
+        Some(locked_listener),
     )
 }
 
@@ -506,7 +504,9 @@ pub fn start_http_fd_thread(
 }
 
 pub fn http_api_graceful_shutdown(http_handle: HttpApiHandle) -> Result<()> {
-    let (api_thread, api_shutdown_fd) = http_handle;
+    // `_locked_listener` is dropped after the join, on a thread allowed to
+    // unlink the socket.
+    let (api_thread, api_shutdown_fd, _locked_listener) = http_handle;
 
     api_shutdown_fd.write(1).unwrap();
     api_thread.join().map_err(VmmError::ThreadCleanup)?
@@ -514,6 +514,10 @@ pub fn http_api_graceful_shutdown(http_handle: HttpApiHandle) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use anyhow::anyhow;
+
     use super::*;
 
     #[test]
@@ -587,9 +591,39 @@ mod tests {
     }
 
     #[test]
+    fn test_state_conflicts_map_to_conflict() {
+        assert_eq!(
+            api_error_status_code(&ApiError::VmmShutdown(VmError::VmMigrating)),
+            StatusCode::Conflict
+        );
+        assert_eq!(
+            api_error_status_code(&ApiError::VmAddNet(VmError::VmMigrating)),
+            StatusCode::Conflict
+        );
+        assert_eq!(
+            api_error_status_code(&ApiError::VmSnapshot(VmError::VmRestoring)),
+            StatusCode::Conflict
+        );
+        assert_eq!(
+            api_error_status_code(&ApiError::VmSendMigration(MigratableError::Conflict(
+                anyhow!("A migration is already in progress")
+            ))),
+            StatusCode::Conflict
+        );
+        assert_eq!(
+            api_error_status_code(&ApiError::VmReceiveMigration(MigratableError::Conflict(
+                anyhow!("A VM already exists on this VMM")
+            ))),
+            StatusCode::Conflict
+        );
+    }
+
+    #[test]
     fn test_other_errors_map_to_internal_server_error() {
         assert_eq!(
-            api_error_status_code(&ApiError::VmRemoveDevice(VmError::VmMigrating)),
+            api_error_status_code(&ApiError::VmBoot(VmError::EventFdClone(io::Error::other(
+                "test"
+            )))),
             StatusCode::InternalServerError
         );
     }

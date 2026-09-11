@@ -61,24 +61,14 @@ pub enum Error {
     BindSocket(#[source] io::Error),
     #[error("Creating eventfd failed")]
     CreateEventFd(#[source] io::Error),
-    #[error("Cloning kill eventfd failed")]
-    CloneKillEventFd(#[source] io::Error),
     #[error("Invalid descriptor table address")]
     DescriptorTableAddress,
     #[error("Signal used queue failed")]
     FailedSignalingUsedQueue(#[source] io::Error),
-    #[error("Failed to read vhost eventfd")]
-    MemoryRegions(#[source] MmapError),
     #[error("Failed removing socket path")]
     RemoveSocketPath(#[source] io::Error),
-    #[error("Failed to create frontend")]
-    VhostUserCreateFrontend(#[source] VhostError),
-    #[error("Failed to open vhost device")]
-    VhostUserOpen(#[source] VhostError),
     #[error("Connection to socket failed")]
     VhostUserConnect(#[source] VhostError),
-    #[error("Backend disconnected for socket {0}")]
-    BackendDisconnected(String),
     #[error("Get features failed")]
     VhostUserGetFeatures(#[source] VhostError),
     #[error("Get queue max number failed")]
@@ -87,12 +77,8 @@ pub enum Error {
     VhostUserGetProtocolFeatures(#[source] VhostError),
     #[error("Get vring base failed")]
     VhostUserGetVringBase(#[source] VhostError),
-    #[error("Vhost-user Backend not support vhost-user protocol")]
-    VhostUserProtocolNotSupport,
     #[error("Set owner failed")]
     VhostUserSetOwner(#[source] VhostError),
-    #[error("Reset owner failed")]
-    VhostUserResetOwner(#[source] VhostError),
     #[error("Set features failed")]
     VhostUserSetFeatures(#[source] VhostError),
     #[error("Set protocol features failed")]
@@ -111,10 +97,6 @@ pub enum Error {
     VhostUserSetVringKick(#[source] VhostError),
     #[error("Set vring enable failed")]
     VhostUserSetVringEnable(#[source] VhostError),
-    #[error("Failed to create vhost eventfd")]
-    VhostIrqCreate(#[source] io::Error),
-    #[error("Failed to read vhost eventfd")]
-    VhostIrqRead(#[source] io::Error),
     #[error("Failed to read vhost eventfd")]
     VhostUserMemoryRegion(#[source] MmapError),
     #[error("Failed to create the frontend request handler from backend")]
@@ -135,12 +117,8 @@ pub enum Error {
     VhostUserSetLogBase(#[source] VhostError),
     #[error("Invalid used address")]
     UsedAddress,
-    #[error("Invalid features provided from vhost-user backend")]
-    InvalidFeatures,
     #[error("Missing file descriptor for the region")]
     MissingRegionFd,
-    #[error("Missing IrqFd")]
-    MissingIrqFd,
     #[error("Failed getting the available index")]
     GetAvailableIndex(#[source] QueueError),
     #[error("Failed getting the used index")]
@@ -221,15 +199,12 @@ fn vhost_error_is_transport_lost(error: &VhostError) -> bool {
 impl Error {
     fn is_transport_lost(&self) -> bool {
         match self {
-            Error::VhostUserConnect(_) | Error::BackendDisconnected(_) => true,
-            Error::VhostUserCreateFrontend(e)
-            | Error::VhostUserOpen(e)
-            | Error::VhostUserGetFeatures(e)
+            Error::VhostUserConnect(_) => true,
+            Error::VhostUserGetFeatures(e)
             | Error::VhostUserGetQueueMaxNum(e)
             | Error::VhostUserGetProtocolFeatures(e)
             | Error::VhostUserGetVringBase(e)
             | Error::VhostUserSetOwner(e)
-            | Error::VhostUserResetOwner(e)
             | Error::VhostUserSetFeatures(e)
             | Error::VhostUserSetProtocolFeatures(e)
             | Error::VhostUserSetMemTable(e)
@@ -804,7 +779,7 @@ impl VhostUserCommon {
         let snapshot = Snapshot::new_from_state(state)?;
 
         if self.migration_started {
-            // Local migration does not enable dirty logging.
+            // Precopy migration may enable dirty logging.
             if self.dirty_logging {
                 self.saved_dirty_log = Some(self.dirty_log()?);
             }
@@ -896,7 +871,7 @@ impl VhostUserCommon {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;

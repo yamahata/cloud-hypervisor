@@ -5,13 +5,14 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
+use std::fs::read_to_string;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use byteorder::{ByteOrder, LittleEndian};
@@ -98,6 +99,8 @@ pub enum VfioPciError {
     RetrievePciConfigurationState(#[source] anyhow::Error),
     #[error("Failed to retrieve VfioCommonState")]
     RetrieveVfioCommonState(#[source] anyhow::Error),
+    #[error("Failed to read the BAR addresses of the device that needs fixed BARs: {0}")]
+    DiscoverFixedBars(PathBuf),
     #[error("Failed to restore VFIO migration state")]
     RestoreMigration(#[source] anyhow::Error),
 }
@@ -291,7 +294,7 @@ impl Interrupt {
 }
 
 #[derive(Clone)]
-pub struct UserMemoryRegion {
+pub(crate) struct UserMemoryRegion {
     pub slot: u32,
     pub start: u64,
     pub mapping: Arc<MmapRegion>,
@@ -666,6 +669,50 @@ pub(crate) struct ConfigPatch {
     patch: u32,
 }
 
+const NVIDIA_VENDOR_ID: u64 = 0x10de;
+const NVIDIA_COHERENT_DEVICE_IDS: [u64; 2] = [0x2941, 0x31c2];
+const IORESOURCE_PREFETCH: u64 = 0x2000;
+
+type FixedBarAddrs = [Option<GuestAddress>; VFIO_PCI_CONFIG_REGION_INDEX as usize];
+
+fn discover_fixed_bars(
+    device_path: Option<&Path>,
+) -> Result<Option<Box<FixedBarAddrs>>, VfioPciError> {
+    let Some(device_path) = device_path else {
+        return Ok(None);
+    };
+
+    let parse_hex = |value: &str| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok();
+    let read_hex = |name: &str| -> Option<u64> {
+        parse_hex(read_to_string(device_path.join(name)).ok()?.trim())
+    };
+
+    if read_hex("vendor") != Some(NVIDIA_VENDOR_ID)
+        || !read_hex("device").is_some_and(|id| NVIDIA_COHERENT_DEVICE_IDS.contains(&id))
+    {
+        return Ok(None);
+    }
+
+    let mut addrs: FixedBarAddrs = [None; VFIO_PCI_CONFIG_REGION_INDEX as usize];
+
+    // Line N is "<start> <end> <flags>" in hex for BAR N.
+    let resource = read_to_string(device_path.join("resource"))
+        .map_err(|_| VfioPciError::DiscoverFixedBars(device_path.to_path_buf()))?;
+    for (bar_id, line) in resource.lines().enumerate().take(addrs.len()) {
+        let mut fields = line.split_whitespace();
+
+        if let Some(base) = fields.next().and_then(parse_hex)
+            && let Some(flags) = fields.nth(1).and_then(parse_hex)
+            && base != 0
+            && flags & IORESOURCE_PREFETCH != 0
+        {
+            addrs[bar_id] = Some(GuestAddress(base));
+        }
+    }
+
+    Ok(Some(Box::new(addrs)))
+}
+
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
     pub(crate) mmio_regions: Vec<MmioRegion>,
@@ -676,6 +723,7 @@ pub(crate) struct VfioCommon {
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
+    fixed_bar_addrs: Option<Box<FixedBarAddrs>>,
     pub(crate) migration_flags: Option<u64>,
     // Negotiated dirty bitmap granularity while DMA logging is active.
     dma_logging_page_size: Option<u64>,
@@ -685,6 +733,7 @@ pub(crate) struct VfioCommon {
 pub(crate) struct VfioCommonConfig {
     pub(crate) x_nv_gpudirect_clique: Option<u8>,
     pub(crate) x_exclude_mmap_bars: Vec<u8>,
+    pub(crate) device_path: Option<PathBuf>,
 }
 
 impl VfioCommon {
@@ -753,6 +802,7 @@ impl VfioCommon {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
+            fixed_bar_addrs: discover_fixed_bars(config.device_path.as_deref())?,
             migration_flags,
             dma_logging_page_size: None,
         };
@@ -974,16 +1024,19 @@ impl VfioCommon {
                     // We need do some fixup to keep MMIO RW region and msix cap region page size
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
+                    let align = cmp::max(
+                        // SAFETY: FFI call. Trivially safe.
+                        unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
+                        region_size,
+                    );
+
+                    let requested_addr = restored_bar_addr.or(self
+                        .fixed_bar_addrs
+                        .as_ref()
+                        .and_then(|addrs| addrs[bar_id as usize]));
+
                     mmio64_allocator
-                        .allocate(
-                            restored_bar_addr,
-                            region_size,
-                            Some(cmp::max(
-                                // SAFETY: FFI call. Trivially safe.
-                                unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
-                                region_size,
-                            )),
-                        )
+                        .allocate(requested_addr, region_size, Some(align))
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
             };
@@ -1683,7 +1736,8 @@ impl VfioCommon {
                 ))
             })?;
             self.load_migration_data(&blob)
-                .map_err(|e| VfioPciError::RestoreMigration(anyhow!("{e}")))?;
+                .context("Failed to load migration data for restoring VFIO device")
+                .map_err(VfioPciError::RestoreMigration)?;
         }
 
         self.sync_command_and_interrupts()?;
@@ -1720,7 +1774,7 @@ impl VfioCommon {
         debug!("VFIO migration transition -> {target:?}");
         self.vfio_wrapper
             .set_migration_state(target)
-            .map_err(|e| anyhow!("VFIO set_migration_state({target:?}) failed: {e}"))
+            .with_context(|| format!("VFIO set_migration_state({target:?}) failed"))
     }
 
     fn reset_and_rearm(&self) {
@@ -1772,9 +1826,9 @@ impl VfioCommon {
             .transition_migration_state_with_recovery(VfioMigrationState::Stop, None)
             .map_err(MigratableError::Snapshot);
 
-        let data = data.map_err(|e| {
-            MigratableError::Snapshot(anyhow!("VFIO migration data read failed: {e}"))
-        })?;
+        let data = data
+            .context("VFIO migration data read failed")
+            .map_err(MigratableError::Snapshot)?;
         stop?;
         Ok(data)
     }
@@ -1791,9 +1845,9 @@ impl VfioCommon {
         // only allows aborting with a reset, so reset directly.
         if let Err(e) = self.vfio_wrapper.write_migration_data(data) {
             self.reset_and_rearm();
-            return Err(MigratableError::Restore(anyhow!(
-                "VFIO migration data write failed: {e}"
-            )));
+            return Err(MigratableError::Restore(
+                anyhow::Error::new(e).context("VFIO migration data write failed"),
+            ));
         }
         Ok(())
     }
@@ -1811,7 +1865,8 @@ impl VfioCommon {
         let negotiated = self
             .vfio_wrapper
             .start_dma_logging(page_size, ranges)
-            .map_err(|e| MigratableError::StartDirtyLog(anyhow!("VFIO start_dma_logging: {e}")))?;
+            .context("VFIO start_dma_logging failed")
+            .map_err(MigratableError::StartDirtyLog)?;
         debug!(
             "VFIO DMA logging started over {} range(s), requested page size {page_size:#x}, device granularity {negotiated:#x}",
             ranges.len()
@@ -1826,7 +1881,8 @@ impl VfioCommon {
         }
         self.vfio_wrapper
             .stop_dma_logging()
-            .map_err(|e| MigratableError::StopDirtyLog(anyhow!("VFIO stop_dma_logging: {e}")))
+            .context("VFIO stop_dma_logging failed")
+            .map_err(MigratableError::StopDirtyLog)
     }
 
     // Reports per range dirty bitmaps from the kernel, merged into a single
@@ -1844,7 +1900,8 @@ impl VfioCommon {
             let table = self
                 .vfio_wrapper
                 .report_dma_logging(*range, page_size)
-                .map_err(|e| MigratableError::DirtyLog(anyhow!("VFIO report_dma_logging: {e}")))?;
+                .context("VFIO report_dma_logging failed")
+                .map_err(MigratableError::DirtyLog)?;
             tables.push(table);
         }
         Ok(MemoryRangeTable::new_from_tables(tables))
@@ -1948,6 +2005,7 @@ impl VfioPciDevice {
             VfioCommonConfig {
                 x_nv_gpudirect_clique,
                 x_exclude_mmap_bars,
+                device_path: Some(device_path.clone()),
             },
         )?;
 
@@ -2206,6 +2264,7 @@ impl VfioPciDevice {
                             user_memory_region.mapping.addr(),
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(VfioPciError::CreateUserMemoryRegion)?;
@@ -2266,7 +2325,6 @@ impl VfioPciDevice {
                         user_memory_region.start,
                         len,
                         host_addr,
-                        false,
                         false,
                     )
                 } {
@@ -2406,9 +2464,10 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
         for region in self.common.mmio_regions.iter_mut() {
-            if region.start.raw_value() == old_base {
+            if region.index as usize == bar_idx {
+                let old_base = region.start.raw_value();
                 region.start = GuestAddress(new_base);
 
                 for user_memory_region in region.user_memory_regions.iter_mut() {
@@ -2442,7 +2501,6 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                             len,
                             host_addr,
                             false,
-                            false,
                         )
                     }
                     .map_err(io::Error::other)?;
@@ -2466,6 +2524,7 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                             host_addr,
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(io::Error::other)?;
@@ -2673,9 +2732,11 @@ where
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::env::temp_dir;
     use std::os::fd::AsFd;
+    use std::sync::Mutex;
+    use std::{env, fs, process};
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -2746,13 +2807,6 @@ mod unit_tests {
             .find_user_address(guest_addr, page_size)
             .unwrap_err();
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
 
     // Trait default behavior and state enum round trip.
 
@@ -3002,9 +3056,58 @@ mod tests {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
+            fixed_bar_addrs: None,
             migration_flags,
             dma_logging_page_size: None,
         }
+    }
+
+    #[test]
+    fn discover_fixed_bars_detects_gb_gpus() {
+        assert!(discover_fixed_bars(None).unwrap().is_none());
+
+        let dir = env::temp_dir().join(format!("ch-idbar-test-{}", process::id()));
+        let _ = fs::create_dir_all(&dir);
+        assert!(discover_fixed_bars(Some(&dir)).unwrap().is_none());
+
+        fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+        fs::write(dir.join("device"), "0x1234\n").unwrap();
+        assert!(discover_fixed_bars(Some(&dir)).unwrap().is_none());
+
+        fs::write(dir.join("vendor"), "0x8086\n").unwrap();
+        fs::write(dir.join("device"), "0x2941\n").unwrap();
+        assert!(discover_fixed_bars(Some(&dir)).unwrap().is_none());
+
+        fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+        let err = discover_fixed_bars(Some(&dir)).unwrap_err();
+        assert!(matches!(err, VfioPciError::DiscoverFixedBars(_)));
+
+        fs::write(
+            dir.join("resource"),
+            "0x0000600000000000 0x0000600001ffffff 0x0000000000140204\n\
+             0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
+             0x0000663ffc000000 0x0000663fffffffff 0x000000000014220c\n\
+             0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
+             0x0000664000000000 0x0000667fffffffff 0x000000000014220c\n",
+        )
+        .unwrap();
+        let addrs = discover_fixed_bars(Some(&dir)).unwrap().unwrap();
+        assert_eq!(addrs.iter().flatten().count(), 2);
+        assert!(addrs[0].is_none());
+        assert_eq!(addrs[2], Some(GuestAddress(0x0000_663f_fc00_0000)));
+        assert_eq!(addrs[4], Some(GuestAddress(0x0000_6640_0000_0000)));
+
+        fs::write(dir.join("device"), "0x31c2\n").unwrap();
+        assert_eq!(
+            discover_fixed_bars(Some(&dir))
+                .unwrap()
+                .unwrap()
+                .iter()
+                .flatten()
+                .count(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

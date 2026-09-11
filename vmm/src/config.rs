@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use arch::CpuProfile;
 use block::ImageType;
 use clap::ArgMatches;
+use libc::CPU_SETSIZE;
 use log::{debug, warn};
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple, TupleList,
@@ -66,15 +67,9 @@ pub enum Error {
     /// Generic vhost-user socket is missing
     #[error("Error parsing --generic-vhost-user: socket missing")]
     ParseGenericVhostUserSockMissing,
-    /// Generic vhost-user number of queues is missing
-    #[error("Error parsing --generic-vhost-user: number of queues missing")]
-    ParseGenericVhostUserNumResponseQueuesMissing,
     /// Generic vhost-user device type is missing
     #[error("Error parsing --generic-vhost-user: device_type missing")]
     ParseGenericVhostUserVirtioIdMissing,
-    /// Generic vhost-user available features is missing
-    #[error("Error parsing --generic-vhost-user: available features missing")]
-    ParseGenericVhostUserAvailFeaturesMissing,
     /// Generic vhost-user queue size missing
     #[error("Error parsing --generic-vhost-user: queue size missing")]
     ParseGenericVhostUserQueueSizeMissing,
@@ -138,10 +133,6 @@ pub enum Error {
     /// Failed parsing serial parameters
     #[error("Error parsing --serial")]
     ParseSerial(#[source] OptionParserError),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed parsing debug-console
-    #[error("Error parsing --debug-console")]
-    ParseDebugConsole(#[source] OptionParserError),
     /// No mode given for console
     #[error("Error parsing --console: invalid console mode given")]
     ParseConsoleInvalidModeGiven,
@@ -160,18 +151,6 @@ pub enum Error {
     /// Failed validating configuration
     #[error("Error validating configuration")]
     Validation(#[source] ValidationError),
-    #[cfg(feature = "sev_snp")]
-    #[error("Error parsing --sev_snp")]
-    /// Failed parsing SEV-SNP config
-    ParseSevSnp(#[source] OptionParserError),
-    #[cfg(feature = "tdx")]
-    #[error("Error parsing --tdx")]
-    /// Failed parsing TDX config
-    ParseTdx(#[source] OptionParserError),
-    #[cfg(feature = "tdx")]
-    #[error("TDX firmware missing")]
-    /// No TDX firmware
-    FirmwarePathMissing,
     /// Failed parsing userspace device
     #[error("Error parsing --user-device")]
     ParseUserDevice(#[source] OptionParserError),
@@ -226,31 +205,30 @@ pub enum ValidationError {
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
+    /// Socket path given without socket console mode
+    #[error("Path only valid when using socket console mode")]
+    ConsoleSocketPathUnexpected,
     /// Max is less than boot
     #[error("Max CPUs ({0}) lower than boot CPUs ({1})")]
     CpusMaxLowerThanBoot(u32 /* max vCPUs */, u32 /* boot vCPUs */),
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
-    /// Missing file value for debug-console
-    #[cfg(target_arch = "x86_64")]
-    #[error("Path missing when using file mode for debug console")]
-    DebugconFileMissing,
+    /// Requested CPU affinity matches or exceeds `CPU_SETSIZE`.
+    #[error("Requested CPU affinity {0} must be below {CPU_SETSIZE}")]
+    CpuAffinityExceedsMax(usize /* specified affinity */),
     /// Both socket and path specified
     #[error("Disk path and vhost socket both provided")]
     DiskSocketAndPath,
+    /// No image type specified for virtio-block
+    #[error("Image type required for disk")]
+    ImageTypeRequired,
     /// Using vhost user requires shared memory
     #[error("Using vhost-user requires using shared memory or huge pages")]
     VhostUserRequiresSharedMemory,
     /// No socket provided for vhost_use
     #[error("No socket provided when using vhost-user")]
     VhostUserMissingSocket,
-    /// Trying to use IOMMU without PCI
-    #[error("Using an IOMMU without PCI support is unsupported")]
-    IommuUnsupported,
-    /// Trying to use VFIO without PCI
-    #[error("Using VFIO without PCI support is unsupported")]
-    VfioUnsupported,
     /// CPU topology count doesn't match max
     #[error("Product of CPU topology parts does not match maximum vCPU")]
     CpuTopologyCount,
@@ -299,6 +277,9 @@ pub enum ValidationError {
     /// Block queue size too small to advertise a usable seg_max
     #[error("Block queue size must be greater than {MINIMUM_BLOCK_QUEUE_SIZE}: {0}")]
     BlockQueueSizeTooSmall(u16),
+    /// Disk guest_block_size is not a power of 2 within the supported range
+    #[error("Disk guest_block_size must be a power of 2 between 512 and 65536: {0}")]
+    InvalidGuestBlockSize(u32),
     /// Need shared memory for vfio-user
     #[error("Using user devices requires using shared memory or huge pages")]
     UserDevicesRequireSharedMemory,
@@ -374,6 +355,9 @@ pub enum ValidationError {
     /// Rate limiting is not supported with vhost-user
     #[error("Rate limiting is not supported with vhost-user")]
     VhostUserRateLimiterNotSupported,
+    /// The vhost-user backend provides the virtio config space
+    #[error("guest_block_size is not supported with vhost-user")]
+    VhostUserGuestBlockSizeNotSupported,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -384,6 +368,22 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("SEV-SNP requires an IGVM payload (--payload igvm=<path>)")]
     SevSnpRequiresIgvm,
+    /// Memory hotplug is not supported with SEV-SNP
+    #[cfg(feature = "sev_snp")]
+    #[error("Memory hotplug is not supported with SEV-SNP")]
+    SevSnpNoMemoryHotplug,
+    /// CPU hotplug is not supported with SEV-SNP
+    #[cfg(feature = "sev_snp")]
+    #[error("CPU hotplug is not supported with SEV-SNP")]
+    SevSnpNoCpuHotplug,
+    /// Huge pages are not supported with SEV-SNP
+    #[cfg(feature = "sev_snp")]
+    #[error("Huge pages are not supported with SEV-SNP")]
+    SevSnpNoHugePages,
+    /// A virtual IOMMU is not supported with SEV-SNP
+    #[cfg(feature = "sev_snp")]
+    #[error("Virtual IOMMU is not supported with SEV-SNP")]
+    SevSnpNoViommu,
     /// Restore expects all net ids that have fds
     #[error("Net id {0} is associated with FDs and is required")]
     RestoreMissingRequiredNetId(String),
@@ -396,8 +396,8 @@ pub enum ValidationError {
     /// A device saved with an FD has no replacement FD for the restore
     #[error("VFIO device '{0}' was FD backed and needs a new fd in 'vfio_fds'")]
     RestoreMissingVfioFd(String),
-    /// Prefault cannot be combined with on-demand restore
-    #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
+    /// Prefault requires the eager-copy restore mode
+    #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
@@ -1153,8 +1153,7 @@ impl MemoryConfig {
         let reserve = parser
             .convert::<Toggle>("reserve")
             .map_err(Error::ParseMemory)?
-            .unwrap_or(Toggle(false))
-            .0;
+            .map(|t| t.0);
         let thp = parser
             .convert::<Toggle>("thp")
             .map_err(Error::ParseMemory)?
@@ -1221,8 +1220,7 @@ impl MemoryConfig {
                 let reserve = parser
                     .convert::<Toggle>("reserve")
                     .map_err(Error::ParseMemoryZone)?
-                    .unwrap_or(Toggle(false))
-                    .0;
+                    .map(|t| t.0);
                 let mergeable = parser
                     .convert::<Toggle>("mergeable")
                     .map_err(Error::ParseMemoryZone)?
@@ -1284,6 +1282,26 @@ impl MemoryConfig {
                 .flatten()
                 .filter_map(|zone| zone.hotplugged_size)
                 .sum::<u64>()
+    }
+
+    pub fn hotplug_size(&self) -> u64 {
+        self.hotplug_size.unwrap_or(0)
+            + self
+                .zones
+                .iter()
+                .flatten()
+                .filter_map(|zone| zone.hotplug_size)
+                .sum::<u64>()
+    }
+
+    pub fn hugepages_enabled(&self) -> bool {
+        self.hugepages
+            || self.hugepage_size.is_some()
+            || self
+                .zones
+                .iter()
+                .flatten()
+                .any(|zone| zone.hugepages || zone.hugepage_size.is_some())
     }
 }
 
@@ -1448,7 +1466,8 @@ impl DiskConfig {
          rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full";
+         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
+         guest_block_size=<size_in_bytes>";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1475,6 +1494,7 @@ impl DiskConfig {
             .add("sparse")
             .add("image_type")
             .add("lock_granularity")
+            .add("guest_block_size")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1572,6 +1592,10 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or_default();
 
+        let guest_block_size = parser
+            .convert::<u32>("guest_block_size")
+            .map_err(Error::ParseDisk)?;
+
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
                 size: bw_size,
@@ -1625,6 +1649,7 @@ impl DiskConfig {
             sparse,
             image_type,
             lock_granularity,
+            guest_block_size,
         })
     }
 
@@ -1656,6 +1681,10 @@ impl DiskConfig {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
         }
 
+        if self.vhost_user && self.guest_block_size.is_some() {
+            return Err(ValidationError::VhostUserGuestBlockSizeNotSupported);
+        }
+
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
@@ -1668,6 +1697,16 @@ impl DiskConfig {
                 serial.len(),
                 VIRTIO_BLK_ID_BYTES as usize,
             ));
+        }
+
+        if !self.vhost_user && self.image_type == ImageType::Unknown {
+            return Err(ValidationError::ImageTypeRequired);
+        }
+
+        if let Some(guest_block_size) = self.guest_block_size
+            && (!guest_block_size.is_power_of_two() || !(512..=65536).contains(&guest_block_size))
+        {
+            return Err(ValidationError::InvalidGuestBlockSize(guest_block_size));
         }
 
         Ok(())
@@ -2372,6 +2411,16 @@ impl CommonConsoleConfig {
 
         Ok(Self { mode, file, socket })
     }
+
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.mode == ConsoleOutputMode::Socket && self.socket.is_none() {
+            return Err(ValidationError::ConsoleSocketPathMissing);
+        }
+        if self.socket.is_some() && self.mode != ConsoleOutputMode::Socket {
+            return Err(ValidationError::ConsoleSocketPathUnexpected);
+        }
+        Ok(())
+    }
 }
 
 impl ConsoleConfig {
@@ -2390,6 +2439,7 @@ impl ConsoleConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        self.common.validate()?;
         self.pci_common.validate(vm_config)
     }
 }
@@ -2404,6 +2454,10 @@ impl SerialConfig {
 
         let common = CommonConsoleConfig::parse(serial, Error::ParseSerial)?;
         Ok(Self { common })
+    }
+
+    pub fn validate(&self) -> ValidationResult<()> {
+        self.common.validate()
     }
 }
 
@@ -2791,6 +2845,9 @@ pub enum MemoryRestoreMode {
     Copy,
     /// Restore lazily by faulting snapshot pages into guest RAM on demand.
     OnDemand,
+    /// Restore by mapping the snapshot memory file copy-on-write, sharing the
+    /// page cache across VMs restored from the same snapshot.
+    CopyOnWrite,
 }
 
 #[derive(Debug, Error)]
@@ -2806,6 +2863,7 @@ impl FromStr for MemoryRestoreMode {
         match s.to_lowercase().as_str() {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
+            "copyonwrite" => Ok(Self::CopyOnWrite),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
     }
@@ -2862,13 +2920,13 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
         zone_updates=<list_of_updates>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
-        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
@@ -2965,7 +3023,7 @@ impl RestoreConfig {
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
+        if self.memory_restore_mode != MemoryRestoreMode::Copy && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
@@ -3259,6 +3317,18 @@ impl VmConfig {
                 {
                     return Err(ValidationError::SevSnpRequiresIgvm);
                 }
+
+                if self.memory.hotplug_size() > 0 || self.memory.hotplugged_size() > 0 {
+                    return Err(ValidationError::SevSnpNoMemoryHotplug);
+                }
+
+                if self.cpus.max_vcpus != self.cpus.boot_vcpus {
+                    return Err(ValidationError::SevSnpNoCpuHotplug);
+                }
+
+                if self.memory.hugepages_enabled() {
+                    return Err(ValidationError::SevSnpNoHugePages);
+                }
             }
         }
         // The 'conflict' check is introduced in commit 24438e0390d3
@@ -3309,6 +3379,14 @@ impl VmConfig {
             //
             // Now the limit is lifted on x86_64 targets. Other targests/archs: TBD.
             return Err(ValidationError::TooManyCpus(self.cpus.max_vcpus));
+        }
+
+        if let Some(affinity) = &self.cpus.affinity {
+            for affinity in affinity.iter().flat_map(|affinity| &affinity.host_cpus) {
+                if *affinity >= CPU_SETSIZE as usize {
+                    return Err(ValidationError::CpuAffinityExceedsMax(*affinity));
+                }
+            }
         }
 
         if let Some(rate_limit_groups) = &self.rate_limit_groups {
@@ -3417,6 +3495,8 @@ impl VmConfig {
         self.console.validate(self)?;
         Self::validate_identifier(&mut id_list, &self.console.pci_common.id)?;
         self.iommu |= self.console.pci_common.iommu;
+
+        self.serial.validate()?;
 
         if let Some(t) = &self.cpus.topology {
             if t.threads_per_core == 0
@@ -3610,6 +3690,12 @@ impl VmConfig {
             .as_ref()
             .map(|p| p.iommu_segments.is_some())
             .unwrap_or_default();
+
+        // Checked after self.iommu changes, so it sees devices and iommu_segments
+        #[cfg(feature = "sev_snp")]
+        if self.iommu && self.platform.as_ref().is_some_and(|p| p.sev_snp) {
+            return Err(ValidationError::SevSnpNoViommu);
+        }
 
         if let Some(landlock_rules) = &self.landlock_rules {
             for landlock_rule in landlock_rules {
@@ -4017,7 +4103,7 @@ impl Drop for VmConfig {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
 
@@ -4215,7 +4301,7 @@ mod unit_tests {
                 zones: Some(vec![MemoryZoneConfig {
                     id: "mem0".to_string(),
                     size: 1 << 30,
-                    reserve: true,
+                    reserve: Some(true),
                     ..Default::default()
                 }]),
                 ..Default::default()
@@ -4291,7 +4377,7 @@ mod unit_tests {
             MemoryConfig {
                 size: 1 << 30,
                 hugepages: true,
-                reserve: true,
+                reserve: Some(true),
                 ..Default::default()
             }
         );
@@ -4391,6 +4477,14 @@ mod unit_tests {
             sparse: true,
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
+            guest_block_size: None,
+        }
+    }
+
+    fn raw_disk_fixture() -> DiskConfig {
+        DiskConfig {
+            image_type: ImageType::Raw,
+            ..disk_fixture()
         }
     }
 
@@ -4512,6 +4606,14 @@ mod unit_tests {
                 ..disk_fixture()
             }
         );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,guest_block_size=4096")?,
+            DiskConfig {
+                guest_block_size: Some(4096),
+                ..disk_fixture()
+            }
+        );
+        DiskConfig::parse("path=/path/to_file,guest_block_size=abc").unwrap_err();
         Ok(())
     }
 
@@ -5609,6 +5711,21 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config_zone_updates.validate(&snapshot_vm_config),
             Err(ValidationError::MemoryZoneUpdatesEmptyId)
         );
+
+        let invalid_cow_prefault = RestoreConfig {
+            source_url: PathBuf::from("/path/to/snapshot"),
+            prefault: true,
+            memory_restore_mode: MemoryRestoreMode::CopyOnWrite,
+            net_fds: None,
+            vfio_fds: None,
+            iommufd_fd: None,
+            resume: false,
+            zone_updates: vec![],
+        };
+        assert_eq!(
+            invalid_cow_prefault.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+        );
     }
 
     #[test]
@@ -5794,7 +5911,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 hugepages: false,
                 hugepage_size: None,
                 prefault: false,
-                reserve: false,
+                reserve: None,
                 zones: None,
                 thp: true,
             },
@@ -5866,6 +5983,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         valid_config.validate().unwrap();
 
         let mut invalid_config = valid_config.clone();
+        invalid_config.disks = Some(vec![DiskConfig {
+            image_type: ImageType::Unknown,
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ImageTypeRequired)
+        );
+
+        let mut invalid_config = valid_config.clone();
         invalid_config.serial.common.mode = ConsoleOutputMode::Tty;
         invalid_config.console.common.mode = ConsoleOutputMode::Tty;
         valid_config.validate().unwrap();
@@ -5912,6 +6039,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.serial.common.mode = ConsoleOutputMode::Socket;
+        invalid_config.serial.common.socket = None;
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ConsoleSocketPathMissing)
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
+        invalid_config.console.common.socket = Some(PathBuf::from("/tmp/console.sock"));
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ConsoleSocketPathUnexpected)
         );
 
         let mut invalid_config = valid_config.clone();
@@ -5976,10 +6119,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }
 
         let mut invalid_config = valid_config.clone();
+        invalid_config.cpus.affinity = Some(Box::new([CpuAffinity {
+            vcpu: 0,
+            host_cpus: Box::new([1024]),
+        }]));
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::CpuAffinityExceedsMax(1024))
+        );
+
+        let mut invalid_config = valid_config.clone();
         invalid_config.disks = Some(vec![DiskConfig {
             vhost_socket: Some("/path/to/sock".to_owned()),
             path: Some(PathBuf::from("/path/to/image")),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6020,11 +6173,27 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         still_valid_config.memory.shared = true;
         still_valid_config.validate().unwrap();
 
+        // guest_block_size cannot take effect when the vhost-user backend
+        // provides the virtio config space.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            guest_block_size: Some(4096),
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserGuestBlockSizeNotSupported)
+        );
+
         // A block queue size that is not a power of 2 is rejected.
         let mut invalid_config = valid_config.clone();
         invalid_config.disks = Some(vec![DiskConfig {
             queue_size: 100,
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6036,7 +6205,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.disks = Some(vec![DiskConfig {
             queue_size: MINIMUM_BLOCK_QUEUE_SIZE,
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6044,6 +6213,55 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 MINIMUM_BLOCK_QUEUE_SIZE
             ))
         );
+
+        // A disk logical block size that is not a power of 2 is rejected.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.disks = Some(vec![DiskConfig {
+            guest_block_size: Some(1000),
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidGuestBlockSize(1000))
+        );
+
+        // A disk logical block size below 512 is rejected.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.disks = Some(vec![DiskConfig {
+            guest_block_size: Some(256),
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidGuestBlockSize(256))
+        );
+
+        // A disk logical block size above the 64KiB limit is rejected.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.disks = Some(vec![DiskConfig {
+            guest_block_size: Some(131072),
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidGuestBlockSize(131072))
+        );
+
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.disks = Some(vec![DiskConfig {
+            guest_block_size: Some(4096),
+            ..raw_disk_fixture()
+        }]);
+        still_valid_config.validate().unwrap();
+
+        // The override is backend agnostic and accepted for non raw images.
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.disks = Some(vec![DiskConfig {
+            image_type: ImageType::Qcow2,
+            guest_block_size: Some(4096),
+            ..disk_fixture()
+        }]);
+        still_valid_config.validate().unwrap();
 
         // A net queue size that is not a power of 2 is rejected.
         let mut invalid_config = valid_config.clone();
@@ -6325,7 +6543,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 pci_segment: 1,
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         still_valid_config.validate().unwrap();
 
@@ -6401,7 +6619,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 pci_segment: 1,
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6621,7 +6839,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_config = valid_config.clone();
         invalid_config.disks = Some(vec![DiskConfig {
             rate_limit_group: Some("foo".into()),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6632,7 +6850,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut valid_serial_config = valid_config.clone();
         valid_serial_config.disks = Some(vec![DiskConfig {
             serial: Some("valid_serial".to_string()),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         valid_serial_config.validate().unwrap();
 
@@ -6640,7 +6858,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut empty_serial_config = valid_config.clone();
         empty_serial_config.disks = Some(vec![DiskConfig {
             serial: Some(String::new()),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         empty_serial_config.validate().unwrap();
 
@@ -6648,7 +6866,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut none_serial_config = valid_config.clone();
         none_serial_config.disks = Some(vec![DiskConfig {
             serial: None,
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         none_serial_config.validate().unwrap();
 
@@ -6657,7 +6875,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut max_serial_config = valid_config.clone();
         max_serial_config.disks = Some(vec![DiskConfig {
             serial: Some(max_serial),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         max_serial_config.validate().unwrap();
 
@@ -6666,7 +6884,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut invalid_serial_config = valid_config.clone();
         invalid_serial_config.disks = Some(vec![DiskConfig {
             serial: Some(long_serial.clone()),
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_serial_config.validate(),
@@ -6819,6 +7037,82 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 fw_cfg_config: None,
             });
             config_with_invalid_host_data.validate().unwrap_err();
+
+            let payload = sev_snp_config.payload.as_mut().unwrap();
+            payload.kernel = None;
+            payload.igvm = Some(PathBuf::from("/path/to/igvm"));
+            sev_snp_config.validate().unwrap();
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.memory.hotplug_size = Some(1);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoMemoryHotplug)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.memory.hotplugged_size = Some(1);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoMemoryHotplug)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.cpus.max_vcpus = 2;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoCpuHotplug)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.memory.hugepages = true;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoHugePages)
+            );
+
+            let iommu_pci_common = PciDeviceCommonConfig {
+                iommu: true,
+                ..Default::default()
+            };
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.disks = Some(vec![DiskConfig {
+                pci_common: iommu_pci_common.clone(),
+                ..raw_disk_fixture()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoViommu)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.devices = Some(vec![DeviceConfig {
+                pci_common: iommu_pci_common.clone(),
+                ..device_fixture()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoViommu)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.platform = Some(PlatformConfig {
+                sev_snp: true,
+                iommu_segments: Some(Box::new([1])),
+                ..platform_fixture()
+            });
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoViommu)
+            );
+
+            let mut invalid_config = sev_snp_config.clone();
+            invalid_config.iommu = true;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::SevSnpNoViommu)
+            );
         }
 
         // x_nv_gpudirect_clique with vfio_p2p_dma=off should fail
@@ -6885,7 +7179,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 pci_device_id: Some(8),
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         still_valid_config.validate().unwrap();
         // Invalid BDF - Same ID as Root device
@@ -6895,7 +7189,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 pci_device_id: Some(pci::PCI_ROOT_DEVICE_ID),
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6910,7 +7204,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 pci_device_id: Some(pci::NUM_DEVICE_IDS + 1),
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6951,7 +7245,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 id: Some("test0".to_string()),
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
@@ -6982,7 +7276,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 id: Some("test0".to_string()),
                 ..Default::default()
             },
-            ..disk_fixture()
+            ..raw_disk_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),

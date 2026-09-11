@@ -16,7 +16,7 @@ use thiserror::Error;
 use vm_device::BusDevice;
 
 use crate::configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType};
-use crate::device::{BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError, PciDevice};
+use crate::device::{BarReprogrammingParams, DeviceRelocation, PciDevice};
 
 /// Denotes the PCI device ID of a bus' root bridge device.
 pub const PCI_ROOT_DEVICE_ID: u8 = 0;
@@ -29,12 +29,6 @@ const DEVICE_ID_INTEL_VIRT_PCIE_HOST: u16 = 0x0d57;
 /// Errors for device manager.
 #[derive(Error, Debug)]
 pub enum PciRootError {
-    /// Could not allocate device address space for the device.
-    #[error("Could not allocate device address space for the device")]
-    AllocateDeviceAddrs(#[source] PciDeviceError),
-    /// Could not allocate an IRQ number.
-    #[error("Could not allocate an IRQ number")]
-    AllocateIrq,
     /// Could not find an available device slot on the PCI bus.
     #[error("Could not find an available device slot on the PCI bus")]
     NoPciDeviceSlotAvailable,
@@ -45,7 +39,7 @@ pub enum PciRootError {
     #[error("Valid PCI device identifier but already used: {0}")]
     AlreadyInUsePciDeviceSlot(usize),
 }
-pub type Result<T> = result::Result<T, PciRootError>;
+pub(crate) type Result<T> = result::Result<T, PciRootError>;
 
 /// Emulates the PCI Root bridge device.
 pub struct PciRoot {
@@ -226,6 +220,35 @@ impl PciBus {
             Err(PciRootError::InvalidPciDeviceSlot(id as usize))
         }
     }
+
+    fn apply_bar_reprogramming(&self, device: &mut dyn PciDevice, bars: &[BarReprogrammingParams]) {
+        for bar in bars {
+            let Some(bar_idx) = bar.bar_idx else {
+                // Migration case: the previous version doesn't snapshot the BAR index being moved.
+                warn!(
+                    "BAR reprogramming without a BAR index: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
+                    bar.old_base, bar.new_base, bar.len
+                );
+                device.restore_bar_addr(bar);
+                continue;
+            };
+            if let Err(e) = self.device_reloc.move_bar(
+                bar_idx,
+                bar.old_base,
+                bar.new_base,
+                bar.len,
+                device,
+                bar.region_type,
+            ) {
+                // Rollback the changes from detect_bar_reprogramming().
+                warn!(
+                    "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
+                    e, bar.old_base, bar.new_base, bar.len
+                );
+                device.restore_bar_addr(bar);
+            }
+        }
+    }
 }
 
 pub struct PciConfigIo {
@@ -298,25 +321,7 @@ impl PciConfigIo {
             let (bar_reprogram, ret) = device.write_config_register(register, offset, data);
 
             // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    warn!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                    // Rollback: the config register was already updated to
-                    // new_base by detect_bar_reprogramming(). Restore it by
-                    // writing back the old address so device state stays
-                    // consistent with the MMIO bus mapping.
-                    device.restore_bar_addr(params);
-                }
-            }
+            pci_bus.apply_bar_reprogramming(device.deref_mut(), &bar_reprogram);
 
             ret
         } else {
@@ -334,8 +339,8 @@ impl PciConfigIo {
                 u32::from(data[0]) << (offset * 8),
             ),
             2 => (
-                0x0000_ffff << (offset * 16),
-                ((u32::from(data[1]) << 8) | u32::from(data[0])) << (offset * 16),
+                0x0000_ffff << (offset * 8),
+                ((u32::from(data[1]) << 8) | u32::from(data[0])) << (offset * 8),
             ),
             4 => (0xffff_ffff, LittleEndian::read_u32(data)),
             _ => return,
@@ -428,21 +433,7 @@ impl PciConfigMmio {
             let (bar_reprogram, _) = device.write_config_register(register, offset, data);
 
             // Move the device's BAR if needed
-            for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
-                    params.old_base,
-                    params.new_base,
-                    params.len,
-                    device.deref_mut(),
-                    params.region_type,
-                ) {
-                    warn!(
-                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
-                        e, params.old_base, params.new_base, params.len
-                    );
-                    device.restore_bar_addr(params);
-                }
-            }
+            pci_bus.apply_bar_reprogramming(device.deref_mut(), &bar_reprogram);
         }
     }
 }
@@ -520,7 +511,7 @@ fn parse_io_config_address(config_address: u32) -> (usize, usize, usize, usize) 
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::error::Error;
     use std::io;
     use std::result::Result;
@@ -528,31 +519,60 @@ mod unit_tests {
     use super::*;
     use crate::configuration::PciBarRegionType;
 
-    #[derive(Debug)]
-    /// Helper struct that mocks the implementation of DeviceRelocation
-    struct MockDeviceRelocation;
+    #[derive(Debug, Default)]
+    /// Helper struct that mocks the implementation of DeviceRelocation and
+    /// records the BAR indexes it was asked to move.
+    struct MockDeviceRelocation {
+        moved: Mutex<Vec<usize>>,
+    }
 
     impl DeviceRelocation for MockDeviceRelocation {
         fn move_bar(
             &self,
+            bar_idx: usize,
             _old_base: u64,
             _new_base: u64,
             _len: u64,
             _pci_dev: &mut dyn PciDevice,
             _region_type: PciBarRegionType,
         ) -> Result<(), io::Error> {
+            self.moved.lock().unwrap().push(bar_idx);
             Ok(())
         }
     }
 
     fn setup_bus() -> PciBus {
         let pci_root = PciRoot::new(None);
-        let mock_device_reloc = Arc::new(MockDeviceRelocation {});
+        let mock_device_reloc = Arc::new(MockDeviceRelocation::default());
         PciBus::new(Some(pci_root), mock_device_reloc)
     }
 
     fn setup_bus_without_host_bridge() -> PciBus {
-        PciBus::new(None, Arc::new(MockDeviceRelocation {}))
+        PciBus::new(None, Arc::new(MockDeviceRelocation::default()))
+    }
+
+    #[test]
+    fn set_config_address() {
+        let test_cases: &[(u64, &[u8], u32)] = &[
+            (0, &[0xaa], 0x1122_33aa),
+            (1, &[0xaa], 0x1122_aa44),
+            (2, &[0xaa], 0x11aa_3344),
+            (3, &[0xaa], 0xaa22_3344),
+            (0, &[0xaa, 0x55], 0x1122_55aa),
+            (1, &[0xaa, 0x55], 0x1155_aa44),
+            (2, &[0xaa, 0x55], 0x55aa_3344),
+            (0, &[0xaa, 0x55, 0xcc, 0x77], 0x77cc_55aa),
+        ];
+
+        for (offset, data, expected) in test_cases {
+            let pci_bus = Arc::new(Mutex::new(setup_bus()));
+            let mut config_io = PciConfigIo::new(pci_bus);
+            config_io.config_address = 0x1122_3344;
+
+            config_io.write(0, *offset, data);
+
+            assert_eq!(config_io.config_address, *expected);
+        }
     }
 
     #[test]
@@ -674,5 +694,76 @@ mod unit_tests {
             result,
             Err(PciRootError::NoPciDeviceSlotAvailable),
         ));
+    }
+
+    /// PciDevice that counts the rollbacks asked of it.
+    #[derive(Default)]
+    struct RecordingDevice {
+        restored: usize,
+    }
+
+    impl BusDevice for RecordingDevice {}
+
+    impl PciDevice for RecordingDevice {
+        fn write_config_register(
+            &mut self,
+            _reg_idx: usize,
+            _offset: u64,
+            _data: &[u8],
+        ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+            (Vec::new(), None)
+        }
+
+        fn read_config_register(&mut self, _reg_idx: usize) -> u32 {
+            0
+        }
+
+        fn restore_bar_addr(&mut self, _params: &BarReprogrammingParams) {
+            self.restored += 1;
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn id(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn reprogram_params(bar_idx: Option<usize>) -> BarReprogrammingParams {
+        BarReprogrammingParams {
+            bar_idx,
+            old_base: 0xc000_0000,
+            new_base: 0xd000_0000,
+            len: 0x8_0000,
+            region_type: PciBarRegionType::Memory32BitRegion,
+        }
+    }
+
+    #[test]
+    fn apply_bar_reprogramming_moves_the_named_bar() {
+        let reloc = Arc::new(MockDeviceRelocation::default());
+        let bus = PciBus::new(Some(PciRoot::new(None)), reloc.clone());
+        let mut device = RecordingDevice::default();
+
+        bus.apply_bar_reprogramming(&mut device, &[reprogram_params(Some(2))]);
+
+        assert_eq!(*reloc.moved.lock().unwrap(), vec![2]);
+        assert_eq!(device.restored, 0);
+    }
+
+    #[test]
+    fn apply_bar_reprogramming_rolls_back_when_the_bar_is_unnamed() {
+        let reloc = Arc::new(MockDeviceRelocation::default());
+        let bus = PciBus::new(Some(PciRoot::new(None)), reloc.clone());
+        let mut device = RecordingDevice::default();
+
+        // An entry restored from a snapshot predating bar_idx. Moving BAR 0 by
+        // default would relocate the wrong BAR, so nothing must be moved.
+        bus.apply_bar_reprogramming(&mut device, &[reprogram_params(None)]);
+
+        assert!(reloc.moved.lock().unwrap().is_empty());
+        assert_eq!(device.restored, 1);
     }
 }

@@ -400,7 +400,11 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(Vec::new(), self.announce.pending.clone()),
+                ctrl_q: CtrlQueue::new(
+                    Vec::new(),
+                    self.announce.pending.clone(),
+                    self.config.max_virtqueue_pairs,
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,
@@ -542,7 +546,7 @@ impl Migratable for Net {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::mem::{offset_of, size_of};
 
     use seccompiler::SeccompAction;

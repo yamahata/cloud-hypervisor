@@ -1,23 +1,34 @@
 # Live Migration
 
-This document gives examples of how to use the live migration support
-in Cloud Hypervisor:
+Cloud Hypervisor supports live migration over two transport channels:
 
-1. **Local Migration**: Migrating a VM from one Cloud Hypervisor instance to another on the same machine; also called
-  UNIX socket migration.
-1. **Remote Migration** (TCP Migration): migrating a VM between two TCP/IP hosts.
+| Transport          | When to use it                                                                  |
+|--------------------|---------------------------------------------------------------------------------|
+| TCP stream         | Migration between hosts. It also works on one host for development and testing. |
+| UNIX domain socket | Migration between VMMs on the same host.                                        |
 
-> :warning: These examples place sockets in /tmp. This is done for
+See [Migration Parameters](#migration-parameters) for the full definitions of
+these parameters.
+
+> :warning: The following examples place sockets in /tmp. This is done for
 > simplicity and should not be done in production.
 
-## Local Migration (Suitable for Live Upgrade of VMM)
+## UNIX Domain Socket Migration
+
+UNIX domain sockets are suited for same host migrations, especially when
+combined with `memory_mode=memfds`. This is particularly useful for VMM
+live upgrades with minimal VM downtime. We call this mode "local migration".
+
+If `memory_mode=memfds` is omitted, the migration defaults to copying guest
+memory instead. UNIX domain socket transport may be proxied via a socket proxy
+(e.g. `socat` fur advanced custom use cases).
 
 Launch the source VM (on the host machine):
 
 ```console
 $ target/release/cloud-hypervisor
     --kernel ~/workloads/vmlinux \
-    --disk path=~/workloads/focal.raw \
+    --disk path=~/workloads/focal.raw,image_type=raw \
     --cpus boot=1 --memory size=1G,shared=on \
     --cmdline "root=/dev/vda1 console=ttyS0"  \
     --serial tty --console off --api-socket=/tmp/api1
@@ -39,20 +50,19 @@ $ target/release/ch-remote --api-socket=/tmp/api2 receive-migration receiver_url
 Start to send migration for the source VM (on the host machine):
 
 ```console
-$ target/release/ch-remote --api-socket=/tmp/api1 send-migration destination_url=unix:/tmp/sock,local=on
+$ target/release/ch-remote --api-socket=/tmp/api1 send-migration destination_url=unix:/tmp/sock,memory_mode=memfds
 ```
 
 When the above commands completed, the source VM should be successfully
 migrated to the destination VM. Now the destination VM is running while
 the source VM is terminated gracefully.
 
-## Remote Migration (TCP Migration)
+## TCP Migration
 
-_Hint: For developing purposes, same-host TCP migrations are also supported._
-
-In this example, we will migrate a VM from one machine (`src`) to
+TCP is intended for migration from one machine (`src`) to
 another (`dst`) across the network. To keep it simple, we will use a
-minimal VM setup without storage.
+minimal VM setup without storage. Same host TCP migration is also supported
+for development and testing.
 
 ### Preparation
 
@@ -76,65 +86,6 @@ src $ curl $DEBIAN/initrd.gz > /var/images/initrd
 
 Repeat the above steps on the destination host.
 
-### Unix Socket Migration
-
-If Unix socket is selected for migration, we can tunnel traffic through "socat".
-
-#### Starting the Receiver VM
-
-On the receiver side, we prepare an empty VM:
-
-```console
-dst $ cloud-hypervisor --api-socket /tmp/api
-```
-
-In a different terminal, configure the VM as a migration target:
-
-```console
-dst $ ch-remote --api-socket=/tmp/api receive-migration receiver_url=unix:/tmp/sock
-```
-
-In yet another terminal, forward TCP connections to the Unix domain socket:
-
-```console
-dst $ socat TCP-LISTEN:{port},reuseaddr UNIX-CLIENT:/tmp/sock
-```
-
-#### Starting the Sender VM
-
-Let's start the VM on the source machine:
-
-```console
-src $ cloud-hypervisor \
-        --serial tty --console off \
-        --cpus boot=2 --memory size=4G \
-        --kernel /var/images/linux \
-        --initramfs /var/images/initrd \
-        --cmdline "console=ttyS0" \
-        --api-socket /tmp/api
-```
-
-After a few seconds the VM should be up and you can interact with it.
-
-#### Performing the Migration
-
-First, we start `socat`:
-
-```console
-src $ socat UNIX-LISTEN:/tmp/sock,reuseaddr TCP:{dst}:{port}
-```
-
-> Replace {dst}:{port} with the actual IP address and port of your destination host.
-
-Then we kick-off the migration itself:
-
-```console
-src $ ch-remote --api-socket=/tmp/api send-migration destination_url=unix:/tmp/sock
-```
-
-When the above commands completed, the VM should be successfully
-migrated to the destination machine without interrupting the workload.
-
 ### Network Announcements After Resume
 
 After a VM resumes from migration, snapshot restore, or any other path
@@ -147,10 +98,15 @@ re-announcement therefore only happens when the guest negotiated
 `VIRTIO_NET_F_GUEST_ANNOUNCE`. For `vhost-user-net`, the current implementation
 only uses the guest announcement path.
 
-### TCP Socket Migration
+### Performing a TCP Migration
 
-If TCP socket is selected for migration, we need to consider migrating
-in a trusted network.
+Use TCP migration only in a trusted network or configure TLS as described
+below.
+
+**Warning**: without TLS, the listener accepts data from anyone who can
+connect to it. Use plaintext `tcp:` only on networks where every host is
+trusted. On any other network, use the TLS support described below, or a
+UNIX socket combined with filesystem permissions.
 
 #### Starting the Receiver VM
 
@@ -249,7 +205,7 @@ src $ ch-remote --api-socket=/tmp/api send-migration destination_url=tcp:{dst}:{
 ```
 
 TLS encryption is only supported with `tcp:<host>:<port>` migration
-URLs, not with local UNIX-socket migration.
+URLs, not with UNIX domain socket migration.
 
 The commands below describe how to create the encryption material necessary
 to perform a same-host TCP migration with TLS.
@@ -377,10 +333,16 @@ migration process. Via the API or `ch-remote`, you may specify:
 - `connections <amount>`: \
   The number of parallel TCP connections to use for migration.
   Must be between `1` and `128`. Defaults to `1`.
-  Multiple connections are not supported with local UNIX-socket migration.
-- `memory_mode <precopy|postcopy>`: \
-  Memory transfer mode. `postcopy` resumes the destination first and faults
-  guest pages in on demand over a dedicated connection. Defaults to `precopy`.
+  Multiple connections are not supported with UNIX domain socket migration.
+- `memory_mode <memfds|precopy|postcopy>`: \
+  Memory transfer mode. `memfds` passes the guest memory backing file
+  descriptors over a UNIX socket. It requires every guest memory region to use
+  shared memory or hugepage backing. `postcopy` resumes the destination first
+  and faults guest pages in on demand over a dedicated connection. Defaults to
+  `precopy`.
+- `preserve_source <on|off>`: \
+  Keep the source VM in a paused state after migration completes. This is only
+  supported with `memory_mode=memfds` and defaults to `off`.
 - `zone_updates <list of zone updates>`: \
   A list of updates to apply to memory zones on the receiver side. For example,
   this can be used to remap memory zones to another NUMA node. Each zone update
@@ -399,37 +361,38 @@ for the requirements, the dirty tracking behavior, and an example.
 
 ## Version Compatibility
 
-Cloud Hypervisor live migration compatibility has two dimensions: the
-Cloud Hypervisor version and the migration protocol version.
+Starting with `v54`, Cloud Hypervisor guarantees migration compatibility from
+the previous two versions ("n-2"), e.g. `v54` accepts migrations from `v52` and
+`v53`. Upgrades spanning more major versions might work. It is, however,
+strongly recommended to do incremental upgrades, e.g., `v54 -> v56 -> v58`.
+Backward migrations, such as `v54 -> v52`, are **not** supported.
 
-Cloud Hypervisor uses a versioned migration protocol for the messages exchanged
-between source and destination. Each Cloud Hypervisor release sends its current
-migration protocol version and accepts that version plus the immediately
-previous protocol version.
+New VMM functionality is designed in a way that it does not cause any
+incompatibility for VMs coming from older versions of Cloud Hypervisor. If new
+features are added to existing device models or the VMM, the corresponding
+device-specific config falls back to safe false/disabled values. Hence, only
+newly spawned VMs will be able to use new functionality, while being able to run
+VMs first spawned in older versions of Cloud Hypervisor.
 
-This means migration is supported from an older protocol version to the same or
-next protocol version. If the source and destination are more than one migration
-protocol version apart, the VM must be migrated through an intermediate
-Cloud Hypervisor version first.
+## Events
 
-### Technical Details
+The following events are emitted by Cloud Hypervisor in the context of
+migration:
 
-The source sends its migration protocol version in the initial `Start` request.
-The destination accepts the migration only if that protocol version is supported.
-A zeroed `Start` command header is handled as protocol `v0`, so older
-deployments that do not explicitly send a protocol version remain compatible.
-
-The migration protocol version covers the protocol spoken after a migration
-connection has been established. Examples include adding a mandatory migration
-command, changing the order of migration protocol messages, or changing the
-framing or encoding of protocol command payloads.
-
-The migration protocol version does not cover migration transport setup. For
-example, choosing TCP vs. UNIX sockets or opening the initial connection needs
-separate compatibility handling.
-
-Migration protocol versioning is separate from snapshot state compatibility.
-Device and VM state changes still need to be handled by the respective snapshot
-serialization/deserialization code. That compatibility is Cloud Hypervisor
-version dependent, but it is not the responsibility of migration protocol
-versioning.
+- Sender
+  - `vm.migration-starting`: Migration worker is beginning the send attempt.
+  - `vm.migration-started`: Receiver acknowledged the migration start request.
+  - `vm.migration-memory-iteration`: A precopy iteration finished. Can appear
+    multiple times and solely signals forward progress.
+  - `vm.migration-finished`: Migration completed successfully.
+  - `vm.migration-failed`: Migration worker returned an error.
+- Receiver
+  - `vm.migration-receive-ready`: Migration listener is ready to accept a
+    connection.
+  - `vm.migration-receive-starting`: Migration connection was accepted.
+  - `vm.migration-receive-started`: Sender's migration start request was
+    acknowledged.
+  - `vm.migration-receive-finished`: Migration was received and the VM resumed
+    successfully.
+  - `vm.migration-receive-failed`: The migration failed or the sender aborted
+    the migration.

@@ -1687,7 +1687,12 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
 
 pub(crate) fn _test_multi_cpu(guest: &Guest) {
     let mut cmd = GuestCommand::new(guest);
-    cmd.args(["--cpus", "boot=2,max=4"])
+    let cpus = if guest.vm_type == GuestVmType::Confidential {
+        "boot=2"
+    } else {
+        "boot=2,max=4"
+    };
+    cmd.args(["--cpus", cpus])
         .default_memory()
         .default_kernel_cmdline()
         .capture_output()
@@ -2112,7 +2117,7 @@ pub(crate) fn _test_virtio_block(
     }
 }
 
-pub fn _test_virtio_block_dynamic_vhdx_expand(guest: &Guest) {
+pub(crate) fn _test_virtio_block_dynamic_vhdx_expand(guest: &Guest) {
     const VIRTUAL_DISK_SIZE: u64 = 100 << 20;
     const EMPTY_VHDX_FILE_SIZE: u64 = 8 << 20;
     const FULL_VHDX_FILE_SIZE: u64 = 112 << 20;
@@ -2458,7 +2463,7 @@ fn vhdx_image_size(disk_name: &str) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn _test_split_irqchip(guest: &Guest) {
+pub(crate) fn _test_split_irqchip(guest: &Guest) {
     let mut child = GuestCommand::new(guest)
         .default_cpus()
         .default_memory()

@@ -10,7 +10,10 @@ use std::path::Path;
 use std::result;
 
 use igvm_defs::{IGVM_VHS_SNP_ID_BLOCK, SnpPolicy};
-use kvm_bindings::kvm_sev_cmd;
+use kvm_bindings::{
+    kvm_sev_cmd, sev_cmd_id_KVM_SEV_INIT2, sev_cmd_id_KVM_SEV_SNP_LAUNCH_FINISH,
+    sev_cmd_id_KVM_SEV_SNP_LAUNCH_START, sev_cmd_id_KVM_SEV_SNP_LAUNCH_UPDATE,
+};
 use kvm_ioctls::VmFd;
 use log::{debug, error, info};
 use vmm_sys_util::errno;
@@ -18,16 +21,10 @@ use zerocopy::{FromZeros, Immutable, IntoBytes};
 
 pub(crate) type Result<T> = result::Result<T, errno::Error>;
 
-// KVM SEV command IDs — linux/include/uapi/linux/kvm.h
-const KVM_SEV_INIT2: u32 = 22;
-const KVM_SEV_SNP_LAUNCH_START: u32 = 100;
-const KVM_SEV_SNP_LAUNCH_UPDATE: u32 = 101;
-const KVM_SEV_SNP_LAUNCH_FINISH: u32 = 102;
-
-// See AMD Spec Section 8.17 — SNP_LAUNCH_UPDATE
+// See AMD Spec Section 8.18 — SNP_LAUNCH_UPDATE
 // The last 12 bits are metadata about the guest context
-// https://docs.amd.com/v/u/en-US/56860_PUB_1.58_SEV_SNP
-pub const GPA_METADATA_SHIFT_OFFSET: u32 = 12;
+// https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP
+pub(crate) const GPA_METADATA_SHIFT_OFFSET: u32 = 12;
 
 // SNP in VMSA - linux/arch/x86/include/asm/svm.h
 const SVM_SEV_FEAT_SNP_ACTIVE: u64 = 1 << 0;
@@ -41,7 +38,7 @@ fn sev_op(vm: &VmFd, sev_cmd: &mut kvm_sev_cmd, name: &str) -> Result<()> {
 }
 
 #[derive(Debug)]
-pub struct SevFd {
+pub(crate) struct SevFd {
     pub fd: OwnedFd,
 }
 
@@ -50,7 +47,7 @@ pub struct SevFd {
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Default)]
-pub(crate) struct KvmSevInit {
+struct KvmSevInit {
     pub vmsa_features: u64,
     pub flags: u32,
     pub ghcb_version: u16,
@@ -60,7 +57,7 @@ pub(crate) struct KvmSevInit {
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Default)]
-pub(crate) struct KvmSevSnpLaunchStart {
+struct KvmSevSnpLaunchStart {
     pub policy: u64,
     pub gosvw: [u8; 16],
     pub flags: u16,
@@ -70,7 +67,7 @@ pub(crate) struct KvmSevSnpLaunchStart {
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Default)]
-pub(crate) struct KvmSevSnpLaunchUpdate {
+struct KvmSevSnpLaunchUpdate {
     pub gfn_start: u64,
     pub uaddr: u64,
     pub len: u64,
@@ -83,7 +80,7 @@ pub(crate) struct KvmSevSnpLaunchUpdate {
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Default)]
-pub(crate) struct KvmSevSnpLaunchFinish {
+struct KvmSevSnpLaunchFinish {
     pub id_block_uaddr: u64,
     pub id_auth_uaddr: u64,
     pub id_block_en: u8,
@@ -96,11 +93,11 @@ pub(crate) struct KvmSevSnpLaunchFinish {
     pub pad1: [u64; 4],
 }
 
-// See AMD Spec Section 8.18 — Structure of the ID Block
-// https://docs.amd.com/v/u/en-US/56860_PUB_1.58_SEV_SNP
+// See AMD Spec Section 8.19 — Structure of the ID Block
+// https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable)]
-pub(crate) struct KvmSevSnpIdBlock {
+struct KvmSevSnpIdBlock {
     pub ld: [u8; 48],
     pub family_id: [u8; 16],
     pub image_id: [u8; 16],
@@ -109,11 +106,11 @@ pub(crate) struct KvmSevSnpIdBlock {
     pub policy: u64,
 }
 
-// See AMD Spec Section 8.18 — Layout of the ID Authentication Information Structure
-// https://docs.amd.com/v/u/en-US/56860_PUB_1.58_SEV_SNP
+// See AMD Spec Section 8.19 — Layout of the ID Authentication Information Structure
+// https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP
 #[repr(C)]
 #[derive(Clone, FromZeros, IntoBytes, Immutable)]
-pub(crate) struct KvmSevSnpIdAuth {
+struct KvmSevSnpIdAuth {
     pub id_key_alg: u32,
     pub auth_key_algo: u32,
     pub reserved: [u8; 56],
@@ -126,8 +123,8 @@ pub(crate) struct KvmSevSnpIdAuth {
 }
 
 // Must be 1
-// AMD SEV-SNP Firmware ABI, Section 8.18 — Structure of the ID Block
-// https://docs.amd.com/v/u/en-US/56860_PUB_1.58_SEV_SNP
+// AMD SEV-SNP Firmware ABI, Section 8.19 — Structure of the ID Block
+// https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP
 const IGVM_SEV_ID_BLOCK_VERSION: u32 = 1;
 
 fn build_id_block(snp_id_block: &IGVM_VHS_SNP_ID_BLOCK, guest_policy: u64) -> KvmSevSnpIdBlock {
@@ -141,8 +138,8 @@ fn build_id_block(snp_id_block: &IGVM_VHS_SNP_ID_BLOCK, guest_policy: u64) -> Kv
     }
 }
 
-// SEV-SNP Firmware ABI Spec Chapter 10: Format for an ECDSA P-384 Public Key
-// https://docs.amd.com/v/u/en-US/56860_PUB_1.58_SEV_SNP
+// SEV-SNP Firmware ABI Spec Appendix B: Format for an ECDSA P-384 Public Key
+// https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP
 fn serialize_public_key(curve: u32, qx: &[u8; 72], qy: &[u8; 72]) -> [u8; 1028] {
     let mut key = [0u8; 0x404];
     key[..0x004].copy_from_slice(&curve.to_le_bytes());
@@ -205,7 +202,7 @@ impl SevFd {
             ..Default::default()
         };
         let mut sev_cmd = kvm_sev_cmd {
-            id: KVM_SEV_INIT2,
+            id: sev_cmd_id_KVM_SEV_INIT2,
             data: &raw mut init as u64,
             sev_fd: self.fd.as_raw_fd() as _,
             ..Default::default()
@@ -219,7 +216,7 @@ impl SevFd {
             ..Default::default()
         };
         let mut sev_cmd = kvm_sev_cmd {
-            id: KVM_SEV_SNP_LAUNCH_START,
+            id: sev_cmd_id_KVM_SEV_SNP_LAUNCH_START,
             data: &raw mut start as u64,
             sev_fd: self.fd.as_raw_fd() as _,
             ..Default::default()
@@ -245,7 +242,7 @@ impl SevFd {
             ..Default::default()
         };
         let mut sev_cmd = kvm_sev_cmd {
-            id: KVM_SEV_SNP_LAUNCH_UPDATE,
+            id: sev_cmd_id_KVM_SEV_SNP_LAUNCH_UPDATE,
             data: &raw mut update as u64,
             sev_fd: self.fd.as_raw_fd() as _,
             ..Default::default()
@@ -274,7 +271,7 @@ impl SevFd {
             ..Default::default()
         };
         let mut sev_cmd = kvm_sev_cmd {
-            id: KVM_SEV_SNP_LAUNCH_FINISH,
+            id: sev_cmd_id_KVM_SEV_SNP_LAUNCH_FINISH,
             data: &raw mut finish as u64,
             sev_fd: self.fd.as_raw_fd() as _,
             ..Default::default()

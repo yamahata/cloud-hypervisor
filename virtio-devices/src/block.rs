@@ -72,16 +72,10 @@ pub const MINIMUM_BLOCK_QUEUE_SIZE: u16 = 2;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Failed to parse the request")]
-    RequestParsing(#[source] block::Error),
-    #[error("Failed to execute the request")]
-    RequestExecuting(#[source] block::ExecuteError),
     #[error("Failed to complete the request")]
     RequestCompleting(#[source] block::Error),
     #[error("Missing the expected entry in the list of requests")]
     MissingEntryRequestList,
-    #[error("The asynchronous request returned with failure")]
-    AsyncRequestFailure,
     #[error("Failed synchronizing the file")]
     Fsync(#[source] AsyncIoError),
     #[error("Failed adding used index")]
@@ -194,7 +188,6 @@ struct BlockEpollHandler {
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
-    disable_sector0_writes: bool,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -202,11 +195,7 @@ fn has_feature(features: u64, feature_flag: u64) -> bool {
 }
 
 impl BlockEpollHandler {
-    fn check_request(
-        features: u64,
-        request: &Request,
-        disable_sector0_writes: bool,
-    ) -> result::Result<(), ExecuteError> {
+    fn check_request(features: u64, request: &Request) -> result::Result<(), ExecuteError> {
         let request_type = request.request_type();
         if (has_feature(features, VIRTIO_BLK_F_RO.into()))
             && !(request_type == RequestType::In
@@ -219,11 +208,6 @@ impl BlockEpollHandler {
             warn!(
                 "Rejecting block request {request_type:?}: device is read-only (VIRTIO_BLK_F_RO negotiated)"
             );
-            return Err(ExecuteError::ReadOnly);
-        }
-
-        if request_type == RequestType::Out && disable_sector0_writes && request.sector() == 0 {
-            warn!("Attempting to write to sector 0 on a disk without specifying image_type");
             return Err(ExecuteError::ReadOnly);
         }
 
@@ -301,10 +285,7 @@ impl BlockEpollHandler {
             // For virtio spec compliance
             // "A device MUST set the status byte to VIRTIO_BLK_S_IOERR for a write request
             // if the VIRTIO_BLK_F_RO feature if offered, and MUST NOT write any data."
-            // Also, if sector 0 writes are disabled, treat writes to sector 0 as read-only as well.
-            if let Err(e) =
-                Self::check_request(self.acked_features, &request, self.disable_sector0_writes)
-            {
+            if let Err(e) = Self::check_request(self.acked_features, &request) {
                 warn!("Request check failed: {request:x?} {e:?}");
                 desc_chain
                     .memory()
@@ -360,7 +341,6 @@ impl BlockEpollHandler {
                 self.disk_nsectors.load(Ordering::SeqCst),
                 self.disk_image.as_mut(),
                 &self.serial,
-                self.disable_sector0_writes,
                 desc_chain.head_index() as u64,
             );
 
@@ -776,7 +756,6 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
-    disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -810,8 +789,8 @@ impl Block {
         state: Option<BlockState>,
         queue_affinity: BTreeMap<u16, Box<[usize]>>,
         sparse: bool,
-        disable_sector0_writes: bool,
         lock_granularity: LockGranularityChoice,
+        guest_block_size: Option<u32>,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -867,7 +846,10 @@ impl Block {
                     avail_features |= 1u64 << VIRTIO_BLK_F_RO;
                 }
 
-                let topology = disk_image.topology();
+                let mut topology = disk_image.topology();
+                if let Some(block_size) = guest_block_size {
+                    topology = topology.with_block_size(block_size as u64);
+                }
                 info!("Disk topology: {topology:?}");
 
                 let logical_block_size = if topology.logical_block_size > 512 {
@@ -942,7 +924,6 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
-            disable_sector0_writes,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -1225,7 +1206,6 @@ impl VirtioDevice for Block {
                 access_platform: self.common.access_platform(),
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
-                disable_sector0_writes: self.disable_sector0_writes,
                 active_request_count: self.active_request_count.clone(),
                 draining_active_requests: self.draining_active_requests.clone(),
             };
@@ -1360,7 +1340,7 @@ impl Transportable for Block {}
 impl Migratable for Block {}
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io::Result as IoResult;
 
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
@@ -1430,7 +1410,6 @@ mod unit_tests {
             access_platform: None,
             host_cpus: None,
             acked_features: 0,
-            disable_sector0_writes: false,
         };
 
         handler.process_queue_submit().unwrap();

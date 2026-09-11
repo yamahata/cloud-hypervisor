@@ -66,7 +66,7 @@ pub enum Error {
     MissingAddressRange,
 }
 
-pub type Result<T> = result::Result<T, Error>;
+pub(crate) type Result<T> = result::Result<T, Error>;
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
@@ -79,14 +79,14 @@ impl convert::From<Error> for io::Error {
 /// * base - The address at which the range start.
 /// * len - The length of the range in bytes.
 #[derive(Debug, Copy, Clone)]
-pub struct BusRange {
+struct BusRange {
     pub base: u64,
     pub len: u64,
 }
 
 impl BusRange {
     /// Returns true if there is overlap with the given range.
-    pub fn overlaps(&self, base: u64, len: u64) -> bool {
+    pub(crate) fn overlaps(&self, base: u64, len: u64) -> bool {
         self.base < (base + len) && base < self.base + self.len
     }
 }
@@ -236,9 +236,9 @@ impl Bus {
     }
 
     /// Reads data from the device that owns the range containing `addr` and puts it into `data`.
-    ///
-    /// Returns true on success, otherwise `data` is untouched.
     pub fn read(&self, addr: u64, data: &mut [u8]) -> Result<()> {
+        // The Linux kernel, quite reasonably, doesn't zero the memory it gives us.
+        data.fill(0);
         if let Some((base, offset, dev)) = self.resolve(addr) {
             // OK to unwrap as lock() failing is a serious error condition and should panic.
             dev.read(base, offset, data);
@@ -262,7 +262,7 @@ impl Bus {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     struct DummyDevice;
@@ -354,7 +354,7 @@ mod unit_tests {
         bus.insert(device.clone(), 0x10, 0x10).unwrap();
         bus.write(0x10, &data).unwrap();
         bus.read(0x10, &mut data).unwrap();
-        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(data, [0, 0, 0, 0]);
     }
 
     #[test]

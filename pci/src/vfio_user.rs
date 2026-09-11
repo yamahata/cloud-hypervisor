@@ -50,12 +50,18 @@ pub enum VfioUserPciDeviceError {
     Client(#[source] VfioUserError),
     #[error("Failed to map VFIO PCI region into guest")]
     MapRegionGuest(#[source] HypervisorVmError),
+    #[error(
+        "Sparse mmap area [0x{offset:x}, +0x{size:x}) outside the 0x{region_size:x} byte region"
+    )]
+    SparseAreaOutsideRegion {
+        offset: u64,
+        size: u64,
+        region_size: u64,
+    },
     #[error("Failed to DMA map")]
     DmaMap(#[source] VfioUserError),
     #[error("Failed to DMA unmap")]
     DmaUnmap(#[source] VfioUserError),
-    #[error("Failed to initialize legacy interrupts")]
-    InitializeLegacyInterrupts(#[source] VfioPciError),
     #[error("Failed to create VfioCommon")]
     CreateVfioCommon(#[source] VfioPciError),
     #[error("Other OS error")]
@@ -167,6 +173,19 @@ impl VfioUserPciDevice {
                 let file_offset = file_offset.as_ref().unwrap();
 
                 for s in mmaps.iter() {
+                    // The area layout comes from the untrusted backend. Never
+                    // mmap or create a memory slot outside the BAR window.
+                    if s.offset
+                        .checked_add(s.size)
+                        .is_none_or(|end| end > mmio_region.length)
+                    {
+                        return Err(VfioUserPciDeviceError::SparseAreaOutsideRegion {
+                            offset: s.offset,
+                            size: s.size,
+                            region_size: mmio_region.length,
+                        });
+                    }
+
                     let mapping = match MmapRegion::mmap(
                         s.size,
                         prot,
@@ -199,6 +218,7 @@ impl VfioUserPciDevice {
                             user_memory_region.mapping.addr(),
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
@@ -222,7 +242,6 @@ impl VfioUserPciDevice {
                         user_memory_region.start,
                         user_memory_region.mapping.len(),
                         user_memory_region.mapping.addr(),
-                        false,
                         false,
                     )
                 } {
@@ -431,10 +450,11 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR 0x{old_base:x} -> 0x{new_base:x}");
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
         for mmio_region in self.common.mmio_regions.iter_mut() {
-            if mmio_region.start.raw_value() == old_base {
+            if mmio_region.index as usize == bar_idx {
+                let old_base = mmio_region.start.raw_value();
                 mmio_region.start = GuestAddress(new_base);
 
                 for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
@@ -446,7 +466,6 @@ impl PciDevice for VfioUserPciDevice {
                             user_memory_region.start,
                             user_memory_region.mapping.len(),
                             user_memory_region.mapping.addr(),
-                            false,
                             false,
                         )
                     }
@@ -469,6 +488,7 @@ impl PciDevice for VfioUserPciDevice {
                             user_memory_region.mapping.addr(),
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(io::Error::other)?;

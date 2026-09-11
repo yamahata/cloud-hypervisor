@@ -46,7 +46,7 @@ use hypervisor::arch::aarch64::gic::Vgic;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::arch::aarch64::mpidr_from_vcpu_id;
 #[cfg(target_arch = "aarch64")]
-use hypervisor::arch::aarch64::regs::MPIDR_EL1;
+use hypervisor::arch::aarch64::regs::{AARCH64_PMU_IRQ, MPIDR_EL1};
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use hypervisor::arch::aarch64::regs::{ID_AA64MMFR0_EL1, TCR_EL1, TTBR1_EL1};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -68,7 +68,7 @@ use libc::{c_void, siginfo_t};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use linux_loader::elf::Elf64_Nhdr;
 use log::{debug, error, info, warn};
-use seccompiler::{SeccompAction, apply_filter};
+use seccompiler::{BpfProgram, SeccompAction, apply_filter};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::BusDevice;
@@ -192,12 +192,6 @@ pub enum Error {
     #[error("Error starting vCPU after restore")]
     StartRestoreVcpu(#[source] anyhow::Error),
 
-    #[error("Unexpected VmExit")]
-    UnexpectedVmExit,
-
-    #[error("Failed to allocate MMIO address for CpuManager")]
-    AllocateMmmioAddress,
-
     #[cfg(feature = "tdx")]
     #[error("Error initializing TDX")]
     InitializeTdx(#[source] hypervisor::HypervisorCpuError),
@@ -227,10 +221,6 @@ pub enum Error {
     #[cfg(feature = "sev_snp")]
     #[error("Failed to set up SEV-SNP vCPU registers")]
     SetupSevSnpRegs(#[source] hypervisor::HypervisorCpuError),
-
-    #[cfg(target_arch = "x86_64")]
-    #[error("Failed to inject NMI")]
-    NmiError(#[source] hypervisor::HypervisorCpuError),
 
     #[cfg(feature = "mshv")]
     #[error("Failed to set partition property")]
@@ -1199,6 +1189,7 @@ impl CpuManager {
         vcpu: Arc<Mutex<Vcpu>>,
         vcpu_id: u32,
         vcpu_thread_barrier: Arc<Barrier>,
+        vcpu_seccomp_filter: Arc<BpfProgram>,
         inserting: bool,
     ) -> Result<()> {
         let reset_evt = self.reset_evt.try_clone().map_err(Error::EventFdClone)?;
@@ -1243,14 +1234,6 @@ impl CpuManager {
 
         let core_scheduling = self.config.core_scheduling;
         let core_scheduling_group_leader = self.core_scheduling_group_leader.clone();
-
-        // Retrieve seccomp filter for vcpu thread
-        let vcpu_seccomp_filter = get_seccomp_filter(
-            &self.seccomp_action,
-            Thread::Vcpu,
-            Some(self.hypervisor.hypervisor_type()),
-        )
-        .map_err(Error::CreateSeccompFilter)?;
 
         #[cfg(target_arch = "x86_64")]
         let interrupt_controller_clone = self.interrupt_controller.as_ref().cloned();
@@ -1529,9 +1512,9 @@ impl CpuManager {
             return Err(Error::DesiredVCpuCountExceedsMax);
         }
 
-        let vcpu_thread_barrier = Arc::new(Barrier::new(
-            (desired_vcpus - self.present_vcpus() + 1) as usize,
-        ));
+        let present_vcpus = self.present_vcpus();
+        let vcpu_thread_barrier =
+            Arc::new(Barrier::new((desired_vcpus - present_vcpus + 1) as usize));
 
         if let Some(paused) = paused {
             self.vcpus_pause_signalled.store(paused, Ordering::SeqCst);
@@ -1541,14 +1524,31 @@ impl CpuManager {
             "Starting vCPUs: desired = {}, allocated = {}, present = {}, paused = {}",
             desired_vcpus,
             self.vcpus.len(),
-            self.present_vcpus(),
+            present_vcpus,
             self.vcpus_pause_signalled.load(Ordering::SeqCst)
         );
 
-        // This reuses any inactive vCPUs as well as any that were newly created
-        for vcpu_id in self.present_vcpus()..desired_vcpus {
-            let vcpu = Arc::clone(&self.vcpus[vcpu_id as usize]);
-            self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
+        if present_vcpus < desired_vcpus {
+            let vcpu_seccomp_filter = Arc::new(
+                get_seccomp_filter(
+                    &self.seccomp_action,
+                    Thread::Vcpu,
+                    Some(self.hypervisor.hypervisor_type()),
+                )
+                .map_err(Error::CreateSeccompFilter)?,
+            );
+
+            // This reuses any inactive vCPUs as well as any that were newly created
+            for vcpu_id in present_vcpus..desired_vcpus {
+                let vcpu = self.vcpus[vcpu_id as usize].clone();
+                self.start_vcpu(
+                    vcpu,
+                    vcpu_id,
+                    vcpu_thread_barrier.clone(),
+                    vcpu_seccomp_filter.clone(),
+                    inserting,
+                )?;
+            }
         }
 
         // Unblock all CPU threads.
@@ -1821,6 +1821,11 @@ impl CpuManager {
              * Ignore Local Interrupt Controller Address at byte offset 36 of MADT table.
              */
 
+            let pmu_supported = self
+                .vcpus
+                .iter()
+                .all(|vcpu| vcpu.lock().unwrap().vcpu.has_pmu_support());
+
             // See section 5.2.12.14 GIC CPU Interface (GICC) Structure in ACPI spec.
             for cpu in 0..self.config.boot_vcpus {
                 let mpidr = mpidr_from_vcpu_id(cpu as u64);
@@ -1841,7 +1846,7 @@ impl CpuManager {
                     uid: cpu,
                     flags: 1,
                     parking_version: 0,
-                    performance_interrupt: 0,
+                    performance_interrupt: if pmu_supported { AARCH64_PMU_IRQ } else { 0 },
                     parked_address: 0,
                     base_address: 0,
                     gicv_base_address: 0,
@@ -3338,8 +3343,6 @@ impl AcpiCpuHotplugController {
 
 impl BusDevice for AcpiCpuHotplugController {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
-        // The Linux kernel, quite reasonably, doesn't zero the memory it gives us.
-        data.fill(0);
         let vcpu_states = self.vcpu_states.lock().unwrap();
 
         match offset {
@@ -3446,7 +3449,7 @@ impl BusDevice for AcpiCpuHotplugController {
 
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use arch::layout;
     use arch::layout::{BOOT_STACK_POINTER, ZERO_PAGE_START};
     use arch::x86_64::interrupts::*;
@@ -3595,7 +3598,7 @@ mod unit_tests {
 
 #[cfg(target_arch = "aarch64")]
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     #[cfg(feature = "kvm")]
     use std::mem::offset_of;
 
