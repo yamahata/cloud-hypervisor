@@ -9,5 +9,6 @@
 /build
 /rpm/SOURCES
 /target
-/vendor
+/vendor/*
+!/vendor/kvm-bindings/
 __pycache__
