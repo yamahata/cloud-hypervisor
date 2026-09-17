@@ -190,3 +190,5 @@ iommufd-bindings = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vs
 iommufd-ioctls = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vsmmuv3-on-0.3.1-v1" }
 vfio-bindings = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }
 vfio-ioctls = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }
+# kvm_irq_routing FAM cap 1024 -> 4096, the kernel's KVM_MAX_IRQ_ROUTES; see vendor/kvm-bindings.
+kvm-bindings = { path = "vendor/kvm-bindings" }

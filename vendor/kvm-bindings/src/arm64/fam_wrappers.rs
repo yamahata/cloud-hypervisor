@@ -37,7 +37,10 @@ generate_fam_struct_impl!(
     entries,
     u32,
     nr,
-    1024
+    // The kernel's KVM_MAX_IRQ_ROUTES. Upstream's 1024 is four times
+    // stricter, and a 128-vCPU Grace guest with 4 GPUs and 8 NVMe needs
+    // ~1085 MSI-X routes; set_gsi_routing() fails past the cap.
+    4096
 );
 
 // Implement the PartialEq trait for kvm_irq_routing.
