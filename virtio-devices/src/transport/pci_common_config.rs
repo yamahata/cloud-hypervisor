@@ -85,13 +85,13 @@ const VRING_AVAIL_ELEMENT_SIZE: usize = 2;
 const VRING_USED_ELEMENT_SIZE: usize = 8;
 
 #[derive(Copy, Clone)]
-pub enum VringType {
+pub(super) enum VringType {
     Desc,
     Avail,
     Used,
 }
 
-pub fn get_vring_size(t: VringType, queue_size: u16) -> u64 {
+pub(super) fn get_vring_size(t: VringType, queue_size: u16) -> u64 {
     let (length_except_ring, element_size) = match t {
         VringType::Desc => (0, VRING_DESC_ELEMENT_SIZE),
         VringType::Avail => (6, VRING_AVAIL_ELEMENT_SIZE),
@@ -442,7 +442,7 @@ impl Snapshottable for VirtioPciCommonConfig {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
     use crate::{ActivateResult, ActivationContext};
 
@@ -476,7 +476,7 @@ mod unit_tests {
     fn write_base_regs() {
         let dev: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(DummyDevice(0)));
         let mut regs = VirtioPciCommonConfig {
-            device: dev.clone(),
+            device: Arc::clone(&dev),
             driver_status: Arc::new(AtomicU8::new(0xaa)),
             config_generation: Arc::new(AtomicU8::new(0x55)),
             config_changed: Arc::new(AtomicBool::new(false)),
@@ -529,7 +529,7 @@ mod unit_tests {
     fn oob_queue_select_does_not_panic() {
         let dev: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(DummyDevice(0)));
         let mut regs = VirtioPciCommonConfig {
-            device: dev.clone(),
+            device: Arc::clone(&dev),
             driver_status: Arc::new(AtomicU8::new(0)),
             config_generation: Arc::new(AtomicU8::new(0)),
             config_changed: Arc::new(AtomicBool::new(false)),

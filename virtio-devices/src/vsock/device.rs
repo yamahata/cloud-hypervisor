@@ -61,13 +61,13 @@ const NUM_QUEUES: usize = 3;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
 // New descriptors are pending on the rx queue.
-pub const RX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+pub(super) const RX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 // New descriptors are pending on the tx queue.
-pub const TX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
+pub(super) const TX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New descriptors are pending on the event queue.
-pub const EVT_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+pub(super) const EVT_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 // Notification coming from the backend.
-pub const BACKEND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+pub(super) const BACKEND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
 
 #[derive(Error, Debug)]
 enum Error {
@@ -93,7 +93,7 @@ enum Error {
 ///   - forward the event to the backend; then
 ///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX buffers.
 ///
-pub struct VsockEpollHandler<B: VsockBackend> {
+pub(crate) struct VsockEpollHandler<B: VsockBackend> {
     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<EventFd>,
@@ -469,7 +469,7 @@ where
             queues,
             device_status,
         } = context;
-        self.common.activate(&queues, interrupt_cb.clone())?;
+        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
 
         let mut virtqueues = Vec::new();
@@ -485,12 +485,12 @@ where
             queue_evts,
             kill_evt,
             pause_evt,
-            interrupt_cb: interrupt_cb.clone(),
-            backend: self.backend.clone(),
+            interrupt_cb: Arc::clone(&interrupt_cb),
+            backend: Arc::clone(&self.backend),
             access_platform: self.common.access_platform(),
         };
 
-        let paused = self.common.paused.clone();
+        let paused = Arc::clone(&self.common.paused);
         let paused_sync = self.common.paused_sync.clone();
 
         self.common.spawn_worker(
@@ -498,8 +498,8 @@ where
             &self.seccomp_action,
             Thread::VirtioVsock,
             &self.exit_evt,
-            device_status.clone(),
-            interrupt_cb.clone(),
+            Arc::clone(&device_status),
+            Arc::clone(&interrupt_cb),
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
         )?;
 
@@ -554,12 +554,12 @@ impl<B> Transportable for Vsock<B> where B: VsockBackend + Sync + 'static {}
 impl<B> Migratable for Vsock<B> where B: VsockBackend + Sync + 'static {}
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::sync::atomic::AtomicU8;
 
     use libc::EFD_NONBLOCK;
 
-    use super::super::unit_tests::{NoopVirtioInterrupt, TestContext};
+    use super::super::tests::{NoopVirtioInterrupt, TestContext};
     use super::super::*;
     use super::*;
     use crate::ActivateError;

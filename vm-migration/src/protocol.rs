@@ -5,16 +5,14 @@
 
 //! # Migration Protocol
 //!
-//! ## Cross-Host Migration
+//! ## TCP Migration
 //!
-//! A traditional network-based live migration where all resources are
-//! transmitted over the wire. Externally-provided FDs must be opened and
-//! managed by the management software on the destination side.
+//! TCP is the normal transport for cross-host migration. It can also be used
+//! between VMs on the same host for development and testing. Guest memory is
+//! copied over the stream. Externally provided FDs must be opened and managed
+//! by the management software on the destination side.
 //!
-//! **Supported migration modes**:
-//! - TCP (currently one single connection)
-//!
-//! The following mermaid sequence diagram shows a brief overview:
+//! The following sequence diagram shows precopy migration over a stream:
 //!
 //! <!-- Best viewed and edited here: https://mermaid.live/edit -->
 //! ```mermaid
@@ -44,13 +42,14 @@
 //!    Destination-->>Source: OK
 //! ```
 //!
-//! ## Local Migration
+//! ## UNIX Domain Socket Migration
 //!
-//! A simplified migration taking a few shortcuts and only working on the
-//! same host. The VM memory is not transferred over the wire but instead
-//! passed as memory FD.
+//! UNIX domain sockets connect two Cloud Hypervisor instances on the same
+//! host. They can transfer guest memory normally, as TCP does, or use
+//! `memory_mode=memfds` to pass the guest memory backing FDs instead of
+//! copying memory ("local migration").
 //!
-//! The following mermaid sequence diagram shows a brief overview:
+//! The following sequence diagram shows the MemFD mode:
 //!
 //! <!-- Best viewed and edited here: https://mermaid.live/edit -->
 //! ```mermaid
@@ -76,15 +75,26 @@
 //!
 //! ## Protocol Versioning
 //!
-//! `Start` carries the sender's migration protocol version.
-//! A zeroed version field is treated as legacy protocol `v0`.
+//! The migration protocol versions the mechanism used to transport VM state
+//! from source to destination. It does not version VMM or device model state.
+//! The protocol version is an internal implementation detail.
 //!
-//! The destination validates that version and replies with a plain `OK` or
-//! `Error`.
+//! ### Version Negotiation
 //!
-//! Only the current and immediately previous protocol versions are
-//! supported. Compatibility is one-way, from older protocol versions
-//! to newer ones.
+//! [`Start`][start-command] carries the sender's protocol version, which is the
+//! current protocol version of that Cloud Hypervisor release. The destination
+//! validates the version and, if supported, receives the migration accordingly.
+//!
+//! ### Compatibility
+//!
+//! Each Cloud Hypervisor release must support all protocol versions required by
+//! the guaranteed migration compatibility window (see the public live-migration
+//! documentation).
+//!
+//! The protocol version must be bumped for breaking protocol changes, but not
+//! for additive ones.
+//!
+//! [start-command]: [`Command::Start`]
 
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
@@ -135,6 +145,7 @@ pub enum Command {
     /// Finalizes the migration and resumes the VM on the destination.
     /// Sent when the source VM was running at migration time.
     Complete = 5,
+    #[deprecated = "v52 was the last version to send this command: we now rely on proper timeout and EOF handling on the destination"]
     Abandon = 6,
     MemoryFd = 7,
     /// Finalizes the migration without resuming the VM on the destination.
@@ -192,7 +203,7 @@ impl TryFrom<u16> for ConnectionRole {
 pub const CURRENT_PROTOCOL_VERSION: u16 = 0;
 
 /// Returns the current migration protocol version and the previous version, if any.
-pub fn supported_protocol_versions() -> RangeInclusive<u16> {
+fn supported_protocol_versions() -> RangeInclusive<u16> {
     CURRENT_PROTOCOL_VERSION.saturating_sub(1)..=CURRENT_PROTOCOL_VERSION
 }
 
@@ -254,10 +265,6 @@ impl Request {
         Self::new(Command::CompletePaused, 0)
     }
 
-    pub fn abandon() -> Self {
-        Self::new(Command::Abandon, 0)
-    }
-
     /// PageFault request always carries a single `MemoryRange`.
     pub fn page_fault() -> Self {
         Self::new(Command::PageFault, size_of::<MemoryRange>() as u64)
@@ -288,7 +295,7 @@ impl Request {
         if !supported_protocol_versions().any(|version| version == sender_version) {
             let supported_versions = supported_protocol_versions().join(", ");
             return Err(MigratableError::MigrateReceive(anyhow!(
-                "Migration protocol version {sender_version} doesn't match supported versions: {supported_versions}"
+                "Migration protocol version {sender_version} of sender doesn't match any supported version: {supported_versions}"
             )));
         }
 
@@ -442,7 +449,7 @@ struct MemoryRangeTableIterator {
 impl MemoryRangeTableIterator {
     /// Create an iterator that partitions `table` into chunks of at most
     /// `chunk_size` bytes.
-    pub fn new(table: MemoryRangeTable, chunk_size: u64) -> Self {
+    pub(crate) fn new(table: MemoryRangeTable, chunk_size: u64) -> Self {
         MemoryRangeTableIterator {
             chunk_size,
             data: table.data,
@@ -608,7 +615,7 @@ impl MemoryRangeTable {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io::Cursor;
 
     use crate::protocol::{

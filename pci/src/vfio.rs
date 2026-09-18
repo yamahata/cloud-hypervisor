@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use byteorder::{ByteOrder, LittleEndian};
@@ -291,7 +291,7 @@ impl Interrupt {
 }
 
 #[derive(Clone)]
-pub struct UserMemoryRegion {
+pub(crate) struct UserMemoryRegion {
     pub slot: u32,
     pub start: u64,
     pub mapping: Arc<MmapRegion>,
@@ -1081,7 +1081,7 @@ impl VfioCommon {
 
         let msix_config = MsixConfig::new(
             msix_cap.table_size(),
-            MaybeMutInterruptSourceGroup::Immutable(interrupt_source_group.clone()),
+            MaybeMutInterruptSourceGroup::Immutable(Arc::clone(&interrupt_source_group)),
             bdf.into(),
             state,
         )
@@ -1108,7 +1108,8 @@ impl VfioCommon {
             })
             .unwrap();
 
-        let msi_config = MsiConfig::new(msg_ctl, interrupt_source_group.clone(), state).unwrap();
+        let msi_config =
+            MsiConfig::new(msg_ctl, Arc::clone(&interrupt_source_group), state).unwrap();
 
         self.interrupt.msi = Some(VfioMsi {
             cfg: msi_config,
@@ -1683,7 +1684,8 @@ impl VfioCommon {
                 ))
             })?;
             self.load_migration_data(&blob)
-                .map_err(|e| VfioPciError::RestoreMigration(anyhow!("{e}")))?;
+                .context("Failed to load migration data for restoring VFIO device")
+                .map_err(VfioPciError::RestoreMigration)?;
         }
 
         self.sync_command_and_interrupts()?;
@@ -1720,7 +1722,7 @@ impl VfioCommon {
         debug!("VFIO migration transition -> {target:?}");
         self.vfio_wrapper
             .set_migration_state(target)
-            .map_err(|e| anyhow!("VFIO set_migration_state({target:?}) failed: {e}"))
+            .with_context(|| format!("VFIO set_migration_state({target:?}) failed"))
     }
 
     fn reset_and_rearm(&self) {
@@ -1772,9 +1774,9 @@ impl VfioCommon {
             .transition_migration_state_with_recovery(VfioMigrationState::Stop, None)
             .map_err(MigratableError::Snapshot);
 
-        let data = data.map_err(|e| {
-            MigratableError::Snapshot(anyhow!("VFIO migration data read failed: {e}"))
-        })?;
+        let data = data
+            .context("VFIO migration data read failed")
+            .map_err(MigratableError::Snapshot)?;
         stop?;
         Ok(data)
     }
@@ -1791,9 +1793,9 @@ impl VfioCommon {
         // only allows aborting with a reset, so reset directly.
         if let Err(e) = self.vfio_wrapper.write_migration_data(data) {
             self.reset_and_rearm();
-            return Err(MigratableError::Restore(anyhow!(
-                "VFIO migration data write failed: {e}"
-            )));
+            return Err(MigratableError::Restore(
+                anyhow::Error::new(e).context("VFIO migration data write failed"),
+            ));
         }
         Ok(())
     }
@@ -1811,7 +1813,8 @@ impl VfioCommon {
         let negotiated = self
             .vfio_wrapper
             .start_dma_logging(page_size, ranges)
-            .map_err(|e| MigratableError::StartDirtyLog(anyhow!("VFIO start_dma_logging: {e}")))?;
+            .context("VFIO start_dma_logging failed")
+            .map_err(MigratableError::StartDirtyLog)?;
         debug!(
             "VFIO DMA logging started over {} range(s), requested page size {page_size:#x}, device granularity {negotiated:#x}",
             ranges.len()
@@ -1826,7 +1829,8 @@ impl VfioCommon {
         }
         self.vfio_wrapper
             .stop_dma_logging()
-            .map_err(|e| MigratableError::StopDirtyLog(anyhow!("VFIO stop_dma_logging: {e}")))
+            .context("VFIO stop_dma_logging failed")
+            .map_err(MigratableError::StopDirtyLog)
     }
 
     // Reports per range dirty bitmaps from the kernel, merged into a single
@@ -1844,7 +1848,8 @@ impl VfioCommon {
             let table = self
                 .vfio_wrapper
                 .report_dma_logging(*range, page_size)
-                .map_err(|e| MigratableError::DirtyLog(anyhow!("VFIO report_dma_logging: {e}")))?;
+                .context("VFIO report_dma_logging failed")
+                .map_err(MigratableError::DirtyLog)?;
             tables.push(table);
         }
         Ok(MemoryRangeTable::new_from_tables(tables))
@@ -2206,6 +2211,7 @@ impl VfioPciDevice {
                             user_memory_region.mapping.addr(),
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(VfioPciError::CreateUserMemoryRegion)?;
@@ -2266,7 +2272,6 @@ impl VfioPciDevice {
                         user_memory_region.start,
                         len,
                         host_addr,
-                        false,
                         false,
                     )
                 } {
@@ -2406,9 +2411,10 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
         for region in self.common.mmio_regions.iter_mut() {
-            if region.start.raw_value() == old_base {
+            if region.index as usize == bar_idx {
+                let old_base = region.start.raw_value();
                 region.start = GuestAddress(new_base);
 
                 for user_memory_region in region.user_memory_regions.iter_mut() {
@@ -2442,7 +2448,6 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                             len,
                             host_addr,
                             false,
-                            false,
                         )
                     }
                     .map_err(io::Error::other)?;
@@ -2466,6 +2471,7 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                             host_addr,
                             false,
                             false,
+                            hypervisor::MemoryVisibility::Shared,
                         )
                     }
                     .map_err(io::Error::other)?;
@@ -2673,9 +2679,10 @@ where
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::env::temp_dir;
     use std::os::fd::AsFd;
+    use std::sync::Mutex;
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -2746,13 +2753,6 @@ mod unit_tests {
             .find_user_address(guest_addr, page_size)
             .unwrap_err();
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
 
     // Trait default behavior and state enum round trip.
 
@@ -2974,7 +2974,7 @@ mod tests {
         }
     }
 
-    fn test_vfio_common(vfio_wrapper: Arc<dyn Vfio>, migration_flags: Option<u64>) -> VfioCommon {
+    fn test_vfio_common(vfio_wrapper: Arc<MockVfio>, migration_flags: Option<u64>) -> VfioCommon {
         let configuration = PciConfiguration::new(
             0,
             0,
@@ -3011,7 +3011,7 @@ mod tests {
     fn save_migration_data_success_path() {
         let blob = b"hello migration".to_vec();
         let mock = MockVfio::for_save(blob.clone());
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let got = common.save_migration_data().unwrap();
         assert_eq!(got, blob);
         assert_eq!(
@@ -3023,7 +3023,7 @@ mod tests {
     #[test]
     fn save_migration_data_stop_copy_failure_recovers_to_stop() {
         let mock = MockVfio::failing_at(&[VfioMigrationState::StopCopy]);
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.save_migration_data().unwrap_err();
         assert!(matches!(err, MigratableError::Snapshot(_)));
         // Entering STOP_COPY failed, so STOP is attempted as recovery.
@@ -3037,7 +3037,7 @@ mod tests {
     #[test]
     fn save_migration_data_stop_copy_and_stop_failure_resets() {
         let mock = MockVfio::failing_at(&[VfioMigrationState::StopCopy, VfioMigrationState::Stop]);
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.save_migration_data().unwrap_err();
         assert!(matches!(err, MigratableError::Snapshot(_)));
         // The recovery STOP failed too, so the device is reset.
@@ -3051,7 +3051,7 @@ mod tests {
     #[test]
     fn save_migration_data_read_failure_returns_to_stop() {
         let mock = MockVfio::failing_read();
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.save_migration_data().unwrap_err();
         assert!(matches!(err, MigratableError::Snapshot(_)));
         // STOP_COPY was entered, so the device is returned to STOP.
@@ -3069,7 +3069,7 @@ mod tests {
             fail_at: vec![VfioMigrationState::Stop],
             ..Default::default()
         });
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.save_migration_data().unwrap_err();
         assert!(matches!(err, MigratableError::Snapshot(_)));
         // The return to STOP after the failed read has no recovery state,
@@ -3085,7 +3085,7 @@ mod tests {
     fn load_migration_data_success_path() {
         let blob = b"restore me".to_vec();
         let mock = MockVfio::for_load();
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         common.load_migration_data(&blob).unwrap();
         assert_eq!(mock.loaded(), blob);
         // Device is left in RESUMING so resume() can drive it to RUNNING.
@@ -3095,7 +3095,7 @@ mod tests {
     #[test]
     fn load_migration_data_recovers_on_failure() {
         let mock = MockVfio::failing_at(&[VfioMigrationState::Resuming]);
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.load_migration_data(b"ignored").unwrap_err();
         assert!(matches!(err, MigratableError::Restore(_)));
         assert_eq!(
@@ -3108,7 +3108,7 @@ mod tests {
     #[test]
     fn load_migration_data_resuming_and_stop_failure_resets() {
         let mock = MockVfio::failing_at(&[VfioMigrationState::Resuming, VfioMigrationState::Stop]);
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.load_migration_data(b"ignored").unwrap_err();
         assert!(matches!(err, MigratableError::Restore(_)));
         assert_eq!(
@@ -3124,7 +3124,7 @@ mod tests {
             fail_write: true,
             ..Default::default()
         });
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common.load_migration_data(b"ignored").unwrap_err();
         assert!(matches!(err, MigratableError::Restore(_)));
         // A RESUMING session can only be aborted by a reset, so a failed write
@@ -3195,7 +3195,7 @@ mod tests {
     #[test]
     fn start_dirty_log_skips_empty_ranges() {
         let mock = MockVfio::for_dma_logging(Vec::new());
-        let mut common = test_vfio_common(mock.clone(), Some(1));
+        let mut common = test_vfio_common(Arc::clone(&mock), Some(1));
 
         // No ranges to track, so no logging session is opened and the
         // stop is a no op rather than an unbalanced kernel call.
@@ -3207,7 +3207,7 @@ mod tests {
     #[test]
     fn start_stop_dirty_log_drives_mock_when_migration_enabled() {
         let mock = MockVfio::for_dma_logging(Vec::new());
-        let mut common = test_vfio_common(mock.clone(), Some(1));
+        let mut common = test_vfio_common(Arc::clone(&mock), Some(1));
         let ranges = [DmaLoggingRange {
             iova: 0x4000,
             length: 0x2000,
@@ -3280,7 +3280,7 @@ mod tests {
     #[test]
     fn transition_without_recovery_state_resets() {
         let mock = MockVfio::failing_at(&[VfioMigrationState::Running]);
-        let common = test_vfio_common(mock.clone(), Some(1));
+        let common = test_vfio_common(Arc::clone(&mock), Some(1));
         let err = common
             .transition_migration_state_with_recovery(VfioMigrationState::Running, None)
             .unwrap_err();

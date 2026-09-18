@@ -72,16 +72,10 @@ pub const MINIMUM_BLOCK_QUEUE_SIZE: u16 = 2;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Failed to parse the request")]
-    RequestParsing(#[source] block::Error),
-    #[error("Failed to execute the request")]
-    RequestExecuting(#[source] block::ExecuteError),
     #[error("Failed to complete the request")]
     RequestCompleting(#[source] block::Error),
     #[error("Missing the expected entry in the list of requests")]
     MissingEntryRequestList,
-    #[error("The asynchronous request returned with failure")]
-    AsyncRequestFailure,
     #[error("Failed synchronizing the file")]
     Fsync(#[source] AsyncIoError),
     #[error("Failed adding used index")]
@@ -159,7 +153,7 @@ struct ActiveRequestGuard {
 impl ActiveRequestGuard {
     fn new(counter: &Arc<AtomicUsize>) -> Self {
         Self {
-            counter: counter.clone(),
+            counter: Arc::clone(counter),
         }
     }
 }
@@ -194,7 +188,6 @@ struct BlockEpollHandler {
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
-    disable_sector0_writes: bool,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -202,11 +195,7 @@ fn has_feature(features: u64, feature_flag: u64) -> bool {
 }
 
 impl BlockEpollHandler {
-    fn check_request(
-        features: u64,
-        request: &Request,
-        disable_sector0_writes: bool,
-    ) -> result::Result<(), ExecuteError> {
+    fn check_request(features: u64, request: &Request) -> result::Result<(), ExecuteError> {
         let request_type = request.request_type();
         if (has_feature(features, VIRTIO_BLK_F_RO.into()))
             && !(request_type == RequestType::In
@@ -219,11 +208,6 @@ impl BlockEpollHandler {
             warn!(
                 "Rejecting block request {request_type:?}: device is read-only (VIRTIO_BLK_F_RO negotiated)"
             );
-            return Err(ExecuteError::ReadOnly);
-        }
-
-        if request_type == RequestType::Out && disable_sector0_writes && request.sector() == 0 {
-            warn!("Attempting to write to sector 0 on a disk without specifying image_type");
             return Err(ExecuteError::ReadOnly);
         }
 
@@ -247,7 +231,7 @@ impl BlockEpollHandler {
         self.active_request_count.fetch_add(1, Ordering::SeqCst);
         let _active_request = ActiveRequestGuard::new(&self.active_request_count);
         // Clone the Arc so the `self.queue` mutable borrow is allowed.
-        let draining_active_requests = self.draining_active_requests.clone();
+        let draining_active_requests = Arc::clone(&self.draining_active_requests);
         if draining_active_requests.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -301,10 +285,7 @@ impl BlockEpollHandler {
             // For virtio spec compliance
             // "A device MUST set the status byte to VIRTIO_BLK_S_IOERR for a write request
             // if the VIRTIO_BLK_F_RO feature if offered, and MUST NOT write any data."
-            // Also, if sector 0 writes are disabled, treat writes to sector 0 as read-only as well.
-            if let Err(e) =
-                Self::check_request(self.acked_features, &request, self.disable_sector0_writes)
-            {
+            if let Err(e) = Self::check_request(self.acked_features, &request) {
                 warn!("Request check failed: {request:x?} {e:?}");
                 desc_chain
                     .memory()
@@ -360,7 +341,6 @@ impl BlockEpollHandler {
                 self.disk_nsectors.load(Ordering::SeqCst),
                 self.disk_image.as_mut(),
                 &self.serial,
-                self.disable_sector0_writes,
                 desc_chain.head_index() as u64,
             );
 
@@ -776,7 +756,6 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
-    disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -810,8 +789,8 @@ impl Block {
         state: Option<BlockState>,
         queue_affinity: BTreeMap<u16, Box<[usize]>>,
         sparse: bool,
-        disable_sector0_writes: bool,
         lock_granularity: LockGranularityChoice,
+        guest_block_size: Option<u32>,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -867,7 +846,10 @@ impl Block {
                     avail_features |= 1u64 << VIRTIO_BLK_F_RO;
                 }
 
-                let topology = disk_image.topology();
+                let mut topology = disk_image.topology();
+                if let Some(block_size) = guest_block_size {
+                    topology = topology.with_block_size(block_size as u64);
+                }
                 info!("Disk topology: {topology:?}");
 
                 let logical_block_size = if topology.logical_block_size > 512 {
@@ -942,7 +924,6 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
-            disable_sector0_writes,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -1175,7 +1156,7 @@ impl VirtioDevice for Block {
         if original_acked_features != self.common.acked_features {
             warn!("Guest did not acknowledge that device is read-only, acting as if it did!");
         }
-        self.common.activate(&queues, interrupt_cb.clone())?;
+        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
 
         // Recompute the barrier size from the queues that are actually activated.
         self.common.paused_sync = Some(Arc::new(Barrier::new(queues.len() + 1)));
@@ -1204,12 +1185,12 @@ impl VirtioDevice for Block {
                         error!("failed to create new AsyncIo: {e}");
                         ActivateError::BadActivate
                     })?,
-                disk_nsectors: self.disk_nsectors.clone(),
-                interrupt_cb: interrupt_cb.clone(),
+                disk_nsectors: Arc::clone(&self.disk_nsectors),
+                interrupt_cb: Arc::clone(&interrupt_cb),
                 serial: self.serial.clone(),
                 kill_evt,
                 pause_evt,
-                writeback: self.writeback.clone(),
+                writeback: Arc::clone(&self.writeback),
                 counters: self.counters.clone(),
                 queue_evt,
                 // Analysis during boot shows around ~40 maximum requests
@@ -1225,12 +1206,11 @@ impl VirtioDevice for Block {
                 access_platform: self.common.access_platform(),
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
-                disable_sector0_writes: self.disable_sector0_writes,
-                active_request_count: self.active_request_count.clone(),
-                draining_active_requests: self.draining_active_requests.clone(),
+                active_request_count: Arc::clone(&self.active_request_count),
+                draining_active_requests: Arc::clone(&self.draining_active_requests),
             };
 
-            let paused = self.common.paused.clone();
+            let paused = Arc::clone(&self.common.paused);
             let paused_sync = self.common.paused_sync.clone();
 
             self.common.spawn_worker(
@@ -1238,8 +1218,8 @@ impl VirtioDevice for Block {
                 &self.seccomp_action,
                 Thread::VirtioBlock,
                 &self.exit_evt,
-                self.device_status.clone(),
-                interrupt_cb.clone(),
+                Arc::clone(&self.device_status),
+                Arc::clone(&interrupt_cb),
                 move || handler.run(&paused, paused_sync.as_ref().unwrap()),
             )?;
         }
@@ -1264,6 +1244,9 @@ impl VirtioDevice for Block {
     fn counters(&self) -> Option<HashMap<&'static str, Wrapping<u64>>> {
         let mut counters = HashMap::new();
 
+        let read_ops = self.counters.read_ops.load(Ordering::Acquire);
+        let write_ops = self.counters.write_ops.load(Ordering::Acquire);
+
         counters.insert(
             "read_bytes",
             Wrapping(self.counters.read_bytes.load(Ordering::Acquire)),
@@ -1272,38 +1255,38 @@ impl VirtioDevice for Block {
             "write_bytes",
             Wrapping(self.counters.write_bytes.load(Ordering::Acquire)),
         );
-        counters.insert(
-            "read_ops",
-            Wrapping(self.counters.read_ops.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "write_ops",
-            Wrapping(self.counters.write_ops.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "write_latency_min",
-            Wrapping(self.counters.write_latency_min.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "write_latency_max",
-            Wrapping(self.counters.write_latency_max.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "write_latency_avg",
-            Wrapping(self.counters.write_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
-        );
-        counters.insert(
-            "read_latency_min",
-            Wrapping(self.counters.read_latency_min.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "read_latency_max",
-            Wrapping(self.counters.read_latency_max.load(Ordering::Acquire)),
-        );
-        counters.insert(
-            "read_latency_avg",
-            Wrapping(self.counters.read_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
-        );
+        counters.insert("read_ops", Wrapping(read_ops));
+        counters.insert("write_ops", Wrapping(write_ops));
+
+        // Don't publish read/write operations counters until the first operation
+        if write_ops > 0 {
+            counters.insert(
+                "write_latency_min",
+                Wrapping(self.counters.write_latency_min.load(Ordering::Acquire)),
+            );
+            counters.insert(
+                "write_latency_max",
+                Wrapping(self.counters.write_latency_max.load(Ordering::Acquire)),
+            );
+            counters.insert(
+                "write_latency_avg",
+                Wrapping(self.counters.write_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
+            );
+        }
+        if read_ops > 0 {
+            counters.insert(
+                "read_latency_min",
+                Wrapping(self.counters.read_latency_min.load(Ordering::Acquire)),
+            );
+            counters.insert(
+                "read_latency_max",
+                Wrapping(self.counters.read_latency_max.load(Ordering::Acquire)),
+            );
+            counters.insert(
+                "read_latency_avg",
+                Wrapping(self.counters.read_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
+            );
+        }
 
         Some(counters)
     }
@@ -1360,7 +1343,7 @@ impl Transportable for Block {}
 impl Migratable for Block {}
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io::Result as IoResult;
 
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
@@ -1430,7 +1413,6 @@ mod unit_tests {
             access_platform: None,
             host_cpus: None,
             acked_features: 0,
-            disable_sector0_writes: false,
         };
 
         handler.process_queue_submit().unwrap();

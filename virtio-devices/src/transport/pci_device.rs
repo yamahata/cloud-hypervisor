@@ -88,7 +88,7 @@ impl PciCapability for VirtioPciCap {
 const VIRTIO_PCI_CAP_LEN_OFFSET: u8 = 2;
 
 impl VirtioPciCap {
-    pub fn new(cfg_type: PciCapabilityType, pci_bar: u8, offset: u32, length: u32) -> Self {
+    pub(crate) fn new(cfg_type: PciCapabilityType, pci_bar: u8, offset: u32, length: u32) -> Self {
         VirtioPciCap {
             cap_len: (size_of::<VirtioPciCap>() as u8) + VIRTIO_PCI_CAP_LEN_OFFSET,
             cfg_type: cfg_type as u8,
@@ -121,7 +121,7 @@ impl PciCapability for VirtioPciNotifyCap {
 }
 
 impl VirtioPciNotifyCap {
-    pub fn new(
+    pub(crate) fn new(
         cfg_type: PciCapabilityType,
         pci_bar: u8,
         offset: u32,
@@ -164,7 +164,13 @@ impl PciCapability for VirtioPciCap64 {
 }
 
 impl VirtioPciCap64 {
-    pub fn new(cfg_type: PciCapabilityType, pci_bar: u8, id: u8, offset: u64, length: u64) -> Self {
+    pub(crate) fn new(
+        cfg_type: PciCapabilityType,
+        pci_bar: u8,
+        id: u8,
+        offset: u64,
+        length: u64,
+    ) -> Self {
         VirtioPciCap64 {
             cap: VirtioPciCap {
                 cap_len: (size_of::<VirtioPciCap64>() as u8) + VIRTIO_PCI_CAP_LEN_OFFSET,
@@ -232,7 +238,7 @@ struct VirtioPciCfgCapInfo {
 }
 
 #[derive(Copy, Clone)]
-pub enum PciVirtioSubclass {
+pub(super) enum PciVirtioSubclass {
     NonTransitionalBase = 0xff,
 }
 
@@ -284,8 +290,8 @@ const MSIX_PBA_SIZE: u64 = 0x800;
 const CAPABILITY_BAR_SIZE: u64 = (MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).next_power_of_two();
 // Align larger than natural alignment to work around Windows driver issues
 const VIRTIO_PCI_BAR_ALIGN: u64 = 0x80_0000;
-const VIRTIO_COMMON_BAR_INDEX: u8 = 0;
-const VIRTIO_SHM_BAR_INDEX: usize = 2;
+pub const VIRTIO_CONFIG_BAR_INDEX: usize = 0;
+pub const VIRTIO_SHM_BAR_INDEX: usize = 2;
 
 const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 
@@ -303,7 +309,7 @@ struct QueueState {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct VirtioPciDeviceState {
+pub(super) struct VirtioPciDeviceState {
     device_activated: bool,
     queues: Vec<QueueState>,
     interrupt_status: usize,
@@ -326,9 +332,9 @@ impl VirtioPciDeviceActivator {
     pub fn activate(mut self) -> ActivateResult {
         let result = self.device.lock().unwrap().activate(ActivationContext {
             mem: self.memory.take().unwrap(),
-            interrupt_cb: self.interrupt.clone(),
+            interrupt_cb: Arc::clone(&self.interrupt),
             queues: self.queues.take().unwrap(),
-            device_status: self.status.clone(),
+            device_status: Arc::clone(&self.status),
         });
 
         if let Err(e) = &result {
@@ -358,7 +364,7 @@ pub enum VirtioPciDeviceError {
     #[error("Failed creating VirtioPciDevice")]
     CreateVirtioPciDevice(#[source] anyhow::Error),
 }
-pub type Result<T> = result::Result<T, VirtioPciDeviceError>;
+pub(super) type Result<T> = result::Result<T, VirtioPciDeviceError>;
 
 pub struct VirtioPciDevice {
     id: String,
@@ -440,7 +446,7 @@ impl VirtioPciDevice {
         let num_queues = locked_device.queue_max_sizes().len();
 
         if let Some(access_platform) = access_platform {
-            locked_device.set_access_platform(access_platform.clone());
+            locked_device.set_access_platform(Arc::clone(access_platform));
         }
 
         let mut queues: Vec<Queue> = locked_device
@@ -490,7 +496,7 @@ impl VirtioPciDevice {
                 MsixConfig::new(msix_num, interrupt_source_group, pci_device_bdf, msix_state)
                     .unwrap(),
             ));
-            let msix_config_clone = msix_config.clone();
+            let msix_config_clone = Arc::clone(&msix_config);
             (msix_config, msix_config_clone)
         };
 
@@ -538,7 +544,7 @@ impl VirtioPciDevice {
             })?;
 
         let common_config = if let Some(common_config_state) = common_config_state {
-            VirtioPciCommonConfig::new(common_config_state, device.clone())
+            VirtioPciCommonConfig::new(common_config_state, Arc::clone(&device))
         } else {
             VirtioPciCommonConfig::new(
                 VirtioPciCommonConfigState {
@@ -550,7 +556,7 @@ impl VirtioPciDevice {
                     msix_config: VIRTQ_MSI_NO_VECTOR,
                     msix_queues: vec![VIRTQ_MSI_NO_VECTOR; num_queues],
                 },
-                device.clone(),
+                Arc::clone(&device),
             )
         };
 
@@ -607,10 +613,10 @@ impl VirtioPciDevice {
         drop(locked_device);
 
         let virtio_interrupt = Arc::new(VirtioInterruptMsix::new(
-            msix_config.clone(),
-            common_config.msix_config.clone(),
-            common_config.config_changed.clone(),
-            common_config.msix_queues.clone(),
+            Arc::clone(&msix_config),
+            Arc::clone(&common_config.msix_config),
+            Arc::clone(&common_config.config_changed),
+            Arc::clone(&common_config.msix_queues),
             interrupt_source_group.clone(),
         ));
 
@@ -691,11 +697,6 @@ impl VirtioPciDevice {
         self.common_config.driver_status.load(Ordering::SeqCst) == DEVICE_INIT as u8
     }
 
-    pub fn config_bar_addr(&self) -> u64 {
-        self.configuration
-            .get_bar_addr(VIRTIO_COMMON_BAR_INDEX.into())
-    }
-
     fn add_pci_capabilities(
         &mut self,
         device_config_size: u64,
@@ -703,7 +704,7 @@ impl VirtioPciDevice {
         // Add pointers to the different configuration structures from the PCI capabilities.
         let common_cap = VirtioPciCap::new(
             PciCapabilityType::Common,
-            VIRTIO_COMMON_BAR_INDEX,
+            VIRTIO_CONFIG_BAR_INDEX as u8,
             COMMON_CONFIG_BAR_OFFSET as u32,
             COMMON_CONFIG_SIZE as u32,
         );
@@ -713,7 +714,7 @@ impl VirtioPciDevice {
 
         let isr_cap = VirtioPciCap::new(
             PciCapabilityType::Isr,
-            VIRTIO_COMMON_BAR_INDEX,
+            VIRTIO_CONFIG_BAR_INDEX as u8,
             ISR_CONFIG_BAR_OFFSET as u32,
             ISR_CONFIG_SIZE as u32,
         );
@@ -724,7 +725,7 @@ impl VirtioPciDevice {
         if device_config_size > 0 {
             let device_cap = VirtioPciCap::new(
                 PciCapabilityType::Device,
-                VIRTIO_COMMON_BAR_INDEX,
+                VIRTIO_CONFIG_BAR_INDEX as u8,
                 DEVICE_CONFIG_BAR_OFFSET as u32,
                 device_config_size as u32,
             );
@@ -735,7 +736,7 @@ impl VirtioPciDevice {
 
         let notify_cap = VirtioPciNotifyCap::new(
             PciCapabilityType::Notify,
-            VIRTIO_COMMON_BAR_INDEX,
+            VIRTIO_CONFIG_BAR_INDEX as u8,
             NOTIFICATION_BAR_OFFSET as u32,
             NOTIFICATION_SIZE as u32,
             Le32::from(NOTIFY_OFF_MULTIPLIER),
@@ -753,10 +754,10 @@ impl VirtioPciDevice {
         self.cap_pci_cfg_info.cap = configuration_cap;
 
         let msix_cap = MsixCap::new(
-            VIRTIO_COMMON_BAR_INDEX,
+            VIRTIO_CONFIG_BAR_INDEX as u8,
             self.msix_num,
             MSIX_TABLE_BAR_OFFSET as u32,
-            VIRTIO_COMMON_BAR_INDEX,
+            VIRTIO_CONFIG_BAR_INDEX as u8,
             MSIX_PBA_BAR_OFFSET as u32,
         );
         self.configuration
@@ -813,7 +814,7 @@ impl VirtioPciDevice {
     }
 
     pub fn virtio_device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
-        self.device.clone()
+        Arc::clone(&self.device)
     }
 
     fn prepare_activator(&mut self, barrier: Option<Arc<Barrier>>) -> VirtioPciDeviceActivator {
@@ -837,14 +838,14 @@ impl VirtioPciDevice {
         }
 
         VirtioPciDeviceActivator {
-            interrupt: self.virtio_interrupt.clone(),
+            interrupt: Arc::clone(&self.virtio_interrupt),
             memory: Some(self.memory.clone()),
-            device: self.device.clone(),
+            device: Arc::clone(&self.device),
             queues: Some(queues),
-            device_activated: self.device_activated.clone(),
+            device_activated: Arc::clone(&self.device_activated),
             barrier,
             id: self.id.clone(),
-            status: self.common_config.driver_status.clone(),
+            status: Arc::clone(&self.common_config.driver_status),
         }
     }
 
@@ -875,7 +876,7 @@ impl VirtioTransport for VirtioPciDevice {
     }
 }
 
-pub struct VirtioInterruptMsix {
+pub(super) struct VirtioInterruptMsix {
     msix_config: Arc<Mutex<MsixConfig>>,
     config_vector: Arc<AtomicU16>,
     config_changed: Arc<AtomicBool>,
@@ -885,7 +886,7 @@ pub struct VirtioInterruptMsix {
 }
 
 impl VirtioInterruptMsix {
-    pub fn new(
+    pub(super) fn new(
         msix_config: Arc<Mutex<MsixConfig>>,
         config_vector: Arc<AtomicU16>,
         config_changed: Arc<AtomicBool>,
@@ -1025,7 +1026,7 @@ impl PciDevice for VirtioPciDevice {
         resources: Option<Vec<Resource>>,
     ) -> result::Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
-        let device_clone = self.device.clone();
+        let device_clone = Arc::clone(&self.device);
         let device = device_clone.lock().unwrap();
 
         let mut settings_bar_addr = None;
@@ -1036,7 +1037,7 @@ impl PciDevice for VirtioPciDevice {
                 if let Resource::PciBar {
                     index, base, type_, ..
                 } = resource
-                    && index == usize::from(VIRTIO_COMMON_BAR_INDEX)
+                    && index == VIRTIO_CONFIG_BAR_INDEX
                 {
                     settings_bar_addr = Some(GuestAddress(base));
                     use_64bit_bar = match type_ {
@@ -1081,7 +1082,7 @@ impl PciDevice for VirtioPciDevice {
         };
 
         let bar = PciBarConfiguration::default()
-            .set_index(VIRTIO_COMMON_BAR_INDEX.into())
+            .set_index(VIRTIO_CONFIG_BAR_INDEX)
             .set_address(virtio_pci_bar_addr.raw_value())
             .set_size(CAPABILITY_BAR_SIZE)
             .set_region_type(region_type);
@@ -1160,11 +1161,11 @@ impl PciDevice for VirtioPciDevice {
         Ok(())
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> io::Result<()> {
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         // We only update our idea of the bar in order to support free_bars() above.
         // The majority of the reallocation is done inside DeviceManager.
         for bar in self.bar_regions.iter_mut() {
-            if bar.addr() == old_base {
+            if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
             }
         }
@@ -1279,7 +1280,7 @@ impl PciDevice for VirtioPciDevice {
         // Try and activate the device if the driver status has changed (from unready to ready)
         if !initial_ready && self.needs_activation() {
             let barrier = Arc::new(Barrier::new(2));
-            let activator = self.prepare_activator(Some(barrier.clone()));
+            let activator = self.prepare_activator(Some(Arc::clone(&barrier)));
             self.pending_activations.lock().unwrap().push(activator);
             info!(
                 "{}: Needs activation; writing to activate event fd",
@@ -1364,7 +1365,7 @@ impl Transportable for VirtioPciDevice {}
 impl Migratable for VirtioPciDevice {}
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::thread;
 
     use vm_device::interrupt::InterruptSourceConfig;
@@ -1398,13 +1399,13 @@ mod unit_tests {
     }
 
     fn make_msix_interrupt(num_vectors: u16) -> VirtioInterruptMsix {
-        let isg = Arc::new(TestInterruptSourceGroup {
+        let isg: Arc<dyn InterruptSourceGroup> = Arc::new(TestInterruptSourceGroup {
             event_fd: EventFd::new(0).unwrap(),
         });
         let msix_config = Arc::new(Mutex::new(
             MsixConfig::new(
                 num_vectors,
-                MaybeMutInterruptSourceGroup::Immutable(isg.clone()),
+                MaybeMutInterruptSourceGroup::Immutable(Arc::clone(&isg)),
                 0,
                 None,
             )
@@ -1588,15 +1589,16 @@ mod unit_tests {
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
         );
         let barrier = Arc::new(Barrier::new(2));
+        let interrupt_cb = Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>;
         let activator = VirtioPciDeviceActivator {
-            interrupt: interrupt.clone(),
+            interrupt: interrupt_cb,
             memory: Some(memory),
             device,
-            device_activated: device_activated.clone(),
+            device_activated: Arc::clone(&device_activated),
             queues: Some(Vec::new()),
-            barrier: Some(barrier.clone()),
+            barrier: Some(Arc::clone(&barrier)),
             id: "test-dev".to_string(),
-            status: status.clone(),
+            status: Arc::clone(&status),
         };
         (activator, status, device_activated, interrupt, barrier)
     }

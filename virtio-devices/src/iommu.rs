@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_device::interrupt::{InterruptRemapping, MsiIrqSourceConfig};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryBackend, GuestMemoryError, GuestMemoryLoadGuard,
@@ -301,6 +302,8 @@ enum Error {
     InvalidAttachRequest,
     #[error("Guest sent us invalid DETACH request")]
     InvalidDetachRequest,
+    #[error("Invalid to detach because the endpoint is not attached to the domain")]
+    InvalidDetachRequestWrongDomain,
     #[error("Guest sent us invalid MAP request")]
     InvalidMapRequest,
     #[error("Invalid to map because the domain is in bypass mode")]
@@ -500,6 +503,12 @@ impl Request {
                     // Copy the value to use it as a proper reference.
                     let domain_id = req.domain;
                     let endpoint = req.endpoint;
+
+                    // The endpoint must be attached to this very domain.
+                    if mapping.endpoints.read().unwrap().get(&endpoint) != Some(&domain_id) {
+                        status = VIRTIO_IOMMU_S_INVAL;
+                        return Err(Error::InvalidDetachRequestWrongDomain);
+                    }
 
                     // Remove endpoint associated with specific domain
                     detach_endpoint_from_domain(endpoint, domain_id, mapping, ext_mapping)?;
@@ -974,6 +983,7 @@ pub struct IommuMapping {
     // Global flag indicating if endpoints that are not attached to any domain
     // are in bypass mode.
     bypass: AtomicBool,
+    msi_iova_space: (u64, u64),
 }
 
 // Inclusive end of `[addr, addr+size)`. Returns None for zero size or
@@ -1087,6 +1097,25 @@ impl DmaRemapping for IommuMapping {
     }
 }
 
+impl InterruptRemapping for IommuMapping {
+    fn translate_msi(&self, dev_id: u32, cfg: MsiIrqSourceConfig) -> Option<MsiIrqSourceConfig> {
+        let addr = (u64::from(cfg.high_addr) << 32) | u64::from(cfg.low_addr);
+        let (start, end) = self.msi_iova_space;
+        let gpa = if (start..=end).contains(&addr) {
+            addr
+        } else {
+            self.translate_gva(dev_id, addr, size_of::<u32>() as u64)
+                .ok()?
+        };
+
+        Some(MsiIrqSourceConfig {
+            high_addr: (gpa >> 32) as u32,
+            low_addr: gpa as u32,
+            ..cfg
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct AccessPlatformMapping {
     id: u32,
@@ -1195,6 +1224,7 @@ impl Iommu {
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(true),
+            msi_iova_space,
         });
 
         Ok((
@@ -1211,7 +1241,7 @@ impl Iommu {
                     ..Default::default()
                 },
                 config,
-                mapping: mapping.clone(),
+                mapping: Arc::clone(&mapping),
                 ext_mapping: Arc::new(Mutex::new(BTreeMap::new())),
                 seccomp_action,
                 exit_evt,
@@ -1326,7 +1356,7 @@ impl VirtioDevice for Iommu {
             mut queues,
             device_status,
         } = context;
-        self.common.activate(&queues, interrupt_cb.clone())?;
+        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
 
         let (_, request_queue, request_queue_evt) = queues.remove(0);
@@ -1336,26 +1366,26 @@ impl VirtioDevice for Iommu {
             mem,
             request_queue,
             _event_queue,
-            interrupt_cb: interrupt_cb.clone(),
+            interrupt_cb: Arc::clone(&interrupt_cb),
             request_queue_evt,
             _event_queue_evt,
             kill_evt,
             pause_evt,
-            mapping: self.mapping.clone(),
-            ext_mapping: self.ext_mapping.clone(),
+            mapping: Arc::clone(&self.mapping),
+            ext_mapping: Arc::clone(&self.ext_mapping),
             msi_iova_space: self.msi_iova_space,
             input_range: self.input_range,
         };
 
-        let paused = self.common.paused.clone();
+        let paused = Arc::clone(&self.common.paused);
         let paused_sync = self.common.paused_sync.clone();
         self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
             Thread::VirtioIommu,
             &self.exit_evt,
-            device_status.clone(),
-            interrupt_cb.clone(),
+            Arc::clone(&device_status),
+            Arc::clone(&interrupt_cb),
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
         )?;
 
@@ -1484,6 +1514,7 @@ mod tests {
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(false),
+            msi_iova_space: (0, 0),
         }
     }
 

@@ -137,7 +137,7 @@ impl AsyncIo for QcowSync {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::fs::{File, OpenOptions, create_dir};
     use std::io::Write;
     use std::os::unix::fs::FileExt;
@@ -156,7 +156,7 @@ mod unit_tests {
     use crate::error::BlockErrorKind;
     use crate::formats::qcow;
     use crate::formats::qcow::common::apply_dealloc_action;
-    use crate::formats::qcow::common::unit_tests::compress_allocated_clusters;
+    use crate::formats::qcow::common::tests::compress_allocated_clusters;
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
         BackingFileConfig, Error as QcowError, ImageType, QcowDisk, QcowHeader, QcowTempDisk,
@@ -331,7 +331,7 @@ mod unit_tests {
         let ranges: Vec<(GuestAddress, u32)> = (0..ranges_count)
             .map(|i| (GuestAddress((i * chunk) as u64), chunk as u32))
             .collect();
-        let target = GuestMemoryTarget::new(mem.clone(), &ranges).unwrap();
+        let target = GuestMemoryTarget::new(Arc::clone(&mem), &ranges).unwrap();
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.read_to_memory(0, target, 1).unwrap();

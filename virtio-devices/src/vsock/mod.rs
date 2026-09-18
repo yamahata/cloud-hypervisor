@@ -25,43 +25,43 @@ pub use self::unix::{VsockUnixBackend, VsockUnixError};
 mod defs {
 
     /// Max vsock packet data/buffer size.
-    pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
+    pub(super) const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
 
-    pub mod uapi {
+    pub(super) mod uapi {
 
         /// Vsock packet operation IDs.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///
         /// Connection request.
-        pub const VSOCK_OP_REQUEST: u16 = 1;
+        pub(crate) const VSOCK_OP_REQUEST: u16 = 1;
         /// Connection response.
-        pub const VSOCK_OP_RESPONSE: u16 = 2;
+        pub(crate) const VSOCK_OP_RESPONSE: u16 = 2;
         /// Connection reset.
-        pub const VSOCK_OP_RST: u16 = 3;
+        pub(crate) const VSOCK_OP_RST: u16 = 3;
         /// Connection clean shutdown.
-        pub const VSOCK_OP_SHUTDOWN: u16 = 4;
+        pub(crate) const VSOCK_OP_SHUTDOWN: u16 = 4;
         /// Connection data (read/write).
-        pub const VSOCK_OP_RW: u16 = 5;
+        pub(crate) const VSOCK_OP_RW: u16 = 5;
         /// Flow control credit update.
-        pub const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
+        pub(crate) const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
         /// Flow control credit update request.
-        pub const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
+        pub(crate) const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
 
         /// Vsock packet flags.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///
         /// Valid with a VSOCK_OP_SHUTDOWN packet: the packet sender will receive no more data.
-        pub const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
+        pub(crate) const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
         /// Valid with a VSOCK_OP_SHUTDOWN packet: the packet sender will send no more data.
-        pub const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
+        pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
         /// Vsock packet type.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///
         /// Stream / connection-oriented packet (the only currently valid type).
-        pub const VSOCK_TYPE_STREAM: u16 = 1;
+        pub(crate) const VSOCK_TYPE_STREAM: u16 = 1;
 
-        pub const VSOCK_HOST_CID: u64 = 2;
+        pub(crate) const VSOCK_HOST_CID: u64 = 2;
     }
 }
 
@@ -79,9 +79,6 @@ pub enum VsockError {
     /// Chained GuestMemory access error.
     #[error("Guest memory access error")]
     GuestMemoryAccess(#[source] vm_memory::GuestMemoryError),
-    /// Bounds check failed on guest memory pointer.
-    #[error("Bounds check failed on guest memory pointer")]
-    GuestMemoryBounds,
     /// The vsock header descriptor length is too small.
     #[error("The vsock header descriptor length is too small: {0}")]
     HdrDescTooSmall(u32),
@@ -158,7 +155,7 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
 }
 
 #[cfg(any(test, fuzzing))]
-pub mod unit_tests {
+pub mod tests {
     use std::io;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
@@ -349,7 +346,7 @@ pub mod unit_tests {
     }
 
     pub struct EpollHandlerContext<'a> {
-        pub handler: VsockEpollHandler<TestBackend>,
+        pub(crate) handler: VsockEpollHandler<TestBackend>,
         pub guest_rxvq: GuestQ<'a>,
         pub guest_txvq: GuestQ<'a>,
         pub guest_evvq: GuestQ<'a>,

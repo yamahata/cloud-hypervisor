@@ -14,7 +14,7 @@ use std::result;
 
 use thiserror::Error;
 
-pub type Result<T> = result::Result<T, InterruptAllocError>;
+pub(crate) type Result<T> = result::Result<T, InterruptAllocError>;
 
 /// Describes one APIC interrupt input range in the global system interrupt
 /// namespace.
@@ -299,7 +299,7 @@ impl Default for GsiAllocator {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     mod interrupt_allocator {

@@ -244,7 +244,7 @@ fn required_msr_updates(
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use hypervisor::arch::x86::MsrEntry;
     use hypervisor::arch::x86::msr_index::{MSR_IA32_UCODE_REV, MSR_IA32_VMX_MISC};
     use proptest::prelude::*;
@@ -483,9 +483,9 @@ mod unit_tests {
             let leaf2 = transform_leaf(leaf2);
 
             // The leaves should still be distinct
-            assert!(leaf0 != leaf1);
-            assert!(leaf0 != leaf2);
-            assert!(leaf1 != leaf2);
+            assert_ne!(leaf0, leaf1);
+            assert_ne!(leaf0, leaf2);
+            assert_ne!(leaf1, leaf2);
             // We have now setup leaves to be used in this test
 
             // Let's now construct some simple adjustments

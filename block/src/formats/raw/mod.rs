@@ -29,7 +29,7 @@ pub(crate) mod engine_sync;
 #[cfg(feature = "io_uring")]
 pub(crate) mod engine_uring;
 #[cfg(test)]
-mod tests;
+mod test_helpers;
 
 /// Selects which async I/O backend a `RawDisk` uses.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -202,7 +202,7 @@ fn run_unaligned_operation(
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::fs::File;
 
     use vmm_sys_util::tempfile::TempFile;

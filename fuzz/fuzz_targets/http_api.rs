@@ -14,8 +14,8 @@ use micro_http::Request;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
-    ApiRequest, RequestHandler, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData,
-    VmmPingResponse,
+    ApiRequest, BalloonStatsResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
+    VmSendMigrationData, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
 use vmm::vm::{Error as VmError, VmState};
@@ -24,8 +24,13 @@ use vmm::{EpollContext, EpollDispatch};
 use vmm_sys_util::eventfd::EventFd;
 
 // Need to be ordered for test case reproducibility
-static ROUTES: LazyLock<Vec<&Box<dyn EndpointHandler + Sync + Send>>> =
-    LazyLock::new(|| HTTP_ROUTES.routes.values().collect());
+static ROUTES: LazyLock<Vec<&'static (dyn EndpointHandler + Sync + Send)>> = LazyLock::new(|| {
+    HTTP_ROUTES
+        .routes
+        .values()
+        .map(|route| route.as_ref())
+        .collect()
+});
 
 fuzz_target!(|bytes: &[u8]| -> Corpus {
     if bytes.len() < 2 {
@@ -68,7 +73,7 @@ fn generate_request(bytes: &[u8]) -> Option<Request> {
     let request_line = format!("{} http://localhost/home HTTP/1.1\r\n", req_method);
 
     let req_body = &bytes[1..];
-    let request = if req_body.len() > 0 {
+    let request = if !req_body.is_empty() {
         [
             format!("{}Content-Length: {}\r\n", request_line, req_body.len()).as_bytes(),
             req_body,
@@ -150,7 +155,7 @@ impl RequestHandler for StubApiRequestHandler {
                     hugepages: false,
                     hugepage_size: None,
                     prefault: false,
-                    reserve: false,
+                    reserve: None,
                     zones: None,
                     thp: true,
                 },
@@ -214,6 +219,14 @@ impl RequestHandler for StubApiRequestHandler {
             state: VmState::Running,
             memory_actual_size: 0,
             device_tree: None,
+        })
+    }
+
+    fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError> {
+        Ok(BalloonStatsResponse {
+            balloon_actual: 0,
+            last_update: 0,
+            stats: Default::default(),
         })
     }
 
@@ -312,7 +325,7 @@ fn http_receiver_stub(exit_evt: EventFd, api_evt: EventFd, api_receiver: Receive
     epoll.add_event(&api_evt, EpollDispatch::Api).unwrap();
 
     let epoll_fd = epoll.as_raw_fd();
-    let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+    let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 2];
     let num_events;
     loop {
         num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {

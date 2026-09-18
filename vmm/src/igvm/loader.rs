@@ -16,7 +16,7 @@ use crate::igvm::{BootPageAcceptance, HV_PAGE_SIZE, StartupMemoryType};
 /// Structure to hold the guest memory info/layout to check
 /// the if the memory is accepted within the layout.
 /// Adds up the total bytes written to the guest memory
-pub struct Loader {
+pub(super) struct Loader {
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
     accepted_ranges: RangeMap<u64, BootPageAcceptance>,
     bytes_written: u64,
@@ -31,18 +31,18 @@ pub struct ImportRegion {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("overlaps with existing import region {0:?}")]
+    #[error("Overlaps with existing import region {0:?}")]
     OverlapsExistingRegion(ImportRegion),
-    #[error("memory unavailable")]
+    #[error("Memory unavailable")]
     MemoryUnavailable,
-    #[error("failed to import pages")]
+    #[error("Failed to import pages")]
     ImportPagesFailed,
-    #[error("data larger than imported region")]
+    #[error("Data larger than imported region")]
     DataTooLarge,
 }
 
 impl Loader {
-    pub fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> Loader {
+    pub(super) fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> Loader {
         Loader {
             memory,
             accepted_ranges: RangeMap::new(),
@@ -51,7 +51,7 @@ impl Loader {
     }
 
     /// Accept a new page range with a given acceptance into the map of accepted ranges.
-    pub fn accept_new_range(
+    pub(super) fn accept_new_range(
         &mut self,
         page_base: u64,
         page_count: u64,
@@ -75,7 +75,7 @@ impl Loader {
         }
     }
 
-    pub fn import_pages(
+    pub(super) fn import_pages(
         &mut self,
         page_base: u64,
         page_count: u64,
@@ -120,7 +120,7 @@ impl Loader {
         Ok(())
     }
 
-    pub fn verify_startup_memory_available(
+    pub(super) fn verify_startup_memory_available(
         &mut self,
         page_base: u64,
         page_count: u64,

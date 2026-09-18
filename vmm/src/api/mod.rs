@@ -41,7 +41,7 @@ use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,10 @@ pub enum ApiError {
     #[error("The VM info is not available")]
     VmInfo(#[source] VmError),
 
+    /// The virtio-balloon statistics are not available.
+    #[error("The virtio-balloon statistics are not available")]
+    VmBalloonStats(#[source] VmError),
+
     /// The VM could not be paused.
     #[error("The VM could not be paused")]
     VmPause(#[source] VmError),
@@ -109,14 +113,6 @@ pub enum ApiError {
     /// The VM could not resume.
     #[error("The VM could not resume")]
     VmResume(#[source] VmError),
-
-    /// The VM is not booted.
-    #[error("The VM is not booted")]
-    VmNotBooted,
-
-    /// The VM is not created.
-    #[error("The VM is not created")]
-    VmNotCreated,
 
     /// The VM could not shutdown.
     #[error("The VM could not shutdown")]
@@ -165,14 +161,6 @@ pub enum ApiError {
     /// The device could not be removed from the VM.
     #[error("The device could not be removed from the VM")]
     VmRemoveDevice(#[source] VmError),
-
-    /// Cannot create seccomp filter
-    #[error("Cannot create seccomp filter")]
-    CreateSeccompFilter(#[source] seccompiler::Error),
-
-    /// Cannot apply seccomp filter
-    #[error("Cannot apply seccomp filter")]
-    ApplySeccompFilter(#[source] seccompiler::Error),
 
     /// The disk could not be added to the VM.
     #[error("The disk could not be added to the VM")]
@@ -231,6 +219,13 @@ pub struct VmInfoResponse {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+pub struct BalloonStatsResponse {
+    pub balloon_actual: u64,
+    pub last_update: u64,
+    pub stats: virtio_devices::BalloonStats,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct VmmPingResponse {
     pub build_version: String,
     pub version: String,
@@ -277,6 +272,11 @@ pub struct VmCoredumpData {
 /// Memory transfer mode for a migration.
 #[derive(Copy, Clone, Default, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub enum MigrationMode {
+    /// Transfer memory as memory FDs.
+    ///
+    /// Only works via a UNIX domain socket. All guest memory must be shared
+    /// memory or use hugepage backing.
+    MemFDs,
     /// Transfer all guest memory before the destination resumes.
     #[default]
     Precopy,
@@ -292,6 +292,7 @@ impl FromStr for MigrationMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "memfds" => Ok(MigrationMode::MemFDs),
             "precopy" => Ok(MigrationMode::Precopy),
             "postcopy" => Ok(MigrationMode::Postcopy),
             _ => Err(format!("Invalid migration mode: {s}")),
@@ -311,9 +312,6 @@ pub struct VmReceiveMigrationData {
     /// If this is `Some`, the migration is instructed to use mTLS.
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,
-    /// Memory transfer mode.
-    #[serde(default)]
-    pub memory_mode: MigrationMode,
     /// Optional VFIO device id to cdev FD pairs, used to substitute each
     /// device's saved path or stale FD in the received VmConfig.
     #[serde(default)]
@@ -373,7 +371,7 @@ pub enum VmReceiveMigrationConfigError {
 
 impl VmReceiveMigrationData {
     pub const SYNTAX: &'static str = "VM receive migration parameters \
-        \"<receiver_url>\" or \"receiver_url=<url>[,tls_dir=<path>][,memory_mode=precopy|postcopy]\
+        \"<receiver_url>\" or \"receiver_url=<url>[,tls_dir=<path>]\
         [,vfio_fds=<list_of_vfio_ids_with_their_associated_fd>][,iommufd_fd=<fd>]\
         [,zone_updates=[<id@host_numa_node>]]\"";
 
@@ -382,7 +380,6 @@ impl VmReceiveMigrationData {
         parser
             .add("receiver_url")
             .add("tls_dir")
-            .add("memory_mode")
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("zone_updates");
@@ -399,10 +396,6 @@ impl VmReceiveMigrationData {
             .convert::<String>("tls_dir")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map(|path| PathBuf::from(&path));
-        let memory_mode = parser
-            .convert::<MigrationMode>("memory_mode")
-            .map_err(VmReceiveMigrationConfigError::ParseError)?
-            .unwrap_or_default();
         let vfio_fds = parser
             .convert::<TupleList<String, u64>>("vfio_fds")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
@@ -433,7 +426,6 @@ impl VmReceiveMigrationData {
         let data = Self {
             receiver_url,
             tls_dir,
-            memory_mode,
             vfio_fds,
             iommufd_fd,
             zone_updates,
@@ -587,11 +579,13 @@ pub enum VmSendMigrationConfigError {
 pub struct VmSendMigrationData {
     /// Migration destination, e.g. `tcp:<host>:<port>` or `unix:/path/to/socket`.
     pub destination_url: String,
-    /// Send memory across socket without copying
+    /// Send memory as memory FDs across socket without copying.
+    #[deprecated(note = "set `memory_mode` to `MigrationMode::MemFDs` instead")]
     #[serde(default)]
     pub local: bool,
     /// Keep the source VM alive in a paused state once the migration is
-    /// complete.
+    /// complete. Only valid when [`Self::effective_memory_mode`] is
+    /// [`MigrationMode::MemFDs`].
     #[serde(default)]
     pub preserve_source: bool,
     /// The maximum downtime the migration aims for.
@@ -618,17 +612,18 @@ pub struct VmSendMigrationData {
     /// If this is `Some`, the migration is instructed to use mTLS.
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,
-    /// Memory transfer mode.
+    /// Requested memory transfer mode.
     #[serde(default)]
     pub memory_mode: MigrationMode,
 }
 
 impl VmSendMigrationData {
     pub const SYNTAX: &'static str = "VM send migration parameters \
-        \"destination_url=<url>[,local=on|off,preserve_source=on|off,\
+        \"destination_url=<url>[,preserve_source=on|off,\
         downtime_ms=<milliseconds>,timeout_s=<seconds>,\
         timeout_strategy=cancel|ignore,connections=<amount>,\
-        tls_dir=<path>,memory_mode=precopy|postcopy]\"";
+        tls_dir=<path>,memory_mode=memfds|precopy|postcopy,\
+        local=on|off (deprecated; use memory_mode=memfds)]\"";
 
     // Same as QEMU.
     pub const DEFAULT_DOWNTIME: Duration = Duration::from_millis(300);
@@ -672,8 +667,10 @@ impl VmSendMigrationData {
         let local = parser
             .convert::<Toggle>("local")
             .map_err(VmSendMigrationConfigError::ParseError)?
-            .unwrap_or(Toggle(false))
-            .0;
+            .is_some_and(|Toggle(v)| {
+                warn!("The 'local' option is deprecated: use 'memory_mode=memfds' instead");
+                v
+            });
         let preserve_source = parser
             .convert::<Toggle>("preserve_source")
             .map_err(VmSendMigrationConfigError::ParseError)?
@@ -725,6 +722,7 @@ impl VmSendMigrationData {
             .map_err(VmSendMigrationConfigError::ParseError)?
             .unwrap_or_default();
 
+        #[expect(deprecated)]
         let data = Self {
             destination_url,
             local,
@@ -740,6 +738,16 @@ impl VmSendMigrationData {
         data.validate()?;
 
         Ok(data)
+    }
+
+    /// The memory transfer mode with the deprecated `local` flag folded in.
+    pub fn effective_memory_mode(&self) -> MigrationMode {
+        #[expect(deprecated)]
+        if self.local {
+            MigrationMode::MemFDs
+        } else {
+            self.memory_mode
+        }
     }
 
     pub fn downtime(&self) -> Duration {
@@ -782,24 +790,24 @@ impl VmSendMigrationData {
             )));
         }
 
-        if self.local {
+        if self.effective_memory_mode() == MigrationMode::MemFDs {
             if !self.destination_url.starts_with("unix:") {
                 return Err(VmSendMigrationConfigError::ValidationError(
-                    "local option is only supported with UNIX sockets.".to_string(),
+                    "Memory FD migration is only supported with UNIX sockets.".to_string(),
                 ));
             }
 
             if self.connections.get() > 1 {
                 return Err(VmSendMigrationConfigError::ValidationError(
-                    "local option and connections option cannot be used at the same time."
+                    "Memory FD migration and connections option cannot be used at the same time."
                         .to_string(),
                 ));
             }
         }
 
-        if self.preserve_source && !self.local {
+        if self.preserve_source && self.effective_memory_mode() != MigrationMode::MemFDs {
             return Err(VmSendMigrationConfigError::ValidationError(
-                "preserve_source option is only supported with the local option.".to_string(),
+                "preserve_source option is only supported with memory_mode=memfds.".to_string(),
             ));
         }
 
@@ -811,19 +819,19 @@ impl VmSendMigrationData {
             })?;
         }
 
-        if matches!(self.memory_mode, MigrationMode::Postcopy) {
-            if self.local {
-                return Err(VmSendMigrationConfigError::ValidationError(
-                    "memory_mode=postcopy and local options are mutually exclusive.".to_string(),
-                ));
-            }
+        #[expect(deprecated)]
+        if self.local && matches!(self.memory_mode, MigrationMode::Postcopy) {
+            return Err(VmSendMigrationConfigError::ValidationError(
+                "memory_mode=postcopy and the deprecated local option are mutually exclusive."
+                    .to_string(),
+            ));
+        }
 
-            if self.connections.get() > 1 {
-                return Err(VmSendMigrationConfigError::ValidationError(
-                    "memory_mode=postcopy currently requires a single connection (connections=1)."
-                        .to_string(),
-                ));
-            }
+        if matches!(self.memory_mode, MigrationMode::Postcopy) && self.connections.get() > 1 {
+            return Err(VmSendMigrationConfigError::ValidationError(
+                "memory_mode=postcopy currently requires a single connection (connections=1)."
+                    .to_string(),
+            ));
         }
 
         Ok(())
@@ -836,6 +844,9 @@ pub enum ApiResponsePayload {
 
     /// Virtual machine information
     VmInfo(VmInfoResponse),
+
+    /// Virtio-balloon statistics
+    VmBalloonStats(Box<BalloonStatsResponse>),
 
     /// Vmm ping response
     VmmPing(VmmPingResponse),
@@ -868,6 +879,8 @@ pub trait RequestHandler {
     fn vm_reboot(&mut self) -> Result<(), VmError>;
 
     fn vm_info(&self) -> Result<VmInfoResponse, VmError>;
+
+    fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError>;
 
     fn vmm_ping(&self) -> VmmPingResponse;
 
@@ -1427,6 +1440,43 @@ impl ApiAction for VmCounters {
         data: Self::RequestBody,
     ) -> ApiResult<Self::ResponseBody> {
         get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmBalloonStats;
+
+impl ApiAction for VmBalloonStats {
+    type RequestBody = ();
+    type ResponseBody = BalloonStatsResponse;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmBalloonStats");
+
+            let response = vmm
+                .vm_balloon_stats()
+                .map_err(ApiError::VmBalloonStats)
+                .map(Box::new)
+                .map(ApiResponsePayload::VmBalloonStats);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::VmBalloonStats(stats) => Ok(*stats),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
     }
 }
 
@@ -2049,11 +2099,13 @@ impl ApiAction for VmmShutdown {
                 .map_err(ApiError::VmmShutdown)
                 .map(|_| ApiResponsePayload::Empty);
 
+            let shutdown = response.is_ok();
+
             response_sender
                 .send(response)
                 .map_err(VmmError::ApiResponseSend)?;
 
-            Ok(true)
+            Ok(shutdown)
         })
     }
 
@@ -2098,7 +2150,7 @@ impl ApiAction for VmNmi {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs, process};
@@ -2147,6 +2199,24 @@ mod unit_tests {
     }
 
     #[test]
+    fn test_balloon_stats_response_omits_unsupported_stats() {
+        let response = BalloonStatsResponse {
+            balloon_actual: 4096,
+            last_update: 1234,
+            stats: virtio_devices::BalloonStats {
+                free_memory: Some(1024),
+                ..Default::default()
+            },
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["balloon_actual"], 4096);
+        assert_eq!(value["last_update"], 1234);
+        assert_eq!(value["stats"]["free_memory"], 1024);
+        assert!(value["stats"].get("swap_in").is_none());
+    }
+
+    #[test]
     fn test_vm_receive_migration_data_parse() {
         let data = VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1:8080").unwrap();
         assert_eq!(
@@ -2154,7 +2224,6 @@ mod unit_tests {
             VmReceiveMigrationData {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: None,
-                memory_mode: MigrationMode::Precopy,
                 vfio_fds: None,
                 iommufd_fd: None,
                 zone_updates: vec![],
@@ -2184,7 +2253,6 @@ mod unit_tests {
             VmReceiveMigrationData {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: Some(tls_dir_path),
-                memory_mode: MigrationMode::Precopy,
                 vfio_fds: None,
                 iommufd_fd: None,
                 zone_updates: vec![],
@@ -2239,38 +2307,11 @@ mod unit_tests {
             VmReceiveMigrationConfigError::TlsEncryptionUsedForUnixSocket,
         );
 
-        // memory_mode defaults to precopy when not specified.
-        let data = VmReceiveMigrationData::parse("receiver_url=tcp:127.0.0.1:1234").unwrap();
-        assert_eq!(
-            data,
-            VmReceiveMigrationData {
-                receiver_url: "tcp:127.0.0.1:1234".to_string(),
-                tls_dir: None,
-                memory_mode: MigrationMode::Precopy,
-                vfio_fds: None,
-                iommufd_fd: None,
-                ..Default::default()
-            }
-        );
-
-        // Explicit receiver_url with memory_mode=postcopy.
-        let data =
-            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,memory_mode=postcopy")
-                .unwrap();
-        assert_eq!(
-            data,
-            VmReceiveMigrationData {
-                receiver_url: "unix:/tmp/sock".to_string(),
-                tls_dir: None,
-                memory_mode: MigrationMode::Postcopy,
-                vfio_fds: None,
-                iommufd_fd: None,
-                ..Default::default()
-            }
-        );
+        VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,memory_mode=postcopy")
+            .unwrap_err();
 
         // Missing receiver_url in keyed form must fail.
-        let e = VmReceiveMigrationData::parse("memory_mode=postcopy").unwrap_err();
+        let e = VmReceiveMigrationData::parse("tls_dir=/tmp/certs").unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::ParseError(_)),
             "Expected \"ParseError\"; got \"{e:?}\"",
@@ -2332,13 +2373,16 @@ mod unit_tests {
     }
 
     #[test]
+    // The deprecated `local` flag is still constructed and compared here to
+    // cover the compatibility layer.
+    #[expect(deprecated)]
     fn test_vm_send_migration_data_parse() {
         // Fully specified
         let data = VmSendMigrationData::parse(
             "destination_url=unix:/tmp/migrate.sock,local=on,downtime_ms=200,timeout_s=3600,timeout_strategy=cancel"
         ).expect("valid migration string should parse");
         assert_eq!(data.destination_url, "unix:/tmp/migrate.sock");
-        assert!(data.local);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
         assert_eq!(data.downtime_ms.get(), 200);
         assert_eq!(data.timeout_s.get(), 3600);
         assert_eq!(data.timeout_strategy, TimeoutStrategy::Cancel);
@@ -2348,7 +2392,7 @@ mod unit_tests {
         let data = VmSendMigrationData::parse("destination_url=tcp:192.168.1.1:8080")
             .expect("minimal migration string should parse");
         assert_eq!(data.destination_url, "tcp:192.168.1.1:8080");
-        assert!(!data.local);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::Precopy);
         assert_eq!(data.downtime_ms, VmSendMigrationData::default_downtime_ms());
         assert_eq!(data.timeout_s, VmSendMigrationData::default_timeout_s());
         assert_eq!(data.timeout_strategy, TimeoutStrategy::default());
@@ -2479,7 +2523,7 @@ mod unit_tests {
         )
         .unwrap();
         assert!(data.preserve_source);
-        assert!(data.local);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
 
         // preserve_source defaults to false when unspecified.
         let data = VmSendMigrationData::parse("destination_url=unix:/tmp/sock,local=on").unwrap();
@@ -2490,5 +2534,64 @@ mod unit_tests {
             .unwrap_err();
         VmSendMigrationData::parse("destination_url=unix:/tmp/sock,preserve_source=on")
             .unwrap_err();
+    }
+
+    #[test]
+    fn test_vm_send_migration_data_memory_mode_memfds() {
+        let data = VmSendMigrationData::parse("destination_url=unix:/tmp/sock,memory_mode=memfds")
+            .unwrap();
+        assert_eq!(data.memory_mode, MigrationMode::MemFDs);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
+
+        // Without either setting, the migration is not local.
+        let data = VmSendMigrationData::parse("destination_url=unix:/tmp/sock").unwrap();
+        assert_eq!(data.effective_memory_mode(), MigrationMode::Precopy);
+
+        // The deprecated flag and the new mode may be combined.
+        let data = VmSendMigrationData::parse(
+            "destination_url=unix:/tmp/sock,local=on,memory_mode=memfds",
+        )
+        .unwrap();
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
+
+        // Local migration requires a UNIX socket destination.
+        VmSendMigrationData::parse("destination_url=tcp:192.168.1.1:8080,memory_mode=memfds")
+            .unwrap_err();
+
+        // Local migration cannot use multiple connections.
+        VmSendMigrationData::parse(
+            "destination_url=unix:/tmp/sock,memory_mode=memfds,connections=2",
+        )
+        .unwrap_err();
+
+        // preserve_source is accepted together with memory_mode=memfds.
+        let data = VmSendMigrationData::parse(
+            "destination_url=unix:/tmp/sock,memory_mode=memfds,preserve_source=on",
+        )
+        .unwrap();
+        assert!(data.preserve_source);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
+    }
+
+    #[test]
+    fn test_vm_send_migration_data_local_flag_json_compatibility() {
+        // Old clients set the deprecated flag through the HTTP API; the
+        // compatibility layer must translate it without going through parse().
+        let data: VmSendMigrationData =
+            serde_json::from_str(r#"{"destination_url": "unix:/tmp/sock", "local": true}"#)
+                .unwrap();
+        assert_eq!(data.memory_mode, MigrationMode::Precopy);
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
+        data.validate().unwrap();
+
+        let data: VmSendMigrationData =
+            serde_json::from_str(r#"{"destination_url": "unix:/tmp/sock"}"#).unwrap();
+        assert_eq!(data.effective_memory_mode(), MigrationMode::Precopy);
+
+        let data: VmSendMigrationData = serde_json::from_str(
+            r#"{"destination_url": "unix:/tmp/sock", "memory_mode": "MemFDs"}"#,
+        )
+        .unwrap();
+        assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
     }
 }

@@ -36,13 +36,13 @@ macro_rules! or_rm_r {
     };
 }
 
-pub struct Or_rm8_r8;
+pub(crate) struct Or_rm8_r8;
 impl<T: CpuStateManager> InstructionHandler<T> for Or_rm8_r8 {
     or_rm_r!(u8);
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
     use crate::arch::x86::emulator::mock_vmm::*;
 

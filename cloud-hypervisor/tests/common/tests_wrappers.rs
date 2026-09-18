@@ -74,8 +74,11 @@ pub(crate) fn _test_api_shutdown(target_api: &TargetApi, guest: &Guest) {
         .unwrap();
 
     // Wait for API server to be ready
-    assert!(wait_until(Duration::from_secs(5), || target_api
-        .remote_command("ping", None)));
+    assert!(wait_for_sequential_events_str(
+        Duration::from_secs(10),
+        &["starting", "started"],
+        &event_path,
+    ));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -99,13 +102,9 @@ pub(crate) fn _test_api_shutdown(target_api: &TargetApi, guest: &Guest) {
         guest.ssh_command("sudo poweroff").unwrap();
 
         // Wait for the VMM to report completed shutdown before reusing the VM.
-        let latest_events = [&MetaEvent {
-            event: "shutdown".to_string(),
-            device_id: None,
-        }];
-        assert!(wait_for_latest_events_exact(
+        assert!(wait_for_latest_events_exact_str(
             Duration::from_secs(20),
-            &latest_events,
+            &["shutdown"],
             &event_path,
         ));
 
@@ -139,8 +138,11 @@ pub(crate) fn _test_api_delete(target_api: &TargetApi, guest: &Guest) {
         .unwrap();
 
     // Wait for API server to be ready
-    assert!(wait_until(Duration::from_secs(5), || target_api
-        .remote_command("ping", None)));
+    assert!(wait_for_sequential_events_str(
+        Duration::from_secs(10),
+        &["starting", "started"],
+        &event_path,
+    ));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -164,13 +166,9 @@ pub(crate) fn _test_api_delete(target_api: &TargetApi, guest: &Guest) {
         guest.ssh_command("sudo poweroff").unwrap();
 
         // Wait for the VMM to report completed shutdown before deleting the VM.
-        let latest_events = [&MetaEvent {
-            event: "shutdown".to_string(),
-            device_id: None,
-        }];
-        assert!(wait_for_latest_events_exact(
+        assert!(wait_for_latest_events_exact_str(
             Duration::from_secs(20),
-            &latest_events,
+            &["shutdown"],
             &event_path,
         ));
 
@@ -1658,23 +1656,9 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
         let _ = guest.ssh_command("sudo systemctl stop snapd");
 
         guest.ssh_command("sudo poweroff").unwrap();
-        let latest_events = [
-            &MetaEvent {
-                event: "shutdown".to_string(),
-                device_id: None,
-            },
-            &MetaEvent {
-                event: "deleted".to_string(),
-                device_id: None,
-            },
-            &MetaEvent {
-                event: "shutdown".to_string(),
-                device_id: None,
-            },
-        ];
-        assert!(wait_for_latest_events_exact(
+        assert!(wait_for_latest_events_exact_str(
             Duration::from_secs(20),
-            &latest_events,
+            &["shutdown", "deleted", "shutdown"],
             &event_path
         ));
     });
@@ -1687,7 +1671,12 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
 
 pub(crate) fn _test_multi_cpu(guest: &Guest) {
     let mut cmd = GuestCommand::new(guest);
-    cmd.args(["--cpus", "boot=2,max=4"])
+    let cpus = if guest.vm_type == GuestVmType::Confidential {
+        "boot=2"
+    } else {
+        "boot=2,max=4"
+    };
+    cmd.args(["--cpus", cpus])
         .default_memory()
         .default_kernel_cmdline()
         .capture_output()
@@ -2112,7 +2101,7 @@ pub(crate) fn _test_virtio_block(
     }
 }
 
-pub fn _test_virtio_block_dynamic_vhdx_expand(guest: &Guest) {
+pub(crate) fn _test_virtio_block_dynamic_vhdx_expand(guest: &Guest) {
     const VIRTUAL_DISK_SIZE: u64 = 100 << 20;
     const EMPTY_VHDX_FILE_SIZE: u64 = 8 << 20;
     const FULL_VHDX_FILE_SIZE: u64 = 112 << 20;
@@ -2458,7 +2447,7 @@ fn vhdx_image_size(disk_name: &str) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn _test_split_irqchip(guest: &Guest) {
+pub(crate) fn _test_split_irqchip(guest: &Guest) {
     let mut child = GuestCommand::new(guest)
         .default_cpus()
         .default_memory()
@@ -3501,13 +3490,9 @@ pub(crate) fn _test_pvpanic(guest: &Guest) {
         make_guest_panic(guest);
 
         // Wait for the panic event to be recorded
-        let expected_sequential_events = [&MetaEvent {
-            event: "panic".to_string(),
-            device_id: None,
-        }];
-        assert!(wait_for_latest_events_exact(
+        assert!(wait_for_latest_events_exact_str(
             Duration::from_secs(10),
-            &expected_sequential_events,
+            &["panic"],
             &event_path
         ));
     });

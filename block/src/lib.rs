@@ -65,10 +65,6 @@ pub enum Error {
     DescriptorChainTooShort,
     #[error("Guest gave us a descriptor that was too short to use")]
     DescriptorLengthTooSmall,
-    #[error("Failed to detect image type")]
-    DetectImageType(#[source] io::Error),
-    #[error("Failure in fixed vhd")]
-    FixedVhdError(#[source] io::Error),
     #[error("Getting a block's metadata failed")]
     GetFileMetadata(#[source] io::Error),
     #[error("The requested operation would cause a seek beyond disk end")]
@@ -137,15 +133,13 @@ pub enum ExecuteError {
     Unsupported(u32),
     #[error("Unsupported flags {flags:#x} for request type {request_type}")]
     UnsupportedFlags { request_type: u32, flags: u32 },
-    #[error("Failed to submit io uring")]
-    SubmitIoUring(#[source] io::Error),
     #[error("Failed to get guest address")]
     GetHostAddress(#[source] GuestMemoryError),
     #[error("Failed to async read")]
     AsyncRead(#[source] AsyncIoError),
     #[error("Failed to async write")]
     AsyncWrite(#[source] AsyncIoError),
-    #[error("failed to async flush")]
+    #[error("Failed to async flush")]
     AsyncFlush(#[source] AsyncIoError),
     #[error("Failed to async punch hole")]
     AsyncPunchHole(#[source] AsyncIoError),
@@ -167,7 +161,6 @@ impl ExecuteError {
             ExecuteError::WriteAll(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
             ExecuteError::UnsupportedFlags { .. } => VIRTIO_BLK_S_UNSUPP,
-            ExecuteError::SubmitIoUring(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::GetHostAddress(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::AsyncRead(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::AsyncWrite(_) => VIRTIO_BLK_S_IOERR,
@@ -540,8 +533,8 @@ pub fn open_disk_image(path: &Path, options: &OpenOptions) -> BlockResult<File> 
     })
 }
 
-/// Determine image type through file parsing.
-pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
+/// Validate image type through file parsing.
+pub fn validate_image_type(f: &mut File, image_type: ImageType) -> BlockResult<bool> {
     let aligned = AlignedFile::new(f.try_clone()?, true);
     // A VMDK descriptor file is small few hundred bytes of text. Read
     // best-effort so a short file yields a zero-padded partial block instead
@@ -555,31 +548,30 @@ pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 return Err(
-                    BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType)
+                    BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
                 );
             }
         }
     }
 
-    // Check 4 first bytes to get the header value and determine the image type
-    let image_type = if u32::from_be_bytes(block[0..4].try_into().unwrap()) == QCOW_MAGIC {
-        ImageType::Qcow2
-    } else if formats::vhd::is_fixed_vhd(f)
-        .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?
-    {
-        ImageType::FixedVhd
-    } else if u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN {
-        ImageType::Vhdx
-    } else if formats::vmdk::has_descriptor_header(&block)
-        && formats::vmdk::is_flat_vmdk(f)
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?
-    {
-        ImageType::FlatVmdk
-    } else {
-        ImageType::Raw
-    };
-
-    Ok(image_type)
+    match image_type {
+        ImageType::Qcow2 => Ok(u32::from_be_bytes(block[0..4].try_into().unwrap()) == QCOW_MAGIC),
+        ImageType::FixedVhd => formats::vhd::is_fixed_vhd(f).map_err(|e| {
+            BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
+        }),
+        ImageType::Vhdx => Ok(u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN),
+        ImageType::FlatVmdk => {
+            if formats::vmdk::has_descriptor_header(&block) {
+                formats::vmdk::is_flat_vmdk(f).map_err(|e| {
+                    BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
+                })
+            } else {
+                Ok(false)
+            }
+        }
+        ImageType::Raw => Ok(true),
+        ImageType::Unknown => Ok(false),
+    }
 }
 
 #[derive(Debug)]
@@ -645,6 +637,18 @@ enum BlockSize {
 }
 
 impl DiskTopology {
+    /// Overrides the logical block size advertised to the guest with `block_size`.
+    /// The physical block size and minimum I/O size are raised to `block_size`
+    /// when smaller, since neither can be below one logical block.
+    pub fn with_block_size(self, block_size: u64) -> Self {
+        Self {
+            logical_block_size: block_size,
+            physical_block_size: self.physical_block_size.max(block_size),
+            minimum_io_size: self.minimum_io_size.max(block_size),
+            ..self
+        }
+    }
+
     // libc::ioctl() takes different types on different architectures
     fn query_block_size(f: &File, block_size_type: BlockSize) -> io::Result<u64> {
         let mut block_size = 0;
@@ -694,7 +698,7 @@ impl DiskTopology {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -706,15 +710,47 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn detect_short_file_is_not_eof_error() {
+    fn with_block_size_raises_physical_and_min_io() {
+        let topology = DiskTopology {
+            logical_block_size: 512,
+            physical_block_size: 512,
+            minimum_io_size: 512,
+            optimal_io_size: 0,
+        }
+        .with_block_size(4096);
+        assert_eq!(topology.logical_block_size, 4096);
+        // Neither can sit below one logical block.
+        assert_eq!(topology.physical_block_size, 4096);
+        assert_eq!(topology.minimum_io_size, 4096);
+        // optimal_io_size is a hint and left untouched.
+        assert_eq!(topology.optimal_io_size, 0);
+    }
+
+    #[test]
+    fn with_block_size_keeps_larger_probed_fields() {
+        let topology = DiskTopology {
+            logical_block_size: 512,
+            physical_block_size: 8192,
+            minimum_io_size: 8192,
+            optimal_io_size: 65536,
+        }
+        .with_block_size(4096);
+        assert_eq!(topology.logical_block_size, 4096);
+        assert_eq!(topology.physical_block_size, 8192);
+        assert_eq!(topology.minimum_io_size, 8192);
+        assert_eq!(topology.optimal_io_size, 65536);
+    }
+
+    #[test]
+    fn validate_short_file_is_not_eof_error() {
         let tmp = TempFile::new().unwrap();
         let mut f = tmp.into_file();
         f.write_all(b"not-a-disk-magic-just-some-short-text\n")
             .unwrap();
         f.sync_all().unwrap();
 
-        let image_type = detect_image_type(&mut f).unwrap();
-        assert_eq!(image_type, ImageType::Raw);
+        assert!(validate_image_type(&mut f, ImageType::Raw).unwrap());
+        assert!(!validate_image_type(&mut f, ImageType::Qcow2).unwrap());
     }
 
     #[test]

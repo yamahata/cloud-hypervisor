@@ -8,6 +8,9 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod socket;
+pub use socket::SocketConsole;
+
 const MAX_BUFFER_SIZE: usize = 1 << 20;
 
 // Circular buffer implementation for serial output.
@@ -152,7 +155,7 @@ mod tests {
     #[test]
     fn accumulates_while_detached_then_replays_on_connect() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         buf.write_all(b"boot: hello\n").unwrap();
         buf.write_all(b"login: ").unwrap();
@@ -169,7 +172,7 @@ mod tests {
     #[test]
     fn live_writes_pass_through_after_connect() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         let sink = TestSink::new();
         buf.set_out(Box::new(sink.clone()));
@@ -185,7 +188,7 @@ mod tests {
     #[test]
     fn output_while_detached_goes_to_next_client() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         // First client: connects, drains "early\n", then disconnects.
         let first = TestSink::new();
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn drained_bytes_are_not_resent_to_a_second_client() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         buf.write_all(b"boot log\n").unwrap();
 

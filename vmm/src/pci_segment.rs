@@ -136,7 +136,7 @@ impl PciSegment {
         address_manager
             .io_bus
             .insert(
-                pci_config_io.clone(),
+                Arc::clone(&pci_config_io) as Arc<dyn BusDeviceSync>,
                 PCI_CONFIG_IO_PORT,
                 PCI_CONFIG_IO_PORT_SIZE,
             )
@@ -195,7 +195,7 @@ impl PciSegment {
         ))
     }
 
-    pub fn reserve_legacy_interrupts_for_pci_devices(
+    pub(crate) fn reserve_legacy_interrupts_for_pci_devices(
         address_manager: &Arc<AddressManager>,
         pci_irq_slots: &mut [u8; 32],
     ) -> DeviceManagerResult<()> {
@@ -228,7 +228,7 @@ impl PciSegment {
     /// An [`AddressManager`] would otherwise be required to create
     /// [`PciBus`] instances. Instead, we use any struct that implements
     /// [`DeviceRelocation`] to instantiate a [`PciBus`].
-    pub(crate) fn new_without_address_manager(
+    fn new_without_address_manager(
         id: u16,
         numa_node: u32,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
@@ -237,7 +237,7 @@ impl PciSegment {
         device_reloc: &Arc<dyn DeviceRelocation>,
     ) -> DeviceManagerResult<Self> {
         let pci_root = (id == 0).then(|| PciRoot::new(None));
-        let pci_bus = Arc::new(Mutex::new(PciBus::new(pci_root, device_reloc.clone())));
+        let pci_bus = Arc::new(Mutex::new(PciBus::new(pci_root, Arc::clone(device_reloc))));
 
         let pci_config_mmio = Arc::new(Mutex::new(PciConfigMmio::new(Arc::clone(&pci_bus))));
         let mmio_config_address =
@@ -553,7 +553,7 @@ impl Aml for PciSegment {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::io;
     use std::result::Result;
 
@@ -566,6 +566,7 @@ mod unit_tests {
     impl DeviceRelocation for MockDeviceRelocation {
         fn move_bar(
             &self,
+            _bar_idx: usize,
             _old_base: u64,
             _new_base: u64,
             _len: u64,
