@@ -1119,7 +1119,29 @@ impl vm::Vm for KvmVm {
             })
             .collect();
 
-        let irq_routing = KvmIrqRouting::from_entries(&entries).unwrap();
+        // An unwrap() here turned a capacity problem into a panic with no
+        // numbers in it. The failure is a configuration limit, not a kernel
+        // refusal: `kvm_irq_routing`'s FamStructWrapper has a compiled-in
+        // entry cap (raised from upstream's 1024 to the kernel's 4096 for
+        // this fork), and a large guest - many vCPUs times many passthrough
+        // devices - can exceed it. A 128-vCPU Grace guest with 4 GPUs and
+        // 8 NVMe needs ~1085.
+        //
+        // Log at the site as well as propagating: a failure this deep in VM
+        // setup is routinely replaced by a teardown error before it reaches
+        // the user, so the propagated chain alone cannot be relied on to
+        // carry the cause.
+        let irq_routing = KvmIrqRouting::from_entries(&entries).map_err(|e| {
+            error!(
+                "Cannot build a GSI routing table for {} entries: {e:?}. This is \
+                 the kvm_irq_routing FAM entry capacity, not a kernel limit.",
+                entries.len()
+            );
+            vm::HypervisorVmError::SetGsiRouting(anyhow!(
+                "failed to build a GSI routing table for {} entries: {e:?}",
+                entries.len()
+            ))
+        })?;
 
         self.fd
             .set_gsi_routing(&irq_routing)
@@ -4183,6 +4205,40 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    /// `set_gsi_routing()` maps and logs the error from
+    /// `KvmIrqRouting::from_entries()` instead of unwrapping it. That
+    /// handling is only reachable if the wrapper RETURNS past its entry
+    /// cap rather than panicking, so assert that directly - otherwise the
+    /// map_err is dead code and an over-large guest still dies in a panic
+    /// with no numbers in it.
+    ///
+    /// The cap itself is asserted too: on aarch64 this fork raises the
+    /// vendored `kvm_irq_routing` FAM capacity from upstream's 1024 to the
+    /// kernel's 4096, because a 128-vCPU Grace guest with 4 GPUs and 8 NVMe
+    /// needs ~1085 routes. A re-vendor that silently restores 1024 fails
+    /// here rather than on a GB300. Other architectures keep upstream's
+    /// 1024.
+    #[test]
+    fn test_kvm_irq_routing_cap_and_overflow_behaviour() {
+        use kvm_bindings::fam_wrappers::KvmIrqRouting;
+
+        #[cfg(target_arch = "aarch64")]
+        const CAP: usize = 4096;
+        #[cfg(not(target_arch = "aarch64"))]
+        const CAP: usize = 1024;
+
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            KvmIrqRouting::new(1085).is_ok(),
+            "the measured GB300 all-twelve route count must fit"
+        );
+        assert!(KvmIrqRouting::new(CAP).is_ok(), "the cap must fit");
+        assert!(
+            KvmIrqRouting::new(CAP + 1).is_err(),
+            "past the cap the wrapper must return an error, not panic"
+        );
+    }
+
     #[test]
     #[cfg(feature = "sev_snp")]
     fn test_validate_gpa_range() {
