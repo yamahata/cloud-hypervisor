@@ -5,10 +5,10 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
+use std::fs::{File, read_to_string};
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
@@ -743,6 +743,21 @@ impl ConfigPatch {
         let written = u32::from_le_bytes(bytes);
         self.patch = (self.patch & !self.write_mask) | (written & self.write_mask);
     }
+}
+
+/// Size of the *hardware* BAR `bar_index` as the host's sysfs
+/// `resource` file reports it, independent of what VFIO presents for
+/// that region index. `None` when the file is unreadable, the line is
+/// absent or the BAR is unused - callers must treat that as "unknown",
+/// never as a mismatch.
+fn host_bar_size(device_path: &Path, bar_index: u32) -> Option<u64> {
+    let resource = read_to_string(device_path.join("resource")).ok()?;
+    let line = resource.lines().nth(bar_index as usize)?;
+    let mut fields = line.split_whitespace();
+    let parse_hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+    let base = fields.next().and_then(parse_hex)?;
+    let end = fields.next().and_then(parse_hex)?;
+    (base != 0 && end >= base).then(|| end - base + 1)
 }
 
 pub(crate) struct VfioCommon {
@@ -2558,6 +2573,7 @@ impl VfioPciDevice {
         user_excluded: bool,
         is_msix_table_or_pba: bool,
         mapped_vs_size: (u64, u64),
+        host_bar_size: Option<u64>,
     ) -> Option<CliqueSkipReason> {
         if !clique_configured
             || region_index == VFIO_PCI_ROM_REGION_INDEX
@@ -2596,7 +2612,18 @@ impl VfioPciDevice {
             matches!(first_relevant_cap, Some(VfioRegionInfoCap::SparseMmap(_)));
         if is_kernel_reported_sparse {
             let (mapped, size) = mapped_vs_size;
-            if mapped < size {
+            // A VFIO variant driver may synthesise a region that is not
+            // the hardware BAR, and then a sparse map covering less than
+            // the region is the kernel DESCRIBING the device, not a
+            // mapping CH failed to make. nvgrace-gpu-vfio-pci presents
+            // BAR 4 of a GB300 as 512 GiB and reports 277.5 GiB of it
+            // mappable; the remainder is not memory, so there is nothing
+            // to lose and nothing to fail closed on.
+            //
+            // Trust the region only when it IS the hardware BAR. An
+            // unknown host size keeps the strict behaviour.
+            let synthesized_region = host_bar_size.is_some_and(|host| host != size);
+            if mapped < size && !synthesized_region {
                 return Some(CliqueSkipReason::KernelSparseHole { mapped, size });
             }
         }
@@ -2641,6 +2668,7 @@ impl VfioPciDevice {
                     true,
                     false,
                     (0, 0),
+                    host_bar_size(&self.device_path, region.index),
                 ) {
                     return Err(VfioPciError::CliqueMappingSkipped(
                         self.bdf,
@@ -2692,6 +2720,7 @@ impl VfioPciDevice {
                         false,
                         true,
                         (0, 0),
+                        host_bar_size(&self.device_path, region.index),
                     ) {
                         return Err(VfioPciError::CliqueMappingSkipped(
                             self.bdf,
@@ -2723,6 +2752,7 @@ impl VfioPciDevice {
                     false,
                     false,
                     (mapped_size, mmap_size),
+                    host_bar_size(&self.device_path, region.index),
                 ) {
                     return Err(VfioPciError::CliqueMappingSkipped(
                         self.bdf,
@@ -3033,6 +3063,7 @@ impl VfioPciDevice {
                 false,
                 false,
                 (0, 0),
+                host_bar_size(&self.device_path, region.index),
             ) {
                 return Err(VfioPciError::CliqueMappingSkipped(
                     self.bdf,
@@ -4581,6 +4612,7 @@ mod tests {
                 false,
                 false,
                 (0, 0),
+                None,
             )
             .is_none()
         );
@@ -4599,6 +4631,7 @@ mod tests {
                 false,
                 false,
                 (0, 0),
+                None,
             )
             .is_none()
         );
@@ -4621,6 +4654,7 @@ mod tests {
                 false,
                 true,
                 (0x1000, 0x2000),
+                None,
             )
             .is_none()
         );
@@ -4638,6 +4672,7 @@ mod tests {
             false,
             false,
             (0x1000, 0x2000),
+            None,
         );
         assert!(matches!(
             reason,
@@ -4661,6 +4696,7 @@ mod tests {
                 false,
                 false,
                 (0x1000, 0x2000),
+                None,
             )
             .is_none()
         );
@@ -4677,6 +4713,7 @@ mod tests {
             true,
             false,
             (0, 0),
+            None,
         );
         assert!(matches!(reason, Some(CliqueSkipReason::UserExcludedBar)));
     }
@@ -4692,6 +4729,7 @@ mod tests {
             false,
             false,
             (0, 0),
+            None,
         );
         assert!(matches!(reason, Some(CliqueSkipReason::NotMmapCapable)));
     }
@@ -4707,6 +4745,7 @@ mod tests {
             false,
             true,
             (0, 0),
+            None,
         );
         assert!(matches!(reason, Some(CliqueSkipReason::MsixNotMappable)));
     }
@@ -4726,6 +4765,7 @@ mod tests {
             true,
             true,
             (0, 0x1000),
+            None,
         );
         assert!(reason.is_none());
     }
@@ -4743,9 +4783,73 @@ mod tests {
                 false,
                 false,
                 (0x2000, 0x2000),
+                None,
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn test_clique_skip_reason_synthesized_region_is_not_a_hole() {
+        // nvgrace-gpu-vfio-pci presents BAR 4 of a GB300 as 512 GiB
+        // and reports 277.5 GiB of it mappable. That region is NOT the
+        // hardware BAR (32 MiB), so the shortfall is the kernel saying
+        // how much is real, not a mapping CH lost - measured on a
+        // GB300, where failing closed here made a clique guest
+        // unbootable. The exact numbers from that run.
+        const MAPPED: u64 = 298_013_687_808;
+        const PRESENTED: u64 = 549_755_813_888;
+        const HOST_BAR: u64 = 0x200_0000;
+        let caps = [sparse_cap(MAPPED)];
+        assert!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                4,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                false,
+                (MAPPED, PRESENTED),
+                Some(HOST_BAR),
+            )
+            .is_none()
+        );
+
+        // The exemption is keyed on the mismatch, not on "sparse is
+        // always fine": the same shortfall on a region that IS the
+        // hardware BAR still fails closed...
+        assert!(matches!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                4,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                false,
+                (MAPPED, PRESENTED),
+                Some(PRESENTED),
+            ),
+            Some(CliqueSkipReason::KernelSparseHole { .. })
+        ));
+
+        // ...and so does an unknown host size, so an unreadable sysfs
+        // never silently weakens the check.
+        assert!(matches!(
+            VfioPciDevice::clique_skip_reason(
+                true,
+                4,
+                PciBarRegionType::Memory64BitRegion,
+                VFIO_REGION_INFO_FLAG_MMAP,
+                &caps,
+                false,
+                false,
+                (MAPPED, PRESENTED),
+                None,
+            ),
+            Some(CliqueSkipReason::KernelSparseHole { .. })
+        ));
     }
 
     #[test]
@@ -4764,6 +4868,7 @@ mod tests {
             false,
             false,
             (0x1000, 0x2000),
+            None,
         );
         assert!(matches!(
             reason,
