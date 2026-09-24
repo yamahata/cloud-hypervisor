@@ -170,3 +170,23 @@ unnecessary_semicolon = "deny"
 # `level = warn` is irrelevant here but mandatory for rustc/cargo
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
 unreachable_pub = "deny"
+
+# The workspace requirements above are the released crates. Until the
+# remaining hooks are published, all users of these crates - including the
+# transitive dependency from vfio-ioctls - are redirected to fork tags that
+# are exactly those releases plus the hooks this series consumes:
+#
+# - iommufd: iommufd-ioctls 0.3.1 plus the IOMMU_IOAS_MAP_FILE and
+#   IOMMU_IOAS_IOVA_RANGES verbs, used by the dma-buf-backed P2P BAR
+#   mapping path regardless of any feature flag.
+# - vfio: vfio-ioctls 0.9.1 plus a dma-buf export operation, a file-backed
+#   DMA map operation, an IOAS IOVA-alignment query and a VfioError::errno()
+#   accessor (same path), and vfio-bindings 0.6.3 plus the VFIO dma-buf
+#   feature definitions they need.
+#
+# Drop this block once those hooks land in crates.io releases.
+[patch.crates-io]
+iommufd-bindings = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vsmmuv3-on-0.3.1-v1" }
+iommufd-ioctls = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vsmmuv3-on-0.3.1-v1" }
+vfio-bindings = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }
+vfio-ioctls = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }

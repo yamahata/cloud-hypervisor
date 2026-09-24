@@ -1195,14 +1195,12 @@ dependencies = [
 [[package]]
 name = "iommufd-bindings"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccb1839dadf7e92244d8ae02a6b60f8d120c5674341dc18d401b715809641667"
+source = "git+https://gitlab.com/iyamahata/iommufd.git?tag=vsmmuv3-on-0.3.1-v1#0949fb3235c26ed46d7b77d62d1e67a7f5c18e78"
 
 [[package]]
 name = "iommufd-ioctls"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1554a76cd851e90d53dadf754044a0d7c99797d7b9375fdb04e9cd60064320bb"
+source = "git+https://gitlab.com/iyamahata/iommufd.git?tag=vsmmuv3-on-0.3.1-v1#0949fb3235c26ed46d7b77d62d1e67a7f5c18e78"
 dependencies = [
  "iommufd-bindings",
  "libc",
@@ -2597,8 +2595,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vfio-bindings"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92982da90461a5808f78d9eb9b0c116da94bf52fbb0791784b64fc300f274c2a"
+source = "git+https://gitlab.com/iyamahata/vfio.git?tag=vsmmuv3-on-0.9.1-v1#93f68048ecc004bbae1e0dd66f01715ebae89772"
 dependencies = [
  "vmm-sys-util",
 ]
@@ -2606,8 +2603,7 @@ dependencies = [
 [[package]]
 name = "vfio-ioctls"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2396defd43c9024f798c272fd9ad2cc4278e71a1121597c2facb2c7a5fad667"
+source = "git+https://gitlab.com/iyamahata/vfio.git?tag=vsmmuv3-on-0.9.1-v1#93f68048ecc004bbae1e0dd66f01715ebae89772"
 dependencies = [
  "byteorder",
  "iommufd-bindings",

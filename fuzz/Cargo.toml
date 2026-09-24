@@ -207,3 +207,9 @@ name = "x86emul"
 path = "fuzz_targets/x86emul.rs"
 required-features = ["mshv_emulator"]
 test = false
+
+[patch.crates-io]
+iommufd-bindings = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vsmmuv3-on-0.3.1-v1" }
+iommufd-ioctls = { git = "https://gitlab.com/iyamahata/iommufd.git", tag = "vsmmuv3-on-0.3.1-v1" }
+vfio-bindings = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }
+vfio-ioctls = { git = "https://gitlab.com/iyamahata/vfio.git", tag = "vsmmuv3-on-0.9.1-v1" }
