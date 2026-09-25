@@ -112,6 +112,8 @@ use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapsho
 use crate::sev::MeasuredBootInfo;
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
+#[cfg(target_arch = "aarch64")]
+use crate::vm_config::IommuType;
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
     NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
@@ -136,6 +138,15 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     #[error("Cannot load the UEFI binary in memory")]
     UefiLoad(#[source] arch::aarch64::uefi::Error),
+
+    /// A direct kernel boot with VFIO devices bound to a vSMMUv3.
+    #[cfg(target_arch = "aarch64")]
+    #[error(
+        "VFIO device(s) {0} are placed behind a vSMMUv3 (`iommu=smmuv3`), which needs a \
+         UEFI firmware boot: a direct kernel boot describes the platform by device tree, and \
+         only the ACPI IORT places these devices behind the vSMMUv3"
+    )]
+    Smmuv3BoundDeviceRequiresUefi(String),
 
     #[cfg(target_arch = "riscv64")]
     #[error("Cannot load the UEFI binary in memory")]
@@ -2758,6 +2769,26 @@ impl Vm {
         Ok(Some(rsdp_addr))
     }
 
+    /// Refuse a direct kernel boot when a VFIO device is bound to a
+    /// vSMMUv3. Such a device is placed behind its SMMU only by the ACPI
+    /// IORT, and an arm64 guest finds ACPI only through UEFI, so a direct
+    /// kernel boot reads the device tree instead, which has no
+    /// `iommu-map` for it. The guest's SMMU driver then never writes the
+    /// device's STE, while its reset CFGI_ALL parks the endpoint on the
+    /// abort HWPT: the device would be dead for the life of the guest.
+    /// Firmware is recognised by its entry point: a payload that is not a
+    /// PE kernel is loaded as UEFI and entered at `UEFI_START`. No entry
+    /// point (a restore) is not a boot and is left alone.
+    #[cfg(target_arch = "aarch64")]
+    fn check_smmuv3_bound_boot(bound: &[String], entry_point: Option<EntryPoint>) -> Result<()> {
+        match entry_point {
+            Some(entry) if !bound.is_empty() && entry.entry_addr != layout::UEFI_START => {
+                Err(Error::Smmuv3BoundDeviceRequiresUefi(bound.join(", ")))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn entry_point(&mut self) -> Result<Option<EntryPoint>> {
         trace_scoped!("entry_point");
 
@@ -2867,6 +2898,23 @@ impl Vm {
         // Load kernel synchronously or if asynchronous then wait for load to
         // finish.
         let entry_point = self.entry_point()?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // The devices placed behind the SMMUv3; created by now, so
+            // each has its id.
+            let bound: Vec<String> = self
+                .config
+                .lock()
+                .unwrap()
+                .devices
+                .iter()
+                .flatten()
+                .filter(|d| d.pci_common.iommu == IommuType::Smmuv3)
+                .map(|d| d.pci_common.id.clone().unwrap_or_default())
+                .collect();
+            Self::check_smmuv3_bound_boot(&bound, entry_point)?;
+        }
 
         #[cfg(feature = "tdx")]
         let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();
@@ -4012,6 +4060,29 @@ mod tests {
     use super::*;
 
     const LEN: u64 = 4096;
+
+    #[test]
+    fn test_check_smmuv3_bound_boot() {
+        let kernel = Some(EntryPoint {
+            entry_addr: GuestAddress(0x20_0000),
+        });
+        let firmware = Some(EntryPoint {
+            entry_addr: layout::UEFI_START,
+        });
+        let bound = ["gpu0".to_string()];
+
+        // Nothing bound: either boot mode is fine.
+        Vm::check_smmuv3_bound_boot(&[], kernel).unwrap();
+        Vm::check_smmuv3_bound_boot(&[], firmware).unwrap();
+        // Bound device behind UEFI (ACPI): fine.
+        Vm::check_smmuv3_bound_boot(&bound, firmware).unwrap();
+        // Bound device on a direct kernel (device-tree) boot: refused, and
+        // the error names the device.
+        let e = Vm::check_smmuv3_bound_boot(&bound, kernel).unwrap_err();
+        assert!(matches!(&e, Error::Smmuv3BoundDeviceRequiresUefi(d) if d == "gpu0"));
+        // No entry point (a restore) is not a boot.
+        Vm::check_smmuv3_bound_boot(&bound, None).unwrap();
+    }
 
     #[test]
     fn test_create_fdt_with_devices() {
