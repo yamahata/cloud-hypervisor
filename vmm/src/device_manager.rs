@@ -1049,6 +1049,13 @@ pub struct DeviceManager {
     #[cfg(target_arch = "aarch64")]
     smmuv3s: BTreeMap<String, Smmuv3Iommufd>,
 
+    // Where the GICv3 sits, decided once from the full configuration. The
+    // placement follows the devices behind an SMMUv3, and the device list
+    // is taken out of the configuration while those devices are added, so
+    // asking the configuration then would give the other answer.
+    #[cfg(target_arch = "aarch64")]
+    gic_placement: layout::GicV3Placement,
+
     // Tree of devices, representing the dependencies between devices.
     // Useful for introspection, snapshot and restore.
     device_tree: Arc<Mutex<DeviceTree>>,
@@ -1196,6 +1203,8 @@ impl DeviceManager {
         snapshot: Option<&Snapshot>,
         dynamic: bool,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
+        #[cfg(target_arch = "aarch64")]
+        let gic_placement = config.lock().unwrap().gic_v3_placement();
         trace_scoped!("DeviceManager::new");
 
         let (device_tree, device_id_cnt) = if let Some(snapshot) = snapshot.as_ref() {
@@ -1388,6 +1397,8 @@ impl DeviceManager {
             iommu_attached_devices: None,
             #[cfg(target_arch = "aarch64")]
             smmuv3s: BTreeMap::new(),
+            #[cfg(target_arch = "aarch64")]
+            gic_placement,
             pci_segments: pci_segments.into_boxed_slice(),
             device_tree,
             exit_evt,
@@ -1619,15 +1630,20 @@ impl DeviceManager {
     /// Guest address of the vITS GITS_TRANSLATER register.
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     fn vits_doorbell(&self) -> u64 {
+        // The ITS moves with the GICv3 placement, which an SMMUv3 guest
+        // changes (`VmConfig::gic_v3_placement`).
         let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
-        gic::Gic::create_default_config(vcpus.into()).msi_addr + 0x1_0040
+        gic::Gic::create_default_config(vcpus.into(), self.gic_placement).msi_addr + 0x1_0040
     }
 
     fn get_msi_iova_space(&mut self) -> (u64, u64) {
         #[cfg(target_arch = "aarch64")]
         {
-            let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
-            let vgic_config = gic::Gic::create_default_config(vcpus.into());
+            let (vcpus, placement) = (
+                self.config.lock().unwrap().cpus.boot_vcpus,
+                self.gic_placement,
+            );
+            let vgic_config = gic::Gic::create_default_config(vcpus.into(), placement);
             (
                 vgic_config.msi_addr,
                 vgic_config.msi_addr + vgic_config.msi_size - 1,
@@ -1782,9 +1798,14 @@ impl DeviceManager {
         &mut self,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
+        let (boot_vcpus, placement) = (
+            self.config.lock().unwrap().cpus.boot_vcpus,
+            self.gic_placement,
+        );
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
-                self.config.lock().unwrap().cpus.boot_vcpus,
+                boot_vcpus,
+                placement,
                 Arc::clone(&self.msi_interrupt_manager)
                     as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
                 Arc::clone(&self.address_manager.vm),

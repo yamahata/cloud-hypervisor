@@ -41,6 +41,28 @@ const MAX_SUPPORTED_CPUS: u32 = 8192;
 #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
 const MAX_SUPPORTED_CPUS: u32 = 255;
 
+// Both GICv3 placements must fit the largest vCPU count the config
+// layer will accept. Making this a build-time truth rather than a
+// runtime check means a change to the cap, to either GIC region size,
+// or to the RMR window base breaks the build instead of silently
+// handing some guest a GIC that overlaps something.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    MAX_SUPPORTED_CPUS as u64 <= arch::layout::GIC_V3_MAX_VCPUS,
+    "the relocated redistributor array must hold MAX_SUPPORTED_CPUS \
+     redistributors without reaching the RMR MSI window"
+);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    arch::layout::GIC_V3_DIST_START.0
+        >= arch::layout::UEFI_START.0
+            + arch::layout::UEFI_SIZE
+            + MAX_SUPPORTED_CPUS as u64 * arch::layout::GIC_V3_REDIST_SIZE
+            + arch::layout::GIC_V3_ITS_SIZE,
+    "the legacy redistributor array must hold MAX_SUPPORTED_CPUS \
+     redistributors without reaching the UEFI flash"
+);
+
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -3383,6 +3405,21 @@ impl VmConfig {
                 .platform
                 .as_ref()
                 .is_some_and(|p| p.iommu_segments.is_some())
+    }
+
+    /// Which GICv3 placement this guest's memory map uses. A guest with
+    /// an SMMUv3 carries the RMR MSI identity window at
+    /// `RMR_MSI_WINDOW_BASE`, which the legacy downward-growing
+    /// redistributor array collides with past 118 vCPUs; a guest
+    /// without one has no window and keeps the layout every earlier
+    /// cloud-hypervisor gave it.
+    #[cfg(target_arch = "aarch64")]
+    pub fn gic_v3_placement(&self) -> arch::layout::GicV3Placement {
+        if self.smmuv3_attached() {
+            arch::layout::GicV3Placement::BelowRmrWindow
+        } else {
+            arch::layout::GicV3Placement::Legacy
+        }
     }
 
     // Also enables virtio-iommu if the config needs it
@@ -7504,6 +7541,184 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::IdentifierNotUnique("test0".to_string()))
         );
     }
+
+    // GicV3Placement admits every vCPU count MAX_SUPPORTED_CPUS
+    // allows, in both directions: the relocated placement (used by an
+    // SMMUv3 guest) never collides with the RMR MSI window no matter
+    // how many vCPUs are configured, and the legacy placement (used
+    // by every other guest) is completely unaffected by this change.
+    // Also pins the layout arithmetic both placements are derived
+    // from: if a future change to `GIC_V3_REDIST_SIZE`,
+    // `GIC_V3_ITS_SIZE`, or the RMR window constants moves a
+    // boundary, this test breaks (loudly, at build time) rather than
+    // the boundary silently moving out from under an unsuspecting
+    // guest.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_gic_v3_placement_admits_max_supported_cpus() {
+        use arch::layout::GicV3Placement::{BelowRmrWindow, Legacy};
+
+        // The relocated placement's bases are fixed - independent of
+        // vCPU count - and pinned by hand.
+        assert_eq!(arch::layout::GIC_V3_ITS_START.0, 0x0100_0000);
+        assert_eq!(arch::layout::GIC_V3_REDIST_START.0, 0x0102_0000);
+        assert_eq!(arch::layout::GIC_V3_MAX_VCPUS, 895);
+        for vcpus in [1, 240, 255] {
+            assert_eq!(
+                arch::layout::gic_v3_its_start(BelowRmrWindow, vcpus),
+                0x0100_0000
+            );
+            assert_eq!(
+                arch::layout::gic_v3_redist_start(BelowRmrWindow, vcpus),
+                0x0102_0000
+            );
+        }
+
+        // At MAX_SUPPORTED_CPUS, the relocated redistributor array
+        // still ends below the RMR MSI window.
+        let relocated_array_end = arch::layout::GIC_V3_REDIST_START.0
+            + MAX_SUPPORTED_CPUS as u64 * arch::layout::GIC_V3_REDIST_SIZE;
+        assert_eq!(relocated_array_end, 0x0300_0000);
+        assert!(relocated_array_end < arch::layout::RMR_MSI_WINDOW_BASE);
+
+        // The legacy placement is unchanged: at 118 vCPUs, the
+        // redistributor array occupies [0x0813_0000, 0x08ff_0000) and
+        // the ITS sits directly below it at 0x0811_0000.
+        assert_eq!(arch::layout::gic_v3_redist_start(Legacy, 118), 0x0813_0000);
+        assert_eq!(arch::layout::gic_v3_its_start(Legacy, 118), 0x0811_0000);
+        // Pin the legacy placement's actual addresses at two more
+        // vCPU counts, independent of the boundary math above.
+        assert_eq!(arch::layout::gic_v3_redist_start(Legacy, 1), 0x08FD_0000);
+        assert_eq!(arch::layout::gic_v3_its_start(Legacy, 1), 0x08FB_0000);
+        assert_eq!(arch::layout::gic_v3_redist_start(Legacy, 240), 0x071F_0000);
+        assert_eq!(arch::layout::gic_v3_its_start(Legacy, 240), 0x071D_0000);
+        let rmr_window_end = arch::layout::RMR_MSI_WINDOW_BASE + arch::layout::RMR_MSI_WINDOW_SIZE;
+        assert_eq!(rmr_window_end, 0x0810_0000);
+        assert_eq!(arch::layout::GIC_V3_DIST_START.0, 0x08ff_0000);
+
+        // The legacy placement's new compile-time bound: at
+        // MAX_SUPPORTED_CPUS it still does not reach the UEFI flash.
+        let legacy_its_at_max = arch::layout::gic_v3_its_start(Legacy, MAX_SUPPORTED_CPUS as u64);
+        assert_eq!(legacy_its_at_max, 0x06FF_0000);
+        assert!(legacy_its_at_max >= arch::layout::UEFI_START.0 + arch::layout::UEFI_SIZE);
+
+        let mut valid_config = VmConfig {
+            cpus: CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1,
+                ..Default::default()
+            },
+            memory: MemoryConfig {
+                size: 536_870_912,
+                mergeable: false,
+                hotplug_method: HotplugMethod::Acpi,
+                hotplug_size: None,
+                hotplugged_size: None,
+                shared: false,
+                hugepages: false,
+                hugepage_size: None,
+                prefault: false,
+                reserve: None,
+                zones: None,
+                thp: true,
+            },
+            payload: Some(PayloadConfig {
+                kernel: Some(PathBuf::from("/path/to/kernel")),
+                firmware: None,
+                cmdline: None,
+                initramfs: None,
+                #[cfg(feature = "igvm")]
+                igvm: None,
+                #[cfg(feature = "sev_snp")]
+                host_data: Some(
+                    "243eb7dc1a21129caa91dcbb794922b933baecb5823a377eb431188673288c07".to_string(),
+                ),
+                #[cfg(feature = "fw_cfg")]
+                fw_cfg_config: None,
+            }),
+            rate_limit_groups: None,
+            disks: None,
+            net: None,
+            rng: RngConfig {
+                src: PathBuf::from("/dev/urandom"),
+                pci_common: PciDeviceCommonConfig::default(),
+            },
+            balloon: None,
+            fs: None,
+            generic_vhost_user: None,
+            pmem: None,
+            serial: SerialConfig {
+                common: CommonConsoleConfig {
+                    file: None,
+                    mode: ConsoleOutputMode::Null,
+                    socket: None,
+                },
+            },
+            console: ConsoleConfig {
+                common: CommonConsoleConfig {
+                    file: None,
+                    mode: ConsoleOutputMode::Tty,
+                    socket: None,
+                },
+                pci_common: PciDeviceCommonConfig::default(),
+            },
+            devices: None,
+            user_devices: None,
+            vdpa: None,
+            vsock: None,
+            #[cfg(feature = "pvmemcontrol")]
+            pvmemcontrol: None,
+            pvpanic: false,
+            iommu: false,
+            numa: None,
+            watchdog: false,
+            rtc: None,
+            #[cfg(feature = "guest_debug")]
+            gdb: false,
+            pci_segments: None,
+            platform: None,
+            tpm: None,
+            preserved_fds: None,
+            landlock_enable: false,
+            landlock_rules: None,
+            #[cfg(feature = "ivshmem")]
+            ivshmem: None,
+        };
+
+        // A plain guest (no SMMUv3) is accepted at every count,
+        // including past what the removed guard used to reject for an
+        // SMMUv3 guest - the regression the removed guard was careful
+        // not to cause.
+        assert!(valid_config.platform.is_none());
+        assert_eq!(
+            valid_config.gic_v3_placement(),
+            arch::layout::GicV3Placement::Legacy
+        );
+        for vcpus in [16, 118, 119, 120] {
+            valid_config.cpus.boot_vcpus = vcpus;
+            valid_config.cpus.max_vcpus = vcpus;
+            valid_config.validate().unwrap();
+        }
+
+        // The positive control this whole change exists for: an
+        // SMMUv3 guest is now accepted at every count up to
+        // MAX_SUPPORTED_CPUS, including 119 and 240 - exactly the
+        // counts the removed guard rejected.
+        valid_config.platform = Some(PlatformConfig::parse("iommufd=on").unwrap());
+        valid_config.devices = Some(vec![
+            DeviceConfig::parse("path=/sys/bus/pci/devices/0009:01:00.0/,iommu=smmuv3").unwrap(),
+        ]);
+        assert_eq!(
+            valid_config.gic_v3_placement(),
+            arch::layout::GicV3Placement::BelowRmrWindow
+        );
+        for vcpus in [1, 118, 119, 240, 255] {
+            valid_config.cpus.boot_vcpus = vcpus;
+            valid_config.cpus.max_vcpus = vcpus;
+            valid_config.validate().unwrap();
+        }
+    }
+
     #[test]
     fn test_landlock_parsing() -> Result<()> {
         // should not be empty

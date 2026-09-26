@@ -40,6 +40,7 @@ impl Gic {
     #[expect(clippy::needless_pass_by_value)]
     pub fn new(
         vcpu_count: u32,
+        placement: layout::GicV3Placement,
         interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         vm: Arc<dyn hypervisor::Vm>,
     ) -> Result<Gic> {
@@ -50,7 +51,7 @@ impl Gic {
             })
             .map_err(Error::CreateInterruptSourceGroup)?;
 
-        let config = Gic::create_default_config(vcpu_count as u64);
+        let config = Gic::create_default_config(vcpu_count as u64, placement);
         let vgic = vm.create_vgic(&config).map_err(Error::CreateGic)?;
 
         let gic = Gic {
@@ -98,16 +99,14 @@ impl Gic {
     }
 
     /// Default config implied by arch::layout
-    pub fn create_default_config(vcpu_count: u64) -> VgicConfig {
-        let redists_size = layout::GIC_V3_REDIST_SIZE * vcpu_count;
-        let redists_addr = layout::GIC_V3_DIST_START.raw_value() - redists_size;
+    pub fn create_default_config(vcpu_count: u64, placement: layout::GicV3Placement) -> VgicConfig {
         VgicConfig {
             vcpu_count,
             dist_addr: layout::GIC_V3_DIST_START.raw_value(),
             dist_size: layout::GIC_V3_DIST_SIZE,
-            redists_addr,
-            redists_size,
-            msi_addr: redists_addr - layout::GIC_V3_ITS_SIZE,
+            redists_addr: layout::gic_v3_redist_start(placement, vcpu_count),
+            redists_size: layout::GIC_V3_REDIST_SIZE * vcpu_count,
+            msi_addr: layout::gic_v3_its_start(placement, vcpu_count),
             msi_size: layout::GIC_V3_ITS_SIZE,
             nr_irqs: layout::IRQ_NUM,
         }

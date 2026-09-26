@@ -796,6 +796,12 @@ fn align_to_8_bytes(len: usize) -> usize {
     (8 - (len % 8)) % 8
 }
 
+// The upstream IORT generator hard-codes the RMR MSI window; the GICv3
+// placement for SMMUv3 guests is laid out around `layout`'s copy of it.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    layout::RMR_MSI_WINDOW_BASE == 0x0800_0000 && layout::RMR_MSI_WINDOW_SIZE == 0x0010_0000
+);
 #[cfg(target_arch = "aarch64")]
 fn next_node_id(next_id: &mut u32) -> u32 {
     let id = *next_id;
