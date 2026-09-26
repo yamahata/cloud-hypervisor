@@ -144,6 +144,17 @@ that are part of the same clique.
 --device path=/sys/bus/pci/devices/0000:01:00.0/,x_nv_gpudirect_clique=0
 ```
 
+#### Guest physical address width for Grace GPUs
+
+A Grace GPU's 64-bit BARs are placed in the guest's MMIO window, which
+ends at `1 << phys_bits` (`phys_bits` is `min(host_phys_bits,
+max_phys_bits)`). Keep every BAR below 128 TiB of guest physical address
+when the guest kernel uses 48-bit virtual addresses: on a GB300 at
+`max_phys_bits=48` the BARs land at 145-255 TiB, and although
+`nvidia-smi` and ATS look healthy, every CUDA call fails at `cuInit` with
+`CUDA_ERROR_SYSTEM_NOT_READY` (802). `max_phys_bits=47` keeps them below
+128 TiB. Check with `cuInit`, not only `nvidia-smi`.
+
 The following command can be run on the guest to verify that GPUDirect P2P is
 correctly enabled.
 ```
