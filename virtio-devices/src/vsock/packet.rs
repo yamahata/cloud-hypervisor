@@ -56,7 +56,7 @@ use crate::GuestMemoryMmap;
 // endianness.
 
 /// The vsock packet header struct size (when packed).
-pub const VSOCK_PKT_HDR_SIZE: usize = 44;
+pub(super) const VSOCK_PKT_HDR_SIZE: usize = 44;
 
 // Source CID.
 const HDROFF_SRC_CID: usize = 0;
@@ -507,7 +507,7 @@ impl VsockPacket {
         self.validate_len()?;
 
         guest_mem
-            .write(self.hdr(), self.guest_hdr_addr)
+            .write_slice(self.hdr(), self.guest_hdr_addr)
             .map_err(VsockError::GuestMemoryAccess)?;
 
         Ok(())
@@ -679,13 +679,13 @@ impl VsockPacket {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::QueueOwnedT;
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::{VirtQueue as GuestQ, VirtqDesc as GuestQDesc};
 
-    use super::super::unit_tests::TestContext;
+    use super::super::tests::TestContext;
     use super::*;
     use crate::GuestMemoryMmap;
     use crate::vsock::defs::MAX_PKT_BUF_SIZE;

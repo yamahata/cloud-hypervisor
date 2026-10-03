@@ -51,6 +51,23 @@ on behalf of untrusted parties. For instance, a cloud service may allow
 users to upload arbitrary files and attach them to their VMs as block
 devices.
 
+## Live Migration and Snapshots
+
+The source and the destination of a live migration fully trust each
+other. The migration data defines the entire VM, including host
+resources the destination opens on behalf of the source, such as disk
+paths and console files. Whoever can connect to a migration listener
+therefore has the same power as management software.
+
+The listener used by `receive-migration` must only be reachable by
+trusted peers. Plaintext TCP provides no authentication and must only
+be used on networks where every host is trusted. On any other network,
+TLS support must be used, or the UNIX socket transport combined with
+filesystem permissions. This also covers the additional migration
+connections that a TCP migration accepts on the same listener.
+
+Snapshot files are trusted input for restore operations.
+
 ## Guest Virtual Machine
 
 Cloud Hypervisor considers the guest VM to be untrusted. This means that
@@ -138,12 +155,17 @@ descriptor.
 
 ### Disk Images
 
-With one exception, Cloud Hypervisor assumes that disk images provided
-to it are untrusted. The exception is that qcow2 images are assumed
+With two exceptions, Cloud Hypervisor assumes that disk images provided
+to it are untrusted. The first exception is that qcow2 images are assumed
 trusted if the `backing_files` option is enabled. It is disabled by
 default. If a backing file must be used with an untrusted image, the
 management stack must validate that the backing file is the expected
 value and resides in sector 0.
+
+Another exception is that vmdk images are assumed trusted if the
+`backing_files` option is enabled. It is disabled by default. The
+vmdk format is disabled if a backing file must be used with an untrusted
+image, as it needs to resolve such files using host paths.
 
 Cloud Hypervisor does not protect against decompression bombs.
 This means that malicious compressed data in a qcow2 image can cause

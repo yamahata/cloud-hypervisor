@@ -739,7 +739,7 @@ impl cpu::Vcpu for MshvVcpu {
 
                     // Update the bitmap(cache) to mark the pages as host inaccessible
                     self.host_access_pages.rcu(|bitmap| {
-                        let bm = bitmap.clone();
+                        let bm = Arc::clone(bitmap);
                         bm.reset_addr_range(gfn_start as usize, gfn_count as usize);
                         bm
                     });
@@ -1941,7 +1941,7 @@ impl vm::Vm for MshvVm {
             #[cfg(target_arch = "x86_64")]
             msrs: self.msrs.load().as_ref().clone(),
             vm_ops,
-            vm_fd: self.fd.clone(),
+            vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
             ghcb,
             #[cfg(feature = "sev_snp")]
@@ -2024,6 +2024,7 @@ impl vm::Vm for MshvVm {
         userspace_addr: *mut u8,
         readonly: bool,
         _log_dirty_pages: bool,
+        _visibility: vm::MemoryVisibility,
     ) -> vm::Result<()> {
         let mut flags = 1 << MSHV_SET_MEM_BIT_EXECUTABLE;
         if !readonly {
@@ -2067,7 +2068,6 @@ impl vm::Vm for MshvVm {
         memory_size: usize,
         userspace_addr: *mut u8,
         readonly: bool,
-        _log_dirty_pages: bool,
     ) -> vm::Result<()> {
         let mut flags = 1 << MSHV_SET_MEM_BIT_EXECUTABLE;
         if !readonly {
@@ -2466,7 +2466,7 @@ impl vm::Vm for MshvVm {
 
             for acquired_gpa in gpas {
                 self.host_access_pages.rcu(|bitmap| {
-                    let bm = bitmap.clone();
+                    let bm = Arc::clone(bitmap);
                     bm.set_bit((acquired_gpa >> PAGE_SHIFT) as usize);
                     bm
                 });
@@ -2504,7 +2504,7 @@ impl vm::Vm for MshvVm {
             self.fd
                 .set_partition_property(
                     hv_partition_property_code_HV_PARTITION_PROPERTY_GIC_PPI_PERFORMANCE_MONITORS_INTERRUPT,
-                    (AARCH64_PMU_IRQ + AARCH64_MIN_PPI_IRQ) as u64,
+                    AARCH64_PMU_IRQ as u64,
                 )
                 .map_err(|e| {
                     vm::HypervisorVmError::InitializeVm(anyhow!(

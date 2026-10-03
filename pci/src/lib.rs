@@ -25,10 +25,10 @@ pub use self::bus::{
     NUM_DEVICE_IDS, PCI_ROOT_DEVICE_ID, PciBus, PciConfigIo, PciConfigMmio, PciRoot, PciRootError,
 };
 pub use self::configuration::{
-    PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
-    PciCapabilityId, PciClassCode, PciConfiguration, PciExpressCapabilityId, PciHeaderType,
-    PciMassStorageSubclass, PciNetworkControllerSubclass, PciProgrammingInterface,
-    PciSerialBusSubClass, PciSubclass,
+    PCI_CONFIGURATION_ID, PasidCap, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
+    PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciExpressCapability,
+    PciExpressCapabilityId, PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass,
+    PciProgrammingInterface, PciSerialBusSubClass, PciSubclass,
 };
 pub use self::device::{
     BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError, PciDevice,
@@ -40,21 +40,6 @@ pub use self::msix::{
 };
 pub use self::vfio::{MmioRegion, VfioDmaMapping, VfioPciDevice, VfioPciError};
 pub use self::vfio_user::{VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError};
-
-/// PCI has four interrupt pins A->D.
-#[derive(Copy, Clone)]
-pub enum PciInterruptPin {
-    IntA,
-    IntB,
-    IntC,
-    IntD,
-}
-
-impl PciInterruptPin {
-    pub fn to_mask(self) -> u32 {
-        self as u32
-    }
-}
 
 #[cfg(target_arch = "x86_64")]
 pub const PCI_CONFIG_IO_PORT: u64 = 0xcf8;

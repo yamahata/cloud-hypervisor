@@ -16,12 +16,9 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(feature = "sev_snp")]
 use std::num;
-#[cfg(feature = "sev_snp")]
-use std::os::fd::FromRawFd;
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(feature = "tdx")]
 use std::os::raw;
-#[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use std::os::unix::io::AsRawFd;
 #[cfg(feature = "tdx")]
 use std::os::unix::io::RawFd;
@@ -44,7 +41,6 @@ use anyhow::anyhow;
 #[cfg(feature = "sev_snp")]
 use igvm::snp_defs::{SevSelector, SevVmsa};
 use kvm_bindings::fam_wrappers::KvmIrqRouting;
-#[cfg(feature = "sev_snp")]
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 #[cfg(feature = "sev_snp")]
@@ -94,8 +90,8 @@ pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
 use crate::ClockData;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MTRR_MSR_INDICES, MsrEntry, NUM_IOAPIC_PINS,
-    SpecialRegisters, VcpuMsrConfigUpdate, XsaveState,
+    CpuIdEntry, FpuState, LapicState, MTRR_ENABLE, MTRR_MEM_TYPE_WB, MTRR_MSR_INDICES, MsrEntry,
+    NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::{ClockRestoreMode, ClockState};
@@ -131,7 +127,7 @@ pub use kvm_bindings::{
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
-    KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM_COPROC_MASK, KVM_REG_ARM_CORE, KVM_REG_ARM64,
+    KVM_GUESTDBG_USE_HW, KVM_REG_ARM_COPROC_MASK, KVM_REG_ARM_CORE, KVM_REG_ARM64,
     KVM_REG_ARM64_SYSREG, KVM_REG_ARM64_SYSREG_CRM_MASK, KVM_REG_ARM64_SYSREG_CRM_SHIFT,
     KVM_REG_ARM64_SYSREG_CRN_MASK, KVM_REG_ARM64_SYSREG_CRN_SHIFT, KVM_REG_ARM64_SYSREG_OP0_MASK,
     KVM_REG_ARM64_SYSREG_OP0_SHIFT, KVM_REG_ARM64_SYSREG_OP1_MASK, KVM_REG_ARM64_SYSREG_OP1_SHIFT,
@@ -206,6 +202,27 @@ ioctl_iow_nr!(
     0xe3,
     kvm_bindings::kvm_device_attr
 );
+// kvm-ioctls only exposes KVM_{GET,SET}_ONE_REG for aarch64 and riscv64.
+#[cfg(target_arch = "x86_64")]
+ioctl_iow_nr!(
+    KVM_GET_ONE_REG,
+    kvm_bindings::KVMIO,
+    0xab,
+    kvm_bindings::kvm_one_reg
+);
+#[cfg(target_arch = "x86_64")]
+ioctl_iow_nr!(
+    KVM_SET_ONE_REG,
+    kvm_bindings::KVMIO,
+    0xac,
+    kvm_bindings::kvm_one_reg
+);
+// KVM_X86_REG_KVM(KVM_REG_GUEST_SSP). The live SSP is a register, not an MSR,
+// so KVM_GET_MSRS never returns it.
+#[cfg(target_arch = "x86_64")]
+const KVM_REG_GUEST_SSP: u64 = 0x2030_0003_0000_0000;
+#[cfg(target_arch = "x86_64")]
+const SHSTK_ECX_BIT: u8 = 7; // CET shadow stack, CPUID leaf 7 subleaf 0 ECX
 
 #[cfg(feature = "sev_snp")]
 use igvm_defs::PAGE_SIZE_4K;
@@ -402,8 +419,9 @@ impl From<kvm_userspace_memory_region2> for UserMemoryRegion {
 
 impl From<UserMemoryRegion> for kvm_userspace_memory_region2 {
     fn from(region: UserMemoryRegion) -> Self {
-        assert!(
-            region.flags & USER_MEMORY_REGION_READ != 0,
+        assert_ne!(
+            region.flags & USER_MEMORY_REGION_READ,
+            0,
             "KVM mapped memory is always readable"
         );
 
@@ -616,6 +634,7 @@ struct KvmDirtyLogSlot {
     guest_phys_addr: u64,
     memory_size: u64,
     userspace_addr: u64,
+    flags: u32,
     // Following fields are used by kvm_userspace_memory_region2.
     guest_memfd_offset: u64,
     guest_memfd: u32,
@@ -628,6 +647,8 @@ struct KvmMemorySlot {
     guest_phys_addr: u64,
     #[cfg_attr(not(feature = "sev_snp"), expect(dead_code))]
     memory_size: u64,
+    #[cfg_attr(not(feature = "sev_snp"), expect(dead_code))]
+    userspace_addr: u64,
 }
 
 /// Wrapper over KVM VM ioctls.
@@ -641,6 +662,8 @@ pub struct KvmVm {
     snp_guest_policy: OnceLock<u64>,
     dirty_log_slots: RwLock<HashMap<u32, KvmDirtyLogSlot>>,
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
+    #[cfg(feature = "sev_snp")]
+    memory_conversion_handler: Arc<OnceLock<Arc<dyn vm::MemoryConversionHandler>>>,
 }
 
 impl KvmVm {
@@ -735,15 +758,6 @@ impl KvmVm {
             }
         }
     }
-
-    /// Get flag for kvm_userspace_memory_region based on memfd support.
-    fn get_kvm_userspace_memory_region_flag(&self, flag: u32) -> u32 {
-        flag | if self.memory_slots.is_some() {
-            KVM_MEM_GUEST_MEMFD
-        } else {
-            0
-        }
-    }
 }
 
 /// Implementation of Vm trait for KVM
@@ -759,6 +773,14 @@ impl KvmVm {
 /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).expect("new VM fd creation failed");
 /// ```
 impl vm::Vm for KvmVm {
+    #[cfg(feature = "sev_snp")]
+    fn register_memory_conversion_handler(&self, handler: Arc<dyn vm::MemoryConversionHandler>) {
+        self.memory_conversion_handler
+            .set(handler)
+            .ok()
+            .expect("Memory conversion handler already registered");
+    }
+
     #[cfg(feature = "sev_snp")]
     fn sev_snp_init(&self, guest_policy: igvm_defs::SnpPolicy) -> vm::Result<()> {
         self.sev_fd
@@ -951,9 +973,11 @@ impl vm::Vm for KvmVm {
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
             #[cfg(feature = "sev_snp")]
-            vm_fd: self.fd.clone(),
+            vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
             memory_slots: self.memory_slots.clone(),
+            #[cfg(feature = "sev_snp")]
+            memory_conversion_handler: Arc::clone(&self.memory_conversion_handler),
         };
         Ok(Box::new(vcpu))
     }
@@ -1112,21 +1136,22 @@ impl vm::Vm for KvmVm {
         userspace_addr: *mut u8,
         readonly: bool,
         log_dirty_pages: bool,
+        visibility: vm::MemoryVisibility,
     ) -> vm::Result<()> {
         let mut flags = 0;
         if readonly {
             flags |= KVM_MEM_READONLY;
         }
-        if log_dirty_pages {
-            flags |= KVM_MEM_LOG_DIRTY_PAGES;
-        }
-
         const _: () = assert!(size_of::<usize>() <= size_of::<u64>());
 
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
-        #[cfg(feature = "sev_snp")]
-        let guest_memfd = if let Some(slots) = &self.memory_slots {
+        let guest_memfd = if let Some(slots) = self
+            .memory_slots
+            .as_ref()
+            .filter(|_| visibility == vm::MemoryVisibility::Private)
+        {
+            flags |= KVM_MEM_GUEST_MEMFD;
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             let fd = unsafe {
                 OwnedFd::from_raw_fd(
@@ -1145,29 +1170,27 @@ impl vm::Vm for KvmVm {
                     guest_memfd: fd,
                     guest_phys_addr,
                     memory_size: memory_size as u64,
+                    userspace_addr: userspace_addr as usize as u64,
                 },
             );
             raw_fd
         } else {
             0
         };
-        #[cfg(not(feature = "sev_snp"))]
-        let guest_memfd = 0;
 
-        let mut region = kvm_userspace_memory_region2 {
+        let region = kvm_userspace_memory_region2 {
             slot,
-            flags: self.get_kvm_userspace_memory_region_flag(flags),
+            flags,
             guest_phys_addr,
             memory_size: memory_size as u64,
             userspace_addr: userspace_addr as usize as u64,
-            #[cfg(not(target_arch = "riscv64"))]
             guest_memfd,
             // Each guest_memfd is per-region and sized to memory_size,
             // so the region's data always starts at offset 0.
             guest_memfd_offset: 0,
             ..Default::default()
         };
-        if (region.flags & KVM_MEM_LOG_DIRTY_PAGES) != 0 {
+        if log_dirty_pages {
             if (region.flags & KVM_MEM_READONLY) != 0 {
                 return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
                     "Error creating regions with both 'dirty-pages-log' and 'read-only'."
@@ -1182,14 +1205,11 @@ impl vm::Vm for KvmVm {
                     guest_phys_addr: region.guest_phys_addr,
                     memory_size: region.memory_size,
                     userspace_addr: region.userspace_addr,
+                    flags: region.flags,
                     guest_memfd_offset: region.guest_memfd_offset,
                     guest_memfd: region.guest_memfd,
                 },
             );
-
-            // Always create guest physical memory region without `KVM_MEM_LOG_DIRTY_PAGES`.
-            // For regions that need this flag, dirty pages log will be turned on in `start_dirty_log`.
-            region.flags = self.get_kvm_userspace_memory_region_flag(0);
         }
 
         // SAFETY: Safe because caller promised this is safe.
@@ -1199,7 +1219,7 @@ impl vm::Vm for KvmVm {
         }
 
         #[cfg(feature = "sev_snp")]
-        if self.memory_slots.is_some() {
+        if visibility == vm::MemoryVisibility::Private && self.memory_slots.is_some() {
             self.fd
                 .set_memory_attributes(kvm_memory_attributes {
                     address: region.guest_phys_addr,
@@ -1224,17 +1244,8 @@ impl vm::Vm for KvmVm {
         guest_phys_addr: u64,
         memory_size: usize,
         userspace_addr: *mut u8,
-        readonly: bool,
-        log_dirty_pages: bool,
+        _readonly: bool,
     ) -> vm::Result<()> {
-        let mut flags = 0;
-        if readonly {
-            flags |= KVM_MEM_READONLY;
-        }
-        if log_dirty_pages {
-            flags |= KVM_MEM_LOG_DIRTY_PAGES;
-        }
-
         const _: () = assert!(size_of::<usize>() <= size_of::<u64>());
 
         let mut region = kvm_userspace_memory_region2 {
@@ -1242,7 +1253,7 @@ impl vm::Vm for KvmVm {
             guest_phys_addr,
             memory_size: memory_size as u64,
             userspace_addr: userspace_addr as usize as u64,
-            flags,
+            flags: 0,
             ..Default::default()
         };
 
@@ -1440,7 +1451,7 @@ impl vm::Vm for KvmVm {
                 guest_phys_addr: s.guest_phys_addr,
                 memory_size: s.memory_size,
                 userspace_addr: s.userspace_addr,
-                flags: self.get_kvm_userspace_memory_region_flag(KVM_MEM_LOG_DIRTY_PAGES),
+                flags: s.flags | KVM_MEM_LOG_DIRTY_PAGES,
                 guest_memfd: s.guest_memfd,
                 guest_memfd_offset: s.guest_memfd_offset,
                 ..Default::default()
@@ -1466,7 +1477,7 @@ impl vm::Vm for KvmVm {
                 guest_phys_addr: s.guest_phys_addr,
                 memory_size: s.memory_size,
                 userspace_addr: s.userspace_addr,
-                flags: self.get_kvm_userspace_memory_region_flag(0),
+                flags: s.flags & !KVM_MEM_LOG_DIRTY_PAGES,
                 guest_memfd: s.guest_memfd,
                 guest_memfd_offset: s.guest_memfd_offset,
                 ..Default::default()
@@ -1810,6 +1821,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 #[cfg(feature = "sev_snp")]
                 snp_guest_policy: OnceLock::new(),
                 memory_slots,
+                #[cfg(feature = "sev_snp")]
+                memory_conversion_handler: Arc::new(OnceLock::new()),
             }))
         }
 
@@ -1952,10 +1965,33 @@ pub struct KvmVcpu {
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
+    #[cfg(feature = "sev_snp")]
+    memory_conversion_handler: Arc<OnceLock<Arc<dyn vm::MemoryConversionHandler>>>,
 }
 
 #[cfg(feature = "sev_snp")]
 impl KvmVcpu {
+    fn notify_memory_conversion_handler(
+        &self,
+        gpa: u64,
+        size: u64,
+        to_shared: bool,
+    ) -> cpu::Result<()> {
+        if let Some(handler) = self.memory_conversion_handler.get() {
+            handler
+                .handle_conversion(gpa, size, to_shared)
+                .map_err(cpu::HypervisorCpuError::RunVcpu)?;
+        }
+        Ok(())
+    }
+
+    /// Whether to discard the stale shared mapping on conversion to private.
+    fn should_discard_shared_mapping(&self) -> bool {
+        self.memory_conversion_handler
+            .get()
+            .is_some_and(|h| h.reclaims_shared_mapping())
+    }
+
     fn punch_holes_in_guest_memfd(
         memory_slots: &Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
         gpa: u64,
@@ -1990,6 +2026,50 @@ impl KvmVcpu {
             if ret != 0 {
                 error!(
                     "Error punching hole in the guest_memfd: gpa={gpa:#x} offset={offset:#x} len={len:#x}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    /// Discard the stale *shared* mapping for `[gpa, gpa + size)`.
+    fn discard_shared_mapping(
+        memory_slots: &Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
+        gpa: u64,
+        size: u64,
+    ) {
+        let Some(slots) = memory_slots else {
+            return;
+        };
+        let slots = slots.read().unwrap();
+        let req_end = gpa.saturating_add(size);
+
+        for slot in slots.values() {
+            let slot_end = slot.guest_phys_addr.saturating_add(slot.memory_size);
+            if gpa >= slot_end || req_end <= slot.guest_phys_addr {
+                continue;
+            }
+
+            let overlap_start = gpa.max(slot.guest_phys_addr);
+            let overlap_end = req_end.min(slot_end);
+            let offset = overlap_start - slot.guest_phys_addr;
+            let len = overlap_end - overlap_start;
+
+            let addr = (slot.userspace_addr as usize + offset as usize) as *mut libc::c_void;
+
+            // MADV_REMOVE frees the backing store for shmem/memfd/hugetlb (shared=on,
+            // hugepages). So fall back to MADV_DONTNEED if MADV_REMOVE is rejected for
+            // default anonymous backing.
+            //
+            // SAFETY: [userspace_addr + offset, + len) lies within the slot's range.
+            let mut ret = unsafe { libc::madvise(addr, len as usize, libc::MADV_REMOVE) };
+            if ret != 0 {
+                // SAFETY: [userspace_addr + offset, + len) lies within the slot's range.
+                ret = unsafe { libc::madvise(addr, len as usize, libc::MADV_DONTNEED) };
+            }
+            if ret != 0 {
+                error!(
+                    "Error discarding shared backing: gpa={gpa:#x} offset={offset:#x} len={len:#x}: {}",
                     io::Error::last_os_error()
                 );
             }
@@ -2072,12 +2152,12 @@ impl cpu::Vcpu for KvmVcpu {
         // https://elixir.bootlin.com/linux/v4.14.174/source/arch/arm64/include/uapi/asm/ptrace.h#L72
         // These actually are the general-purpose registers of the Armv8-a
         // architecture (i.e x0-x30 if used as a 64bit register or w0-30 when used as a 32bit register).
-        for i in 0..31 {
+        for reg in &mut state.regs.regs {
             let mut bytes = [0_u8; 8];
             self.fd
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
                 .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
-            state.regs.regs[i] = u64::from_le_bytes(bytes);
+            *reg = u64::from_le_bytes(bytes);
             off += size_of::<u64>();
         }
 
@@ -2125,12 +2205,12 @@ impl cpu::Vcpu for KvmVcpu {
 
         // Saved Program Status Registers, there are 5 of them used in the kernel.
         let mut off = offset_of!(kvm_regs, spsr);
-        for i in 0..KVM_NR_SPSR as usize {
+        for spsr in &mut state.spsr {
             let mut bytes = [0_u8; 8];
             self.fd
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
                 .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
-            state.spsr[i] = u64::from_le_bytes(bytes);
+            *spsr = u64::from_le_bytes(bytes);
             off += size_of::<u64>();
         }
 
@@ -2226,11 +2306,11 @@ impl cpu::Vcpu for KvmVcpu {
         // for some additional info on registers.
         let kvm_regs_state: kvm_regs = (*state).into();
         let mut off = offset_of!(user_pt_regs, regs);
-        for i in 0..31 {
+        for reg in &kvm_regs_state.regs.regs {
             self.fd
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                    &kvm_regs_state.regs.regs[i].to_le_bytes(),
+                    &reg.to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += size_of::<u64>();
@@ -2277,11 +2357,11 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let mut off = offset_of!(kvm_regs, spsr);
-        for i in 0..KVM_NR_SPSR as usize {
+        for spsr in &kvm_regs_state.spsr {
             self.fd
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                    &kvm_regs_state.spsr[i].to_le_bytes(),
+                    &spsr.to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += size_of::<u64>();
@@ -2593,11 +2673,9 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Reset)
                 }
 
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 VcpuExit::SystemEvent(event_type, flags) => {
                     use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-                    // On Aarch64, when the VM is shutdown, run() returns
-                    // VcpuExit::SystemEvent with reason KVM_SYSTEM_EVENT_SHUTDOWN
                     if event_type == KVM_SYSTEM_EVENT_RESET {
                         Ok(cpu::VmExit::Reset)
                     } else if event_type == KVM_SYSTEM_EVENT_SHUTDOWN {
@@ -2676,6 +2754,16 @@ impl cpu::Vcpu for KvmVcpu {
                                 Self::punch_holes_in_guest_memfd(&self.memory_slots, address, size);
                             }
 
+                            self.notify_memory_conversion_handler(
+                                address,
+                                size,
+                                set_private_attr == 0,
+                            )?;
+
+                            if set_private_attr != 0 && self.should_discard_shared_mapping() {
+                                Self::discard_shared_mapping(&self.memory_slots, address, size);
+                            }
+
                             Ok(cpu::VmExit::Ignore)
                         }
                         _ => Ok(cpu::VmExit::Ignore),
@@ -2710,8 +2798,19 @@ impl cpu::Vcpu for KvmVcpu {
                             attributes,
                             flags: 0,
                         })
-                        .map(|_| cpu::VmExit::Ignore)
-                        .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
+                        .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+                    if attributes == 0 {
+                        Self::punch_holes_in_guest_memfd(&self.memory_slots, gpa, size);
+                    }
+
+                    self.notify_memory_conversion_handler(gpa, size, attributes == 0)?;
+
+                    if attributes != 0 && self.should_discard_shared_mapping() {
+                        Self::discard_shared_mapping(&self.memory_slots, gpa, size);
+                    }
+
+                    Ok(cpu::VmExit::Ignore)
                 }
 
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
@@ -2954,14 +3053,6 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(())
     }
 
-    ///
-    /// Gets the value of a non-core register
-    ///
-    #[cfg(target_arch = "riscv64")]
-    fn get_non_core_reg(&self, _non_core_reg: u32) -> cpu::Result<u64> {
-        unimplemented!()
-    }
-
     #[cfg(target_arch = "riscv64")]
     fn get_timebase_frequency(&self) -> cpu::Result<u64> {
         use kvm_bindings::kvm_riscv_timer;
@@ -3171,6 +3262,27 @@ impl cpu::Vcpu for KvmVcpu {
 
         let vcpu_events = self.get_vcpu_events()?;
         let tsc_khz = self.tsc_khz()?;
+        let guest_has_shstk = cpuid
+            .iter()
+            .any(|e| e.function == 7 && e.index == 0 && e.ecx & (1 << SHSTK_ECX_BIT) != 0);
+        // A vCPU paused in user mode keeps its live SSP here, not in MSR_IA32_PL3_SSP.
+        let guest_ssp = if guest_has_shstk {
+            let mut ssp = 0u64;
+            let reg = kvm_bindings::kvm_one_reg {
+                id: KVM_REG_GUEST_SSP,
+                addr: &raw mut ssp as u64,
+            };
+            // SAFETY: FFI call; `reg.addr` points to `ssp`, filled in by the kernel.
+            let ret = unsafe { ioctl_with_ref(&self.fd, KVM_GET_ONE_REG(), &reg) };
+            if ret < 0 {
+                return Err(cpu::HypervisorCpuError::GetRegister(
+                    io::Error::last_os_error().into(),
+                ));
+            }
+            Some(ssp)
+        } else {
+            None
+        };
 
         Ok(VcpuKvmState {
             cpuid,
@@ -3186,6 +3298,7 @@ impl cpu::Vcpu for KvmVcpu {
             tsc_khz,
             nested_state,
             hyperv_synic,
+            guest_ssp,
         }
         .into())
     }
@@ -3425,6 +3538,20 @@ impl cpu::Vcpu for KvmVcpu {
             }
         }
 
+        if let Some(ssp) = state.guest_ssp {
+            let reg = kvm_bindings::kvm_one_reg {
+                id: KVM_REG_GUEST_SSP,
+                addr: &raw const ssp as u64,
+            };
+            // SAFETY: FFI call; `reg.addr` points to `ssp`, read by the kernel.
+            let ret = unsafe { ioctl_with_ref(&self.fd, KVM_SET_ONE_REG(), &reg) };
+            if ret < 0 {
+                return Err(cpu::HypervisorCpuError::SetRegister(
+                    io::Error::last_os_error().into(),
+                ));
+            }
+        }
+
         self.set_vcpu_events(&state.vcpu_events)?;
 
         Ok(())
@@ -3559,8 +3686,6 @@ impl cpu::Vcpu for KvmVcpu {
     /// Return the list of initial MSR entries for a VCPU
     ///
     fn boot_msr_entries(&self) -> Vec<MsrEntry> {
-        use crate::arch::x86::{MTRR_ENABLE, MTRR_MEM_TYPE_WB, msr_index};
-
         let mut boot_entries = self.feature_msrs.clone();
 
         boot_entries.extend([
@@ -3710,7 +3835,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(feature = "sev_snp")]
-    fn setup_sev_snp_regs(&self, vmsa: SevVmsa) -> cpu::Result<()> {
+    fn setup_sev_snp_regs(&self, vmsa: SevVmsa, nested: bool) -> cpu::Result<()> {
         let mut sregs = self
             .fd
             .get_sregs()
@@ -3727,7 +3852,10 @@ impl cpu::Vcpu for KvmVcpu {
         sregs.cr0 = vmsa.cr0;
         sregs.cr4 = vmsa.cr4;
         sregs.cr3 = vmsa.cr3;
-        sregs.efer = vmsa.efer;
+        let svme = u64::from(msr_index::EFER_SVME);
+        // Guest CPUID is configured later, so KVM_SET_SREGS rejects SVME even
+        // for nested guests. Restore it through KVM_SET_MSRS below.
+        sregs.efer = vmsa.efer & !svme;
 
         sregs.idt.base = vmsa.idtr.base;
         sregs.idt.limit = vmsa
@@ -3748,6 +3876,18 @@ impl cpu::Vcpu for KvmVcpu {
         self.fd
             .set_sregs(&sregs)
             .map_err(|e: kvm_ioctls::Error| cpu::HypervisorCpuError::SetSpecialRegs(e.into()))?;
+
+        if nested && vmsa.efer & svme != 0 {
+            let efer_entry = MsrEntry {
+                index: msr_index::MSR_EFER,
+                data: vmsa.efer,
+            };
+            if self.set_msrs(&[efer_entry])? != 1 {
+                return Err(cpu::HypervisorCpuError::SetMsrEntries(anyhow!(
+                    "KVM_SET_MSRS did not set EFER"
+                )));
+            }
+        }
 
         let mut regs = self
             .fd
@@ -3790,12 +3930,12 @@ impl KvmVcpu {
         // Floating point registers are stored in the user_fpsimd_state in the kernel:
         // https://elixir.bootlin.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
         let mut off = offset_of!(kvm_regs, fp_regs.vregs);
-        for i in 0..32 {
+        for vreg in &mut regs.fp_regs.vregs {
             let mut bytes = [0_u8; 16];
             self.fd
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)
                 .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
-            regs.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
+            *vreg = u128::from_le_bytes(bytes);
             off += size_of::<u128>();
         }
 
@@ -3822,11 +3962,11 @@ impl KvmVcpu {
         // Floating point registers are stored in the user_fpsimd_state in the kernel:
         // https://elixir.bootlin.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
         let mut off = offset_of!(kvm_regs, fp_regs.vregs);
-        for i in 0..32 {
+        for vreg in &regs.fp_regs.vregs {
             self.fd
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
-                    &regs.fp_regs.vregs[i].to_le_bytes(),
+                    &vreg.to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += size_of::<u128>();
@@ -4002,7 +4142,7 @@ impl KvmVcpu {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     #[test]
     #[cfg(target_arch = "riscv64")]
     fn test_get_and_set_regs() {

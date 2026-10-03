@@ -71,7 +71,7 @@ For a Flat VMDK, its `path=` points at a small text descriptor whose
 data lives in one or more separate extent files. Granting only the descriptor
 currently leaves those extents unreachable under landlock.
 
-The process launching Cloud-Hypervisor must grant these extent paths explicitly
+The process launching Cloud Hypervisor must grant these extent paths explicitly
 via `--landlock-rules` (or the `landlock_rules` API field). The descriptor file's
 extent section mentions the extent file path which can be either:
 
@@ -95,7 +95,8 @@ To enable Landlock:
 ```
 ./cloud-hypervisor \
 	--kernel ./linux-cloud-hypervisor/arch/x86/boot/compressed/vmlinux.bin \
-	--disk path=focal-server-cloudimg-amd64.raw path=/tmp/ubuntu-cloudinit.img \
+	--disk path=focal-server-cloudimg-amd64.raw,image_type=raw \
+		path=/tmp/ubuntu-cloudinit.img,image_type=raw \
 	--cmdline "console=hvc0 root=/dev/vda1 rw" \
 	--cpus boot=4 \
 	--memory size=1024M \
@@ -111,7 +112,8 @@ To enable Landlock with hotplug support:
 ./cloud-hypervisor \
 	--api-socket /tmpXXXX/ch.socket \
 	--kernel ./linux-cloud-hypervisor/arch/x86/boot/compressed/vmlinux.bin \
-	--disk path=focal-server-cloudimg-amd64.raw path=/tmp/ubuntu-cloudinit.img \
+	--disk path=focal-server-cloudimg-amd64.raw,image_type=raw \
+		path=/tmp/ubuntu-cloudinit.img,image_type=raw \
 	--cmdline "console=hvc0 root=/dev/vda1 rw" \
 	--cpus boot=4 \
 	--memory size=1024M \
@@ -120,7 +122,7 @@ To enable Landlock with hotplug support:
 	--landlock-rules path="/path/to/hotplug1",access="rw" path="/path/to/hotplug2",access="rw"
 
 ./ch-remote --api-socket /tmpXXXX/ch.socket \
-	add-disk "path=/path/to/hotplug/blk.raw"
+	add-disk "path=/path/to/hotplug/blk.raw,image_type=raw"
 ```
 
 `--landlock-rules` accepts file or directory paths among its options.

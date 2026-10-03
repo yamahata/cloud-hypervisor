@@ -33,8 +33,6 @@ use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 use arch::uefi;
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits, layout};
 use devices::AcpiNotificationFlags;
-#[cfg(target_arch = "aarch64")]
-use devices::interrupt_controller;
 #[cfg(feature = "fw_cfg")]
 use devices::legacy::fw_cfg;
 #[cfg(feature = "fw_cfg")]
@@ -167,10 +165,6 @@ pub enum Error {
     #[error("Cannot configure system")]
     ConfigureSystem(#[source] arch::Error),
 
-    #[cfg(target_arch = "aarch64")]
-    #[error("Cannot enable interrupt controller")]
-    EnableInterruptController(#[source] interrupt_controller::Error),
-
     #[error("Error from device manager")]
     DeviceManager(#[source] DeviceManagerError),
 
@@ -207,23 +201,11 @@ pub enum Error {
     #[error("Cannot clone EventFd")]
     EventFdClone(#[source] io::Error),
 
-    #[error("invalid VM state transition: {0:?} to {1:?}")]
+    #[error("Invalid VM state transition: {0:?} to {1:?}")]
     InvalidStateTransition(VmState, VmState),
 
     #[error("Error from CPU manager")]
     CpuManager(#[source] cpu::Error),
-
-    #[error("Cannot pause devices")]
-    PauseDevices(#[source] MigratableError),
-
-    #[error("Cannot resume devices")]
-    ResumeDevices(#[source] MigratableError),
-
-    #[error("Cannot pause CPUs")]
-    PauseCpus(#[source] MigratableError),
-
-    #[error("Cannot resume cpus")]
-    ResumeCpus(#[source] MigratableError),
 
     #[error("Cannot pause VM")]
     Pause(#[source] MigratableError),
@@ -233,9 +215,6 @@ pub enum Error {
 
     #[error("Memory manager error")]
     MemoryManager(#[source] MemoryManagerError),
-
-    #[error("Eventfd write error")]
-    EventfdError(#[source] io::Error),
 
     #[error("Cannot snapshot VM")]
     Snapshot(#[source] MigratableError),
@@ -282,17 +261,8 @@ pub enum Error {
     #[error("Kernel lacks PVH header")]
     KernelMissingPvhHeader,
 
-    #[error("Failed to allocate firmware RAM")]
-    AllocateFirmwareMemory(#[source] MemoryManagerError),
-
     #[error("Error manipulating firmware file")]
     FirmwareFile(#[source] io::Error),
-
-    #[error("Firmware too big")]
-    FirmwareTooLarge,
-
-    #[error("Failed to copy firmware to memory")]
-    FirmwareLoad(#[source] vm_memory::GuestMemoryError),
 
     #[cfg(feature = "sev_snp")]
     #[error("Error enabling SEV-SNP VM")]
@@ -345,7 +315,7 @@ pub enum Error {
     #[error("Error spawning kernel loading thread")]
     KernelLoadThreadSpawn(#[source] io::Error),
 
-    #[error("Error joining kernel loading thread")]
+    #[error("Error joining kernel loading thread: {0:?}")]
     KernelLoadThreadJoin(Box<dyn any::Any + Send>),
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -379,10 +349,6 @@ pub enum Error {
     #[cfg(feature = "fw_cfg")]
     #[error("Fw Cfg missing kernel cmdline")]
     MissingFwCfgCmdline,
-
-    #[cfg(feature = "fw_cfg")]
-    #[error("Error creating e820 map")]
-    CreatingE820Map(#[source] io::Error),
 
     #[error("Error creating ACPI tables")]
     CreatingAcpiTables(#[source] acpi::Error),
@@ -529,6 +495,38 @@ pub fn physical_bits(hypervisor: &dyn hypervisor::Hypervisor, max_phys_bits: u8)
     cmp::min(host_phys_bits, max_phys_bits)
 }
 
+// Whether the VM configuration supports the copy-on-write restore path at
+// runtime. Consumers that rely on guest RAM staying anonymous (DMA pinning,
+// MADV_DONTNEED zeroing, KSM, per-zone reserve/NUMA replay) keep the eager
+// copy. Shared and hugepage zones are already rejected per region.
+fn is_restore_cow_supported(config: &VmConfig) -> bool {
+    let mem = &config.memory;
+    // vDPA dma-maps guest RAM into the vhost-vdpa IOTLB, pinning host pages the
+    // same way VFIO does, so it also needs the anonymous eager-copy mapping.
+    let passthrough = config.devices.as_ref().is_some_and(|d| !d.is_empty())
+        || config.user_devices.as_ref().is_some_and(|d| !d.is_empty())
+        || config.vdpa.as_ref().is_some_and(|d| !d.is_empty());
+    // pvmemcontrol madvises guest RAM as if anonymous.
+    #[cfg(feature = "pvmemcontrol")]
+    let pvmemcontrol = config.pvmemcontrol.is_some();
+    #[cfg(not(feature = "pvmemcontrol"))]
+    let pvmemcontrol = false;
+    let unsupported_zone = mem.zones.as_ref().is_some_and(|zones| {
+        zones.iter().any(|z| {
+            z.host_numa_node.is_some()
+                || z.hotplug_size.is_some()
+                || z.hotplugged_size.is_some()
+                || z.reserve.unwrap_or(false)
+                || z.mergeable
+        })
+    });
+    !(passthrough
+        || pvmemcontrol
+        || mem.mergeable
+        || mem.hotplug_size.is_some()
+        || unsupported_zone)
+}
+
 /// Guest clock baseline captured for snapshot/restore, plus how it must be
 /// re-established on the next resume. `mode` is runtime-only (`SnapshotRestore`
 /// after restore/migration-receive, `SameHostResume` for a live same-host capture)
@@ -555,9 +553,6 @@ pub struct Vm {
     saved_clock: Option<SavedClock>,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
-    #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
-    #[cfg(not(target_arch = "riscv64"))]
-    hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
 }
@@ -624,14 +619,14 @@ impl Vm {
         let vm_ops: Arc<dyn VmOps> = Arc::new(VmOpsHandler {
             memory,
             #[cfg(target_arch = "x86_64")]
-            io_bus: io_bus.clone(),
-            mmio_bus: mmio_bus.clone(),
+            io_bus: Arc::clone(&io_bus),
+            mmio_bus: Arc::clone(&mmio_bus),
         });
 
         // Create CPU manager
         let cpu_manager = Self::create_cpu_manager(
             &config,
-            vm.clone(),
+            Arc::clone(&vm),
             exit_evt.try_clone().map_err(Error::EventFdClone)?,
             guest_exit_evt.try_clone().map_err(Error::EventFdClone)?,
             reset_evt.try_clone().map_err(Error::EventFdClone)?,
@@ -651,10 +646,10 @@ impl Vm {
         let device_manager = Self::create_device_manager(
             io_bus,
             mmio_bus,
-            vm.clone(),
-            config.clone(),
-            memory_manager.clone(),
-            cpu_manager.clone(),
+            Arc::clone(&vm),
+            Arc::clone(&config),
+            Arc::clone(&memory_manager),
+            Arc::clone(&cpu_manager),
             exit_evt.try_clone().map_err(Error::EventFdClone)?,
             reset_evt,
             guest_exit_evt,
@@ -684,7 +679,7 @@ impl Vm {
             igvm_file,
         )?;
 
-        // Load kernel and initramfs files
+        // Load files needed directly by the VMM.
         #[cfg(feature = "tdx")]
         let kernel = config
             .lock()
@@ -701,8 +696,8 @@ impl Vm {
             .unwrap()
             .payload
             .as_ref()
-            .map(|p| p.initramfs.as_ref().map(File::open))
-            .unwrap_or_default()
+            .filter(|payload| payload.firmware.is_none())
+            .and_then(|payload| payload.initramfs.as_ref().map(File::open))
             .transpose()
             .map_err(Error::InitramfsFile)?;
 
@@ -738,8 +733,6 @@ impl Vm {
             saved_clock,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
-            #[cfg(not(target_arch = "riscv64"))]
-            hypervisor,
             stop_on_boot,
             load_payload_handle,
         })
@@ -748,13 +741,17 @@ impl Vm {
     /// Determine if VIRTIO_F_ACCESS_PLATFORM should be forced based on
     /// confidential computing features.
     fn should_force_access_platform(_config: &Arc<Mutex<VmConfig>>) -> bool {
-        #[cfg(feature = "tdx")]
-        if _config.lock().unwrap().is_tdx_enabled() {
-            return true;
-        }
-        #[cfg(feature = "sev_snp")]
-        if _config.lock().unwrap().is_sev_snp_enabled() {
-            return true;
+        #[cfg(any(feature = "tdx", feature = "sev_snp"))]
+        {
+            let config = _config.lock().unwrap();
+            #[cfg(feature = "tdx")]
+            if config.is_tdx_enabled() {
+                return true;
+            }
+            #[cfg(feature = "sev_snp")]
+            if config.is_sev_snp_enabled() {
+                return true;
+            }
         }
         false
     }
@@ -808,7 +805,7 @@ impl Vm {
             reset_evt,
             #[cfg(feature = "guest_debug")]
             vm_debug_evt,
-            hypervisor.clone(),
+            Arc::clone(hypervisor),
             seccomp_action,
             vm_ops,
             #[cfg(feature = "tdx")]
@@ -993,7 +990,7 @@ impl Vm {
                 device_manager,
                 console_info.cloned(),
                 console_resize_pipe.cloned(),
-                original_termios.clone(),
+                Arc::clone(original_termios),
                 snapshot,
             )?;
         }
@@ -1060,7 +1057,7 @@ impl Vm {
             .create_devices(
                 console_info.cloned(),
                 console_resize_pipe.cloned(),
-                original_termios.clone(),
+                Arc::clone(original_termios),
                 ic,
                 dm_snapshot,
             )
@@ -1098,7 +1095,7 @@ impl Vm {
             .create_devices(
                 console_info.cloned(),
                 console_resize_pipe.cloned(),
-                original_termios.clone(),
+                Arc::clone(original_termios),
                 ic,
                 dm_snapshot,
             )
@@ -1285,7 +1282,8 @@ impl Vm {
                         if let Some(mm_zone) = mm_zones.get(memory_zone) {
                             node.memory_regions.extend(mm_zone.regions().clone());
                             if let Some(virtiomem_zone) = mm_zone.virtio_mem_zone() {
-                                node.hotplug_regions.push(virtiomem_zone.region().clone());
+                                node.hotplug_regions
+                                    .push(Arc::clone(virtiomem_zone.region()));
                             }
                             node.memory_zones.push(memory_zone.clone());
                         } else {
@@ -1400,22 +1398,32 @@ impl Vm {
             vm_config.lock().unwrap().cpus.max_phys_bits,
         );
 
+        let mut memory_restore_mode = memory_restore_mode.unwrap_or_default();
+        if memory_restore_mode == MemoryRestoreMode::CopyOnWrite
+            && !is_restore_cow_supported(&vm_config.lock().unwrap())
+        {
+            warn!(
+                "Restore (mode=copyonwrite): requires non-resizable private RAM without passthrough, NUMA binding or KSM, falling back to copy"
+            );
+            memory_restore_mode = MemoryRestoreMode::Copy;
+        }
+
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
                 MemoryManager::new_from_snapshot(
                     snapshot,
-                    vm.clone(),
+                    Arc::clone(&vm),
                     &vm_config.lock().unwrap().memory.clone(),
                     source_url,
                     prefault.unwrap_or(false),
-                    memory_restore_mode.unwrap_or_default(),
+                    memory_restore_mode,
                     phys_bits,
                     &exit_evt,
                 )
                 .map_err(Error::MemoryManager)?
             } else {
                 MemoryManager::new(
-                    vm.clone(),
+                    Arc::clone(&vm),
                     &vm_config.lock().unwrap().memory.clone(),
                     None,
                     phys_bits,
@@ -1482,8 +1490,10 @@ impl Vm {
             arch::initramfs_load_addr(guest_mem, size).map_err(Error::InitramfsAddress)?;
         let address = GuestAddress(address);
 
+        // TODO although the name indicates, there is no retry internally: https://github.com/rust-vmm/rust-vmm/issues/43
+        // For now, we prefer to fail loudly at least.
         guest_mem
-            .read_volatile_from(address, initramfs, size)
+            .read_exact_volatile_from(address, initramfs, size)
             .map_err(Error::InitramfsRead)?;
 
         info!("Initramfs loaded: address = 0x{:x}", address.0);
@@ -1594,7 +1604,7 @@ impl Vm {
         let res = igvm_loader::load_igvm(
             igvm_file,
             memory_manager,
-            cpu_manager.clone(),
+            Arc::clone(&cpu_manager),
             "",
             #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
             measured_boot,
@@ -1734,7 +1744,7 @@ impl Vm {
             }
         }
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), _) => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_kernel(firmware, None, memory_manager)
             }
@@ -1756,7 +1766,7 @@ impl Vm {
         memory_manager: Arc<Mutex<MemoryManager>>,
     ) -> Result<EntryPoint> {
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), _) => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_firmware(&firmware, memory_manager)
             }
@@ -1788,10 +1798,10 @@ impl Vm {
             .payload
             .as_ref()
             .map(|payload| {
-                let memory_manager = memory_manager.clone();
+                let memory_manager = Arc::clone(memory_manager);
                 let payload = payload.clone();
                 #[cfg(feature = "igvm")]
-                let cpu_manager = cpu_manager.clone();
+                let cpu_manager = Arc::clone(cpu_manager);
 
                 thread::Builder::new()
                     .name("payload_loader".into())
@@ -1913,17 +1923,24 @@ impl Vm {
                 ))
             })?;
 
-        // PMU interrupt sticks to PPI, so need to be added by 16 to get real irq number.
         let pmu_supported = self
             .cpu_manager
             .lock()
             .unwrap()
-            .init_pmu(AARCH64_PMU_IRQ + 16)
+            .init_pmu(AARCH64_PMU_IRQ)
             .map_err(|_| {
                 Error::ConfigureSystem(arch::Error::PlatformSpecific(
                     arch::aarch64::Error::VcpuInitPmu,
                 ))
             })?;
+
+        let smbios = self
+            .config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .and_then(|p| p.smbios_config());
 
         arch::configure_system(
             &mem,
@@ -1937,6 +1954,7 @@ impl Vm {
             &vgic,
             &self.numa_nodes,
             pmu_supported,
+            smbios.as_ref(),
         )
         .map_err(Error::ConfigureSystem)?;
 
@@ -2552,7 +2570,9 @@ impl Vm {
                     firmware_file
                         .seek(SeekFrom::Start(section.data_offset as u64))
                         .map_err(Error::LoadTdvf)?;
-                    mem.read_volatile_from(
+                    // TODO although the name indicates, there is no retry internally: https://github.com/rust-vmm/rust-vmm/issues/43
+                    // For now, we prefer to fail loudly at least.
+                    mem.read_exact_volatile_from(
                         GuestAddress(section.address),
                         &mut firmware_file,
                         section.data_size as usize,
@@ -2575,7 +2595,7 @@ impl Vm {
 
                         let mut payload_header = bootparam::setup_header::default();
                         payload_file
-                            .read_volatile(&mut payload_header.as_bytes())
+                            .read_exact_volatile(&mut payload_header.as_bytes())
                             .unwrap();
 
                         if payload_header.header != 0x5372_6448 {
@@ -2589,7 +2609,9 @@ impl Vm {
                         }
 
                         payload_file.rewind().map_err(Error::LoadPayload)?;
-                        mem.read_volatile_from(
+                        // TODO although the name indicates, there is no retry internally: https://github.com/rust-vmm/rust-vmm/issues/43
+                        // For now, we prefer to fail loudly at least.
+                        mem.read_exact_volatile_from(
                             GuestAddress(section.address),
                             payload_file,
                             payload_size as usize,
@@ -2791,8 +2813,10 @@ impl Vm {
                 let kvm_sev_snp_enabled = {
                     #[cfg(feature = "sev_snp")]
                     {
-                        self.config.lock().unwrap().is_sev_snp_enabled()
-                            && self.hypervisor.hypervisor_type() == hypervisor::HypervisorType::Kvm
+                        let sev_snp_enabled = self.config.lock().unwrap().is_sev_snp_enabled();
+                        sev_snp_enabled
+                            && self.cpu_manager.lock().unwrap().hypervisor_type()
+                                == hypervisor::HypervisorType::Kvm
                     }
                     #[cfg(not(feature = "sev_snp"))]
                     {
@@ -2987,6 +3011,14 @@ impl Vm {
     /// Gets the actual size of the balloon.
     pub fn balloon_size(&self) -> u64 {
         self.device_manager.lock().unwrap().balloon_size()
+    }
+
+    pub fn balloon_stats(&self) -> Result<virtio_devices::BalloonStatsSnapshot> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .balloon_stats()
+            .map_err(Error::DeviceManager)
     }
 
     /// Get the actual size of the virtio_mem regions
@@ -3211,7 +3243,8 @@ impl Vm {
         Ok(self
             .vm
             .snapshot_clock(boot_vcpu.hypervisor_vcpu())
-            .map_err(|e| MigratableError::Pause(anyhow!("Could not capture guest clock: {e}")))?
+            .context("Could not capture guest clock")
+            .map_err(MigratableError::Pause)?
             .map(|state| SavedClock {
                 mode: hypervisor::ClockRestoreMode::SameHostResume,
                 state,
@@ -3229,7 +3262,8 @@ impl Vm {
             guards.iter().map(|g| g.hypervisor_vcpu()).collect();
         self.vm
             .restore_clock(&hv_vcpus, &saved.state, saved.mode)
-            .map_err(|e| MigratableError::Resume(anyhow!("Could not restore guest clock: {e}")))
+            .context("Could not restore guest clock")
+            .map_err(MigratableError::Resume)
     }
 
     pub fn device_manager(&self) -> &Arc<Mutex<DeviceManager>> {
@@ -3260,7 +3294,8 @@ impl Pausable for Vm {
 
         self.vm
             .pause()
-            .map_err(|e| MigratableError::Pause(anyhow!("Could not pause the VM: {e}")))?;
+            .context("Could not pause the VM")
+            .map_err(MigratableError::Pause)?;
 
         self.state = new_state;
 
@@ -3283,7 +3318,8 @@ impl Pausable for Vm {
         if current_state == VmState::Paused {
             self.vm
                 .resume()
-                .map_err(|e| MigratableError::Resume(anyhow!("Could not resume the VM: {e}")))?;
+                .context("Could not resume the VM")
+                .map_err(MigratableError::Resume)?;
         }
 
         self.device_manager.lock().unwrap().resume()?;
@@ -3328,35 +3364,10 @@ impl Snapshottable for Vm {
             )));
         }
 
+        // Reuse what the CPU manager generated at VM creation from the same
+        // configuration.
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        let common_cpuid = {
-            let (amx, max_phys_bits, kvm_hyperv, profile) = {
-                let guard = self.config.lock().unwrap();
-                let VmConfig { cpus, .. } = &*guard;
-                (
-                    cpus.features.amx,
-                    cpus.max_phys_bits,
-                    cpus.kvm_hyperv,
-                    cpus.profile,
-                )
-            };
-
-            let phys_bits = physical_bits(self.hypervisor.as_ref(), max_phys_bits);
-
-            arch::generate_common_cpuid(
-                self.hypervisor.as_ref(),
-                &arch::CpuidConfig {
-                    phys_bits,
-                    kvm_hyperv,
-                    #[cfg(feature = "tdx")]
-                    tdx: false,
-                    amx,
-                    profile,
-                },
-            )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateReceive)?
-        };
+        let common_cpuid = self.cpu_manager.lock().unwrap().common_cpuid();
 
         let vm_snapshot_state = VmSnapshot {
             clock: self.saved_clock.map(|saved| saved.state),
@@ -3411,7 +3422,7 @@ impl Transportable for Vm {
             .map_err(MigratableError::MigrateSend)?;
 
         snapshot_config_file
-            .write(vm_config.as_bytes())
+            .write_all(vm_config.as_bytes())
             .context("Error writing VM config snapshot")
             .map_err(MigratableError::MigrateSend)?;
 
@@ -3433,7 +3444,7 @@ impl Transportable for Vm {
             .map_err(MigratableError::MigrateSend)?;
 
         snapshot_state_file
-            .write(&vm_state)
+            .write_all(&vm_state)
             .context("Error writing VM state snapshot")
             .map_err(MigratableError::MigrateSend)?;
 
@@ -3465,20 +3476,43 @@ impl Migratable for Vm {
     }
 
     fn dirty_log(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {
-        Ok(MemoryRangeTable::new_from_tables(vec![
-            self.memory_manager.lock().unwrap().dirty_log()?,
-            self.device_manager.lock().unwrap().dirty_log()?,
-        ]))
+        // memory manager reports by far the most dirty ranges: extend into it
+        let mut table = self.memory_manager.lock().unwrap().dirty_log()?;
+        table.extend(self.device_manager.lock().unwrap().dirty_log()?);
+        Ok(table)
     }
 
-    fn start_migration(&mut self) -> result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().start_migration()?;
-        self.device_manager.lock().unwrap().start_migration()
+    fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .notify_started_migration()?;
+        self.device_manager
+            .lock()
+            .unwrap()
+            .notify_started_migration()
     }
 
-    fn complete_migration(&mut self) -> result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().complete_migration()?;
-        self.device_manager.lock().unwrap().complete_migration()
+    fn notify_failed_migration(&mut self) -> result::Result<(), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .notify_failed_migration()?;
+        self.device_manager
+            .lock()
+            .unwrap()
+            .notify_failed_migration()
+    }
+
+    fn notify_completed_migration(&mut self) -> result::Result<(), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .notify_completed_migration()?;
+        self.device_manager
+            .lock()
+            .unwrap()
+            .notify_completed_migration()
     }
 }
 
@@ -3625,7 +3659,7 @@ impl GuestDebuggable for Vm {
 
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     fn test_vm_state_transitions(state: VmState) {
@@ -3899,7 +3933,7 @@ mod unit_tests {
     }
 
     #[test]
-    pub fn test_vm() {
+    pub(crate) fn test_vm() {
         use hypervisor::VmExit;
         use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
         // This example based on https://lwn.net/Articles/658511/
@@ -3932,6 +3966,7 @@ mod unit_tests {
                     region.as_ptr(),
                     false,
                     false,
+                    hypervisor::MemoryVisibility::Shared,
                 )
                 .expect("Cannot configure guest memory");
             }
@@ -3970,7 +4005,7 @@ mod unit_tests {
 
 #[cfg(target_arch = "aarch64")]
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use arch::{DeviceType, MmioDeviceInfo};
     use devices::gic::Gic;
 
@@ -4034,75 +4069,5 @@ mod unit_tests {
             true,
         )
         .unwrap();
-    }
-}
-
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-#[test]
-pub fn test_vm() {
-    use hypervisor::VmExit;
-    use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
-    // This example based on https://lwn.net/Articles/658511/
-    let code = [
-        0xba, 0xf8, 0x03, /* mov $0x3f8, %dx */
-        0x00, 0xd8, /* add %bl, %al */
-        0x04, b'0', /* add $'0', %al */
-        0xee, /* out %al, (%dx) */
-        0xb0, b'\n', /* mov $'\n', %al */
-        0xee,  /* out %al, (%dx) */
-        0xf4,  /* hlt */
-    ];
-
-    let mem_size = 0x1000;
-    let load_addr = GuestAddress(0x1000);
-    let mem = GuestMemoryMmap::from_ranges(&[(load_addr, mem_size)]).unwrap();
-
-    let hv = hypervisor::new().unwrap();
-    let vm = hv
-        .create_vm(HypervisorVmConfig::default())
-        .expect("new VM creation failed");
-
-    for (index, region) in mem.iter().enumerate() {
-        // SAFETY: parameters are correct
-        unsafe {
-            vm.create_user_memory_region(
-                index as u32,
-                region.start_addr().raw_value(),
-                region.len().try_into().unwrap(),
-                region.as_ptr().cast(),
-                false,
-                false,
-            )
-            .expect("Cannot configure guest memory");
-        }
-    }
-    mem.write_slice(&code, load_addr)
-        .expect("Writing code to memory failed");
-
-    let mut vcpu = vm
-        .create_vcpu(0, None, Default::default())
-        .expect("new Vcpu failed");
-
-    let mut vcpu_sregs = vcpu.get_sregs().expect("get sregs failed");
-    vcpu_sregs.cs.base = 0;
-    vcpu_sregs.cs.selector = 0;
-    vcpu.set_sregs(&vcpu_sregs).expect("set sregs failed");
-
-    let mut vcpu_regs = vcpu.get_regs().expect("get regs failed");
-    vcpu_regs.set_rip(0x1000);
-    vcpu_regs.set_rax(2);
-    vcpu_regs.set_rbx(3);
-    vcpu_regs.set_rflags(2);
-    vcpu.set_regs(&vcpu_regs).expect("set regs failed");
-
-    loop {
-        match vcpu.run().expect("run failed") {
-            VmExit::Reset => {
-                println!("HLT");
-                break;
-            }
-            VmExit::Ignore => {}
-            r => panic!("unexpected exit reason: {r:?}"),
-        }
     }
 }

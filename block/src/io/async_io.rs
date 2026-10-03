@@ -36,9 +36,6 @@ pub enum DiskFileError {
     /// Failed creating a new AsyncIo.
     #[error("Failed creating a new AsyncIo")]
     NewAsyncIo(#[source] io::Error),
-    /// Unsupported operation.
-    #[error("Unsupported operation")]
-    Unsupported,
     /// Resize failed
     #[error("Resize failed")]
     ResizeError(#[source] io::Error),
@@ -48,8 +45,6 @@ pub enum DiskFileError {
     #[error("Failed cloning disk file")]
     Clone(#[source] io::Error),
 }
-
-pub type DiskFileResult<T> = result::Result<T, DiskFileError>;
 
 /// A wrapper for [`RawFd`] capturing the lifetime of a corresponding disk file.
 ///

@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::any::Any;
 use std::cmp;
 
 use kvm_ioctls::DeviceFd;
@@ -255,10 +254,6 @@ impl Vaia for KvmAiaImsics {
         true
     }
 
-    fn as_any_concrete_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
     /// Save the state of AIA.
     fn state(&self) -> Result<AiaImsicsState> {
         unimplemented!()
@@ -271,7 +266,7 @@ impl Vaia for KvmAiaImsics {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use crate::HypervisorVmConfig;
     use crate::arch::riscv64::aia::VaiaConfig;
     use crate::kvm::KvmAiaImsics;

@@ -12,7 +12,7 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use log::{debug, error, info, warn};
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
     CtrlQueue, MAC_ADDR_LEN, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap,
-    TapError, TxVirtio, VirtioNetConfig, open_tap, vnet_hdr_len,
+    TapError, TxVirtio, VirtioNetConfig, associate_taps, open_tap, vnet_hdr_len,
 };
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
@@ -222,8 +222,6 @@ pub enum Error {
     DuplicateTapFd(#[source] io::Error),
     #[error("Error creating EventFd")]
     CreateEventFd(#[source] io::Error),
-    #[error("Error cloning EventFd")]
-    CloneEventFd(#[source] io::Error),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -505,6 +503,7 @@ pub struct Net {
     common: VirtioCommon,
     id: String,
     taps: Vec<Tap>,
+    curr_queue_pairs: Arc<AtomicU16>,
     config: VirtioNetConfig,
     counters: NetCounters,
     seccomp_action: SeccompAction,
@@ -520,6 +519,8 @@ pub struct NetState {
     pub acked_features: u64,
     pub config: VirtioNetConfig,
     pub queue_size: Vec<u16>,
+    #[serde(default)]
+    pub curr_queue_pairs: Option<u16>,
 }
 
 impl Net {
@@ -549,6 +550,12 @@ impl Net {
                 warn!("Failed to query tap MTU; not advertising VIRTIO_NET_F_MTU: {e}");
                 None
             }
+        };
+
+        // One pair until the driver enables more; an older snapshot keeps every pair.
+        let curr_queue_pairs = match &state {
+            Some(state) => state.curr_queue_pairs.unwrap_or(taps.len() as u16),
+            None => 1,
         };
 
         let (avail_features, acked_features, config, queue_sizes, paused, announce_pending) =
@@ -630,6 +637,7 @@ impl Net {
             },
             id,
             taps,
+            curr_queue_pairs: Arc::new(AtomicU16::new(curr_queue_pairs)),
             config,
             counters: NetCounters::default(),
             seccomp_action,
@@ -749,6 +757,7 @@ impl Net {
             acked_features: self.common.acked_features,
             config: self.config,
             queue_size: self.common.queue_sizes.clone(),
+            curr_queue_pairs: Some(self.curr_queue_pairs.load(Ordering::Acquire)),
         }
     }
 
@@ -847,7 +856,7 @@ impl VirtioDevice for Net {
             device_status,
         } = context;
         self.device_status = device_status;
-        self.common.activate(&queues, interrupt_cb.clone())?;
+        self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
@@ -859,6 +868,19 @@ impl VirtioDevice for Net {
         let qp_threads = (num_queues - ctrl_threads) / 2;
         self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
 
+        // Only a queue pair with a worker drains its tap queue, so detach the
+        // rest before the workers start.
+        let curr_queue_pairs = self
+            .curr_queue_pairs
+            .load(Ordering::Acquire)
+            .min(qp_threads as u16);
+        associate_taps(&self.taps, curr_queue_pairs.into()).map_err(|e| {
+            error!("Error setting the number of tap queues: {e:?}");
+            ActivateError::BadActivate
+        })?;
+        self.curr_queue_pairs
+            .store(curr_queue_pairs, Ordering::Release);
+
         if has_ctrl_queue {
             let ctrl_queue_index = num_queues - 1;
             let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
@@ -868,7 +890,7 @@ impl VirtioDevice for Net {
             let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
 
             let guest_announce_ops = VirtioNetGuestAnnounceOps::new(
-                interrupt_cb.clone(),
+                Arc::clone(&interrupt_cb),
                 self.common
                     .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
                 &self.announce,
@@ -892,12 +914,17 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone(), self.announce.pending.clone()),
+                ctrl_q: CtrlQueue::new(
+                    self.taps.clone(),
+                    Arc::clone(&self.announce.pending),
+                    self.config.max_virtqueue_pairs,
+                    Arc::clone(&self.curr_queue_pairs),
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform(),
                 queue_index: ctrl_queue_index as u16,
-                interrupt_cb: interrupt_cb.clone(),
+                interrupt_cb: Arc::clone(&interrupt_cb),
                 announce_evt: self
                     .announce
                     .evt
@@ -907,7 +934,7 @@ impl VirtioDevice for Net {
                 announcer,
             };
 
-            let paused = self.common.paused.clone();
+            let paused = Arc::clone(&self.common.paused);
             let paused_sync = self.common.paused_sync.clone();
 
             self.common.spawn_worker(
@@ -915,8 +942,8 @@ impl VirtioDevice for Net {
                 &self.seccomp_action,
                 Thread::VirtioNetCtl,
                 &self.exit_evt,
-                self.device_status.clone(),
-                interrupt_cb.clone(),
+                Arc::clone(&self.device_status),
+                Arc::clone(&interrupt_cb),
                 move || ctrl_handler.run_ctrl(&paused, paused_sync.as_ref().unwrap()),
             )?;
         }
@@ -978,12 +1005,12 @@ impl VirtioDevice for Net {
                 queue_index_base: (i * 2) as u16,
                 queue_pair,
                 queue_evt_pair,
-                interrupt_cb: interrupt_cb.clone(),
+                interrupt_cb: Arc::clone(&interrupt_cb),
                 kill_evt,
                 pause_evt,
             };
 
-            let paused = self.common.paused.clone();
+            let paused = Arc::clone(&self.common.paused);
             let paused_sync = self.common.paused_sync.clone();
 
             self.common.spawn_worker(
@@ -991,8 +1018,8 @@ impl VirtioDevice for Net {
                 &self.seccomp_action,
                 Thread::VirtioNet,
                 &self.exit_evt,
-                self.device_status.clone(),
-                interrupt_cb.clone(),
+                Arc::clone(&self.device_status),
+                Arc::clone(&interrupt_cb),
                 move || handler.run(&paused, paused_sync.as_ref().unwrap()),
             )?;
         }
@@ -1006,6 +1033,7 @@ impl VirtioDevice for Net {
     fn reset(&mut self) {
         self.common.reset();
         self.announce.reset();
+        self.curr_queue_pairs.store(1, Ordering::Release);
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -1065,7 +1093,7 @@ impl Snapshottable for Net {
 }
 impl Transportable for Net {}
 impl Migratable for Net {
-    fn start_migration(&mut self) -> result::Result<(), MigratableError> {
+    fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         self.announce.invalidate();
         Ok(())
     }
@@ -1099,7 +1127,7 @@ impl Announcer {
 
     pub fn new(announce: &AnnouncementState, announce_ops: Box<[Box<dyn AnnounceOps>]>) -> Self {
         Self {
-            announce_generation: announce.generation.clone(),
+            announce_generation: Arc::clone(&announce.generation),
             generation: 0,
             announcements_done: 0,
             announce_ops,
@@ -1145,7 +1173,7 @@ pub(crate) struct VirtioNetGuestAnnounceOps {
 }
 
 impl VirtioNetGuestAnnounceOps {
-    pub fn new(
+    pub(crate) fn new(
         interrupt_cb: Arc<dyn VirtioInterrupt>,
         guest_announce_negotiated: bool,
         announce: &AnnouncementState,
@@ -1153,7 +1181,7 @@ impl VirtioNetGuestAnnounceOps {
         Self {
             interrupt_cb,
             guest_announce_negotiated,
-            announce_pending: announce.pending.clone(),
+            announce_pending: Arc::clone(&announce.pending),
         }
     }
 }
@@ -1187,7 +1215,7 @@ struct VirtioNetHostAnnounceOps {
 }
 
 impl VirtioNetHostAnnounceOps {
-    pub fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, taps: Box<[Tap]>) -> Self {
+    pub(crate) fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, taps: Box<[Tap]>) -> Self {
         Self {
             rarp_announce,
             taps,
@@ -1204,7 +1232,7 @@ impl AnnounceOps for VirtioNetHostAnnounceOps {
             buf[vnet_hdr_len()..].copy_from_slice(&rarp_announce);
 
             for tap in &mut self.taps {
-                if let Err(e) = tap.write(&buf) {
+                if let Err(e) = tap.write_all(&buf) {
                     // The host-side RARP packets are best-effort. Thus, to keep things simple, we
                     // only log errors here instead of waiting for the TAP to become writable again.
                     error!("Host RARP write to TAP failed: {e}");
@@ -1219,7 +1247,7 @@ impl AnnounceOps for VirtioNetHostAnnounceOps {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::mem::{offset_of, size_of};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1244,6 +1272,7 @@ mod unit_tests {
             },
             id: "test-net".to_string(),
             taps: Vec::new(),
+            curr_queue_pairs: Arc::new(AtomicU16::new(1)),
             config: VirtioNetConfig::default(),
             counters: NetCounters::default(),
             seccomp_action: SeccompAction::Allow,
@@ -1334,7 +1363,7 @@ mod unit_tests {
         let interrupt = Arc::new(TestInterrupt::new());
         let net = test_net(
             (1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
+            Some(Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>),
         )
         .unwrap();
         let mut announcer = test_announcer(&net).unwrap();
@@ -1355,7 +1384,7 @@ mod unit_tests {
         let interrupt = Arc::new(TestInterrupt::new());
         let net = test_net(
             (1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
+            Some(Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>),
         )
         .unwrap();
         let mut announcer = test_announcer(&net).unwrap();
@@ -1375,7 +1404,7 @@ mod unit_tests {
     #[test]
     fn test_post_migration_without_feature_is_noop() {
         let interrupt = Arc::new(TestInterrupt::new());
-        let net = test_net(0, Some(interrupt.clone() as Arc<dyn VirtioInterrupt>)).unwrap();
+        let net = test_net(0, Some(Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>)).unwrap();
         let mut announcer = test_announcer(&net).unwrap();
 
         net.announce.pending.store(true, Ordering::Release);
@@ -1393,7 +1422,7 @@ mod unit_tests {
         let interrupt = Arc::new(TestInterrupt::new());
         let mut net = test_net(
             (1 << VIRTIO_NET_F_GUEST_ANNOUNCE) | (1 << VIRTIO_NET_F_STATUS),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
+            Some(Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>),
         )
         .unwrap();
         let mut announcer = test_announcer(&net).unwrap();
@@ -1418,7 +1447,7 @@ mod unit_tests {
         let interrupt = Arc::new(TestInterrupt::new());
         let mut net = test_net(
             1 << VIRTIO_NET_F_GUEST_ANNOUNCE,
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
+            Some(Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>),
         )
         .unwrap();
         let mut announcer = test_announcer(&net).unwrap();
@@ -1452,7 +1481,7 @@ mod unit_tests {
     #[test]
     fn test_start_migration_invalidates_old_announcer() {
         assert_old_announcer_invalidated(|net| {
-            net.start_migration().unwrap();
+            net.notify_started_migration().unwrap();
         });
     }
 
@@ -1475,7 +1504,7 @@ mod unit_tests {
         val: Arc<AtomicUsize>,
     ) -> Result<Announcer> {
         let first_ops = RecordingAnnounceOps {
-            val: val.clone(),
+            val: Arc::clone(&val),
             outcome: first_outcome,
         };
         let second_ops = RecordingAnnounceOps {
@@ -1506,12 +1535,44 @@ mod unit_tests {
             &net,
             AnnounceOutcome::Retry,
             AnnounceOutcome::Done,
-            val.clone(),
+            Arc::clone(&val),
         )
         .unwrap();
 
         announcer.initialize();
         assert!(matches!(announcer.send_announce(), AnnounceOutcome::Retry));
         assert_eq!(val.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn test_restore_state_without_curr_queue_pairs() {
+        #[derive(Serialize)]
+        struct LegacyNetState {
+            avail_features: u64,
+            acked_features: u64,
+            config: VirtioNetConfig,
+            queue_size: Vec<u16>,
+        }
+
+        let snapshot = Snapshot::new_from_state(&LegacyNetState {
+            avail_features: 0,
+            acked_features: 0,
+            config: VirtioNetConfig::default(),
+            queue_size: vec![256; 3],
+        })
+        .unwrap();
+
+        let state: NetState = snapshot.to_state().unwrap();
+        assert_eq!(state.curr_queue_pairs, None);
+    }
+
+    #[test]
+    fn test_reset_returns_to_one_queue_pair() {
+        let mut net = test_net(0, None).unwrap();
+        net.curr_queue_pairs.store(4, Ordering::Release);
+        assert_eq!(net.state().curr_queue_pairs, Some(4));
+
+        net.reset();
+        assert_eq!(net.state().curr_queue_pairs, Some(1));
     }
 }

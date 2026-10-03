@@ -35,10 +35,10 @@ type ApiResult = Result<(), Error>;
 
 #[derive(Error, Debug)]
 enum Error {
-    #[error("http client error")]
+    #[error("HTTP Client Error")]
     HttpApiClient(#[source] ApiClientError),
     #[cfg(feature = "dbus_api")]
-    #[error("dbus api client error")]
+    #[error("D-Bus API Client Error")]
     DBusApiClient(#[source] zbus::Error),
     #[error("Error parsing CPU count")]
     InvalidCpuCount(#[source] num::ParseIntError),
@@ -101,6 +101,7 @@ trait DBusApi1 {
     fn vm_add_user_device(&self, vm_add_user_device: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_vdpa(&self, vdpa_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_vsock(&self, vsock_config: &str) -> zbus::Result<Optional<String>>;
+    fn vm_balloon_stats(&self) -> zbus::Result<String>;
     fn vm_boot(&self) -> zbus::Result<()>;
     fn vm_coredump(&self, vm_coredump_data: &str) -> zbus::Result<()>;
     fn vm_counters(&self) -> zbus::Result<Optional<String>>;
@@ -114,6 +115,7 @@ trait DBusApi1 {
     fn vm_resize(&self, vm_resize: &str) -> zbus::Result<()>;
     fn vm_resize_zone(&self, vm_resize_zone: &str) -> zbus::Result<()>;
     fn vm_restore(&self, restore_config: &str) -> zbus::Result<()>;
+    fn vm_cancel_migration(&self) -> zbus::Result<()>;
     fn vm_receive_migration(&self, receive_migration_data: &str) -> zbus::Result<()>;
     fn vm_send_migration(&self, receive_migration_data: &str) -> zbus::Result<()>;
     fn vm_resume(&self) -> zbus::Result<()>;
@@ -192,6 +194,12 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
         self.print_response(self.vm_add_vsock(vsock_config))
     }
 
+    fn api_vm_balloon_stats(&self) -> ApiResult {
+        self.vm_balloon_stats()
+            .map(|stats| println!("{stats}"))
+            .map_err(Error::DBusApiClient)
+    }
+
     fn api_vm_boot(&self) -> ApiResult {
         self.vm_boot().map_err(Error::DBusApiClient)
     }
@@ -248,6 +256,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
     fn api_vm_restore(&self, restore_config: &str) -> ApiResult {
         self.vm_restore(restore_config)
             .map_err(Error::DBusApiClient)
+    }
+
+    fn api_vm_cancel_migration(&self) -> ApiResult {
+        self.vm_cancel_migration().map_err(Error::DBusApiClient)
     }
 
     fn api_vm_receive_migration(&self, receive_migration_data: &str) -> ApiResult {
@@ -308,6 +320,9 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
         }
         Some("info") => {
             simple_api_command(socket, "GET", "info", None).map_err(Error::HttpApiClient)
+        }
+        Some("balloon-stats") => {
+            simple_api_command(socket, "GET", "balloon-stats", None).map_err(Error::HttpApiClient)
         }
         Some("counters") => {
             simple_api_command(socket, "GET", "counters", None).map_err(Error::HttpApiClient)
@@ -557,6 +572,8 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             )?;
             simple_api_command(socket, "PUT", "create", Some(&data)).map_err(Error::HttpApiClient)
         }
+        Some("cancel-migration") => simple_api_command(socket, "PUT", "cancel-migration", None)
+            .map_err(Error::HttpApiClient),
         _ => unreachable!(),
     }
 }
@@ -572,6 +589,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
         Some("reboot") => proxy.api_vm_reboot(),
         Some("pause") => proxy.api_vm_pause(),
         Some("info") => proxy.api_vm_info(),
+        Some("balloon-stats") => proxy.api_vm_balloon_stats(),
         Some("counters") => proxy.api_vm_counters(),
         Some("ping") => proxy.api_vmm_ping(),
         Some("shutdown") => proxy.api_vm_shutdown(),
@@ -740,6 +758,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             );
             proxy.api_vm_coredump(&coredump_config)
         }
+        Some("cancel-migration") => proxy.api_vm_cancel_migration(),
         Some("send-migration") => {
             let send_migration_data = send_migration_data(
                 matches
@@ -1072,7 +1091,9 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
         Command::new("add-vsock")
             .about("Add vsock device")
             .arg(Arg::new("vsock_config").index(1).help(VsockConfig::SYNTAX)),
+        Command::new("balloon-stats").about("Statistics from the virtio-balloon device"),
         Command::new("boot").about("Boot a created VM"),
+        Command::new("cancel-migration").about("Cancel any ongoing migration"),
         Command::new("coredump")
             .about("Create a coredump from VM")
             .arg(Arg::new("coredump_config").index(1).help("<file_path>")),
@@ -1312,7 +1333,7 @@ fn main() {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::cmp::Ordering;
 
     use super::*;

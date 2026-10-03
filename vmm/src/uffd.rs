@@ -13,11 +13,11 @@
 //! original memory mapping, so it remains compatible with VFIO device
 //! passthrough and shared-memory-backed guest RAM.
 
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Error, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
+use std::{fmt, thread};
 
 use vm_migration::protocol::{MemoryRange, Request, Response, Status};
 
@@ -25,14 +25,14 @@ use crate::migration::transport::SocketStream;
 use crate::userfaultfd;
 
 #[repr(C)]
-pub(crate) struct UffdioApi {
+struct UffdioApi {
     pub api: u64,
     pub features: u64,
     pub ioctls: u64,
 }
 
 #[repr(C)]
-pub(crate) struct UffdioRegister {
+struct UffdioRegister {
     pub range_start: u64,
     pub range_len: u64,
     pub mode: u64,
@@ -40,7 +40,7 @@ pub(crate) struct UffdioRegister {
 }
 
 #[repr(C)]
-pub(crate) struct UffdioCopy {
+struct UffdioCopy {
     pub dst: u64,
     pub src: u64,
     pub len: u64,
@@ -49,7 +49,7 @@ pub(crate) struct UffdioCopy {
 }
 
 #[repr(C)]
-pub(crate) struct UffdioContinue {
+struct UffdioContinue {
     pub range_start: u64,
     pub range_len: u64,
     pub mode: u64,
@@ -182,18 +182,25 @@ pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Re
         mode: 0,
         copy: 0,
     };
-    // SAFETY: `cp` is a valid, correctly-sized struct for this ioctl.
-    let ret = unsafe {
-        libc::ioctl(
-            fd.as_raw_fd(),
-            userfaultfd::UFFDIO_COPY as libc::Ioctl,
-            &mut cp,
-        )
-    };
-    if ret < 0 {
-        return Err(Error::last_os_error());
+    loop {
+        // SAFETY: `cp` is a valid, correctly-sized struct for this ioctl.
+        let ret = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                userfaultfd::UFFDIO_COPY as libc::Ioctl,
+                &mut cp,
+            )
+        };
+        if ret >= 0 {
+            return Ok(());
+        }
+
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) {
+            return Err(error);
+        }
+        thread::yield_now();
     }
-    Ok(())
 }
 
 /// Resolves a minor page fault by installing PTEs for a range.
@@ -204,18 +211,25 @@ pub(crate) fn uffd_continue(fd: BorrowedFd<'_>, dst: u64, len: u64) -> Result<()
         mode: 0,
         mapped: 0,
     };
-    // SAFETY: `cont` is a valid, correctly-sized struct for this ioctl.
-    let ret = unsafe {
-        libc::ioctl(
-            fd.as_raw_fd(),
-            userfaultfd::UFFDIO_CONTINUE as libc::Ioctl,
-            &mut cont,
-        )
-    };
-    if ret < 0 {
-        return Err(Error::last_os_error());
+    loop {
+        // SAFETY: `cont` is a valid, correctly-sized struct for this ioctl.
+        let ret = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                userfaultfd::UFFDIO_CONTINUE as libc::Ioctl,
+                &mut cont,
+            )
+        };
+        if ret >= 0 {
+            return Ok(());
+        }
+
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) {
+            return Err(error);
+        }
+        thread::yield_now();
     }
-    Ok(())
 }
 
 #[repr(C)]
@@ -234,31 +248,23 @@ pub(crate) struct UffdRange {
 }
 
 impl UffdRange {
-    pub fn num_pages(&self) -> u64 {
+    pub(crate) fn num_pages(&self) -> u64 {
         self.length.div_ceil(self.page_size)
     }
 
-    pub fn page_addr(&self, page_idx: u64) -> u64 {
+    pub(crate) fn page_addr(&self, page_idx: u64) -> u64 {
         self.host_addr + page_idx * self.page_size
     }
 
-    pub fn page_source_offset(&self, page_idx: u64) -> u64 {
+    pub(crate) fn page_source_offset(&self, page_idx: u64) -> u64 {
         self.source_offset + page_idx * self.page_size
     }
 
-    pub fn page_index_of(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn page_index_of(&self, addr: u64) -> Option<u64> {
         let page_addr = addr & !(self.page_size - 1);
         (page_addr >= self.host_addr && page_addr < self.host_addr + self.length)
             .then(|| (page_addr - self.host_addr) / self.page_size)
     }
-}
-
-/// Result of a page fault being resolved.
-pub(crate) enum FaultResolution {
-    /// Page installed.
-    Served,
-    /// Indicates the page couldn't be installed and it's worth retrying.
-    Retry,
 }
 
 /// Provider of guest-memory page contents for a UFFD handler.
@@ -268,7 +274,7 @@ pub(crate) trait UffdMemorySource: Send {
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
-    ) -> Result<FaultResolution, io::Error>;
+    ) -> Result<(), io::Error>;
 
     fn requires_uffd_minor_mode(&self) -> bool;
 }
@@ -280,7 +286,7 @@ pub(crate) struct FileUffdMemorySource {
 }
 
 impl FileUffdMemorySource {
-    pub fn new(file: File) -> Self {
+    pub(crate) fn new(file: File) -> Self {
         Self {
             file,
             buf: Vec::new(),
@@ -294,7 +300,7 @@ impl UffdMemorySource for FileUffdMemorySource {
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
-    ) -> Result<FaultResolution, io::Error> {
+    ) -> Result<(), io::Error> {
         let page_size = range.page_size as usize;
         let page_addr = range.page_addr(page_idx);
         let file_pos = range.page_source_offset(page_idx);
@@ -306,15 +312,14 @@ impl UffdMemorySource for FileUffdMemorySource {
             .read_exact_at(&mut self.buf[..page_size], file_pos)?;
 
         match copy(uffd_fd, page_addr, self.buf.as_ptr(), range.page_size) {
-            Ok(()) => Ok(FaultResolution::Served),
+            Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                 // Installed concurrently. Wake any blocked threads.
                 if let Err(e) = wake(uffd_fd, page_addr, range.page_size) {
                     log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
                 }
-                Ok(FaultResolution::Served)
+                Ok(())
             }
-            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(FaultResolution::Retry),
             Err(e) => Err(e),
         }
     }
@@ -332,7 +337,7 @@ pub(crate) struct SocketUffdMemorySource {
 }
 
 impl SocketUffdMemorySource {
-    pub fn new(stream: SocketStream, shared_backing: bool) -> Self {
+    pub(crate) fn new(stream: SocketStream, shared_backing: bool) -> Self {
         Self {
             stream,
             shared_backing,
@@ -366,7 +371,7 @@ impl UffdMemorySource for SocketUffdMemorySource {
         uffd_fd: BorrowedFd<'_>,
         range: &UffdRange,
         page_idx: u64,
-    ) -> Result<FaultResolution, io::Error> {
+    ) -> Result<(), io::Error> {
         let page_size = range.page_size;
         let page_addr = range.page_addr(page_idx);
         let page_gpa = range.page_source_offset(page_idx);
@@ -380,15 +385,14 @@ impl UffdMemorySource for SocketUffdMemorySource {
                 )));
             }
             match uffd_continue(uffd_fd, page_addr, page_size) {
-                Ok(()) => Ok(FaultResolution::Served),
+                Ok(()) => Ok(()),
                 // This is fine, someone mapped the page before us.
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                     if let Err(e) = wake(uffd_fd, page_addr, page_size) {
                         log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
                     }
-                    Ok(FaultResolution::Served)
+                    Ok(())
                 }
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(FaultResolution::Retry),
                 Err(e) => Err(e),
             }
         } else {
@@ -403,14 +407,13 @@ impl UffdMemorySource for SocketUffdMemorySource {
             }
             self.stream.read_exact(&mut self.buf[..len])?;
             match copy(uffd_fd, page_addr, self.buf.as_ptr(), page_size) {
-                Ok(()) => Ok(FaultResolution::Served),
+                Ok(()) => Ok(()),
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                     if let Err(e) = wake(uffd_fd, page_addr, page_size) {
                         log::warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
                     }
-                    Ok(FaultResolution::Served)
+                    Ok(())
                 }
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(FaultResolution::Retry),
                 Err(e) => Err(e),
             }
         }

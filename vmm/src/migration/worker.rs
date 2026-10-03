@@ -13,8 +13,8 @@
 //! [`MigrationWorkerSpawnError`].
 
 use std::fmt::{self, Debug, Formatter};
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::{io, thread};
@@ -32,7 +32,7 @@ use crate::vm::{Vm, VmState};
 
 #[derive(thiserror::Error)]
 #[error("Migration worker could not be spawned: {spawn_error}")]
-pub struct MigrationWorkerSpawnError {
+pub(crate) struct MigrationWorkerSpawnError {
     pub spawn_error: io::Error,
     pub vm: Vm,
 }
@@ -46,17 +46,22 @@ impl Debug for MigrationWorkerSpawnError {
     }
 }
 
-pub struct MigrationWorkerHandle {
+pub(crate) struct MigrationWorkerHandle {
     handle: Option<JoinHandle<MigrationWorkerResult>>,
+    cancel_migration: Arc<AtomicBool>,
 }
 
 impl MigrationWorkerHandle {
-    pub fn join(mut self) -> MigrationWorkerResult {
+    pub(crate) fn join(mut self) -> MigrationWorkerResult {
         self.handle
             .take()
             .expect("should have thread")
             .join()
             .expect("should join migration worker gracefully")
+    }
+
+    pub(crate) fn try_cancel_migration(&self) {
+        self.cancel_migration.store(true, Ordering::Release);
     }
 }
 
@@ -70,13 +75,13 @@ impl Drop for MigrationWorkerHandle {
 }
 
 #[derive(Clone, Debug)]
-pub struct MigrationSeccompFilters {
+pub(crate) struct MigrationSeccompFilters {
     pub worker: BpfProgram,
     pub tcp_worker: BpfProgram,
     pub postcopy_server: BpfProgram,
 }
 
-pub struct MigrationWorker {
+pub(crate) struct MigrationWorker {
     // Keep the VM out of the thread closure until spawning succeeds.
     vm_receiver: Receiver<Vm>,
     check_migration_evt: EventFd,
@@ -85,12 +90,14 @@ pub struct MigrationWorker {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     initial_vm_state: VmState,
     seccomp_filters: MigrationSeccompFilters,
+    vm_moved_to_destination: bool,
+    cancel_migration: Arc<AtomicBool>,
 }
 
 impl MigrationWorker {
     /// Drives the migration from its start to its end (success, cancellation,
     /// failure)
-    fn run(self) -> MigrationWorkerResult {
+    fn run(mut self) -> MigrationWorkerResult {
         let seccomp_res = if self.seccomp_filters.worker.is_empty() {
             Ok(())
         } else {
@@ -107,7 +114,7 @@ impl MigrationWorker {
         // therefore we chain the results together.
         let migration_result = seccomp_res
             .and_then(|()| {
-                event!("vm", "migration-started");
+                event!("vm", "migration-starting");
                 Vmm::send_migration(
                     &mut vm,
                     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -115,10 +122,21 @@ impl MigrationWorker {
                     &self.config,
                     self.initial_vm_state,
                     &self.seccomp_filters,
+                    &mut self.vm_moved_to_destination,
+                    &self.cancel_migration,
                 )
             })
-            .inspect(|_| event!("vm", "migration-finished"))
-            .inspect_err(|_| event!("vm", "migration-failed"));
+            .inspect(|_| {
+                event!("vm", "migration-finished");
+            })
+            .inspect_err(|e| match e {
+                MigratableError::Cancelled => {
+                    event!("vm", "migration-cancelled");
+                }
+                _ => {
+                    event!("vm", "migration-failed");
+                }
+            });
 
         // Notify VMM thread to check migration result.
         self.check_migration_evt.write(1).unwrap();
@@ -127,7 +145,8 @@ impl MigrationWorker {
             vm,
             migration_result,
             initial_vm_state: self.initial_vm_state,
-            preserve_source: self.config.preserve_source,
+            config: self.config,
+            vm_moved_to_destination: self.vm_moved_to_destination,
         }
     }
 
@@ -135,7 +154,7 @@ impl MigrationWorker {
     // All code paths need special care to prevent any panic and thus losing the
     // VM in case of failure.
     #[expect(clippy::result_large_err)]
-    pub fn spawn(
+    pub(crate) fn spawn(
         vm: Vm,
         check_migration_evt: EventFd,
         config: VmSendMigrationData,
@@ -145,6 +164,8 @@ impl MigrationWorker {
         initial_vm_state: VmState,
         seccomp_filters: MigrationSeccompFilters,
     ) -> Result<MigrationWorkerHandle, MigrationWorkerSpawnError> {
+        let cancel_migration = Arc::new(AtomicBool::new(false));
+
         let (vm_sender, vm_receiver) = mpsc::sync_channel(0);
         let worker = MigrationWorker {
             vm_receiver,
@@ -154,6 +175,8 @@ impl MigrationWorker {
             hypervisor,
             initial_vm_state,
             seccomp_filters,
+            vm_moved_to_destination: false,
+            cancel_migration: Arc::clone(&cancel_migration),
         };
 
         let inner_handle = match thread::Builder::new()
@@ -173,12 +196,13 @@ impl MigrationWorker {
 
         Ok(MigrationWorkerHandle {
             handle: Some(inner_handle),
+            cancel_migration,
         })
     }
 }
 
 /// Return value of [`MigrationWorker`].
-pub struct MigrationWorkerResult {
+pub(crate) struct MigrationWorkerResult {
     /// The VM that was migrated.
     ///
     /// If `migration_result` is `Ok`, the VM is paused and can be deleted
@@ -189,5 +213,6 @@ pub struct MigrationWorkerResult {
     /// The result of [`Vmm::send_migration`].
     pub migration_result: Result<(), MigratableError>,
     pub initial_vm_state: VmState,
-    pub preserve_source: bool,
+    pub config: VmSendMigrationData,
+    pub vm_moved_to_destination: bool,
 }

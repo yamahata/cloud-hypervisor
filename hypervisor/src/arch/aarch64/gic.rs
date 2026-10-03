@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::any::Any;
 use std::result;
 
 use serde::de::Error as SerdeError;
@@ -59,7 +58,7 @@ impl<'de> Deserialize<'de> for GicState {
         // GicStateDefaultDeserialize is a helper enum that mirrors GicState but also derives the Deserialize trait.
         // This enables backward-compatible deserialization of GicState, facilitating live-upgrade scenarios.
         #[derive(Deserialize)]
-        pub enum GicStateDefaultDeserialize {
+        enum GicStateDefaultDeserialize {
             #[cfg(feature = "kvm")]
             Kvm(Gicv3ItsState),
             #[cfg(feature = "mshv")]
@@ -110,9 +109,6 @@ pub trait Vgic: Send + Sync {
 
     /// Returns the MSI reg property of the device
     fn msi_properties(&self) -> [u64; 2];
-
-    /// Downcast the trait object to its concrete type.
-    fn as_any_concrete_mut(&mut self) -> &mut dyn Any;
 
     /// Save the state of GICv3ITS.
     fn state(&self) -> Result<GicState>;

@@ -33,7 +33,7 @@ pub use ctrl_queue::{CtrlQueue, Error as CtrlQueueError};
 pub use mac::{MAC_ADDR_LEN, MacAddr};
 pub use open_tap::{Error as OpenTapError, open_tap};
 pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
-pub use tap::{Error as TapError, Tap};
+pub use tap::{Error as TapError, Tap, associate_taps};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -174,7 +174,7 @@ pub fn virtio_features_to_tap_offload(features: u64) -> c_uint {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
 
     #[test]

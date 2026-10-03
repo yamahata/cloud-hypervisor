@@ -17,6 +17,7 @@ ivshmem = ["devices/ivshmem"]
 kvm = [
   "arch/kvm",
   "hypervisor/kvm",
+  "iommufd-bindings",
   "iommufd-ioctls",
   "pci/kvm",
   "vfio-ioctls/kvm",
@@ -34,6 +35,7 @@ mshv = [
 pvmemcontrol = ["devices/pvmemcontrol"]
 sev_snp = [
   "arch/sev_snp",
+  "dep:sha2",
   "hypervisor/sev_snp",
   "igvm",
   "virtio-devices/sev_snp",
@@ -62,6 +64,7 @@ hex = { version = "0.4.3", optional = true }
 hypervisor = { path = "../hypervisor" }
 igvm = { workspace = true, optional = true }
 igvm_defs = { workspace = true, optional = true }
+iommufd-bindings = { workspace = true, optional = true }
 iommufd-ioctls = { workspace = true, optional = true }
 landlock = "0.4.5"
 libc = { workspace = true }
@@ -82,7 +85,7 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["macros"] }
 serial_buffer = { path = "../serial_buffer" }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 signal-hook = { workspace = true }
 socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = { workspace = true }

@@ -8,6 +8,7 @@
 //
 //
 
+use kvm_bindings::nested::KvmNestedStateBuffer;
 use log::error;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,7 +24,6 @@ pub use {
     kvm_bindings::kvm_msr_entry, kvm_bindings::kvm_regs, kvm_bindings::kvm_segment,
     kvm_bindings::kvm_sregs, kvm_bindings::kvm_vcpu_events as VcpuEvents,
     kvm_bindings::kvm_xcrs as ExtendedControlRegisters, kvm_bindings::kvm_xsave,
-    kvm_bindings::nested::KvmNestedStateBuffer,
 };
 
 use crate::arch::x86::{
@@ -87,6 +87,8 @@ pub struct VcpuKvmState {
     pub nested_state: Option<KvmNestedStateBuffer>,
     #[serde(default)]
     pub hyperv_synic: bool,
+    #[serde(default)]
+    pub guest_ssp: Option<u64>,
 }
 
 impl From<SegmentRegister> for kvm_segment {

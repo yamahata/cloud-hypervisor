@@ -16,8 +16,11 @@ mshv_emulator = ["hypervisor/mshv_emulator"]
 pvmemcontrol = []
 
 [dependencies]
-arbitrary = "1.4.2"
-block = { path = "../block" }
+arbitrary = { version = "1.4.2", features = ["derive"] }
+# test-utils provides the disk_*_ops template images.
+block = { path = "../block", features = ["test-utils"] }
+# Must match the VHDX parser's CRC-32C implementation.
+crc-any = "3.0.0"
 devices = { path = "../devices" }
 epoll = "4.4.0"
 hypervisor = { path = "../hypervisor", features = ["mshv_emulator"] }
@@ -25,11 +28,12 @@ libc = "0.2.186"
 libfuzzer-sys = "0.4.12"
 linux-loader = { version = "0.14.0", features = ["bzimage", "elf", "pe"] }
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http", branch = "main" }
-mshv-bindings = "0.7.0"
+mshv-bindings = "0.7.1"
 net_util = { path = "../net_util" }
 seccompiler = "0.5.0"
 virtio-devices = { path = "../virtio-devices" }
 virtio-queue = "0.18.0"
+vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
 vm-memory = "0.18.0"
 vm-migration = { path = "../vm-migration" }
@@ -63,6 +67,60 @@ test = false
 doc = false
 name = "console"
 path = "fuzz_targets/console.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_detect"
+path = "fuzz_targets/disk_detect.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_qcow2"
+path = "fuzz_targets/disk_qcow2.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_qcow2_chain"
+path = "fuzz_targets/disk_qcow2_chain.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_qcow2_ops"
+path = "fuzz_targets/disk_qcow2_ops.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_vhd"
+path = "fuzz_targets/disk_vhd.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_vhdx"
+path = "fuzz_targets/disk_vhdx.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_vhdx_ops"
+path = "fuzz_targets/disk_vhdx_ops.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_vmdk"
+path = "fuzz_targets/disk_vmdk.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "disk_vmdk_ops"
+path = "fuzz_targets/disk_vmdk_ops.rs"
 test = false
 
 [[bin]]

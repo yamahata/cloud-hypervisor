@@ -63,7 +63,7 @@ use super::{Error, MuxerConnection, Result, defs};
 /// keyed by a `ConnMapKey` object.
 ///
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ConnMapKey {
+pub(super) struct ConnMapKey {
     local_port: u32,
     peer_port: u32,
 }
@@ -71,7 +71,7 @@ pub struct ConnMapKey {
 /// A muxer RX queue item.
 ///
 #[derive(Clone, Copy, Debug)]
-pub enum MuxerRx {
+pub(super) enum MuxerRx {
     /// The packet must be fetched from the connection identified by `ConnMapKey`.
     ConnRx(ConnMapKey),
     /// The muxer must produce an RST packet.
@@ -888,7 +888,7 @@ impl VsockMuxer {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::cmp::min;
     use std::io::Write;
     use std::net::Shutdown;
@@ -899,7 +899,7 @@ mod unit_tests {
     use virtio_queue::QueueOwnedT;
 
     use super::super::super::csm::defs as csm_defs;
-    use super::super::super::unit_tests::TestContext as VsockTestContext;
+    use super::super::super::tests::TestContext as VsockTestContext;
     use super::*;
 
     impl PartiallyReadCommand {

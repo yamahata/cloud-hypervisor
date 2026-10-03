@@ -95,11 +95,20 @@ pub enum MigratableError {
     #[error("Failed to retrieve dirty ranges for migratable component")]
     DirtyLog(#[source] anyhow::Error),
 
+    #[error("Failed to cancel migration")]
+    CancelMigration(#[source] anyhow::Error),
+
     #[error("Failed to start migration for migratable component")]
     StartMigration(#[source] anyhow::Error),
 
+    #[error("Failed to abort migration for migratable component")]
+    AbortMigration(#[source] anyhow::Error),
+
     #[error("Failed to complete migration for migratable component")]
     CompleteMigration(#[source] anyhow::Error),
+
+    #[error("Migration was cancelled")]
+    Cancelled,
 
     #[error("Failed to release a disk lock")]
     UnlockError(#[source] anyhow::Error),
@@ -109,6 +118,9 @@ pub enum MigratableError {
 
     #[error("Error setting up a TLS-encrypted connection")]
     Tls(#[source] tls::TlsError),
+
+    #[error("The request conflicts with current state")]
+    Conflict(#[source] anyhow::Error),
 }
 
 /// A Pausable component can be paused and resumed.
@@ -293,11 +305,15 @@ pub trait Migratable: Send + Pausable + Snapshottable + Transportable {
         Ok(MemoryRangeTable::default())
     }
 
-    fn start_migration(&mut self) -> result::Result<(), MigratableError> {
+    fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         Ok(())
     }
 
-    fn complete_migration(&mut self) -> result::Result<(), MigratableError> {
+    fn notify_failed_migration(&mut self) -> result::Result<(), MigratableError> {
+        Ok(())
+    }
+
+    fn notify_completed_migration(&mut self) -> result::Result<(), MigratableError> {
         Ok(())
     }
 }

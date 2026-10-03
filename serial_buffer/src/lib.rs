@@ -8,6 +8,9 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod socket;
+pub use socket::SocketConsole;
+
 const MAX_BUFFER_SIZE: usize = 1 << 20;
 
 // Circular buffer implementation for serial output.
@@ -50,12 +53,12 @@ impl SerialBuffer {
 }
 
 impl Write for SerialBuffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         // Simply fill the buffer if we're not allowed to write to the out
         // device.
         if !self.write_out.load(Ordering::Acquire) {
-            self.fill_buffer(buf);
-            return Ok(buf.len());
+            self.fill_buffer(data);
+            return Ok(data.len());
         }
 
         // In case we're allowed to write to the out device, we flush the
@@ -66,36 +69,35 @@ impl Write for SerialBuffer {
         // only a subset of the bytes was written and we should fill the buffer
         // with what's coming from the serial.
         if !self.buffer.is_empty() {
-            self.fill_buffer(buf);
-            return Ok(buf.len());
+            self.fill_buffer(data);
+            return Ok(data.len());
         }
 
-        // We reach this point if we're allowed to write to the out device
-        // and we know there's nothing left in the buffer.
+        // First try writing directly to the output device; if that fails,
+        // buffer the data in memory for later.
         let mut offset = 0;
-        loop {
-            match self.out.write(&buf[offset..]) {
-                Ok(written_bytes) => {
-                    if written_bytes < buf.len() - offset {
-                        offset += written_bytes;
-                        continue;
-                    }
+        while offset < data.len() {
+            match self.out.write(&data[offset..]) {
+                Ok(0) => {
+                    self.fill_buffer(&data[offset..]);
+                    break;
                 }
-                Err(e) => {
-                    if !matches!(e.kind(), io::ErrorKind::WouldBlock) {
-                        return Err(e);
-                    }
-                    self.fill_buffer(&buf[offset..]);
+                Ok(written) => {
+                    offset += written;
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.fill_buffer(&data[offset..]);
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            break;
         }
 
         // Make sure we flush anything that might have been written to the
         // out device.
         self.out.flush()?;
 
-        Ok(buf.len())
+        Ok(data.len())
     }
 
     // This function flushes the content of the buffer to the out device if
@@ -152,7 +154,7 @@ mod tests {
     #[test]
     fn accumulates_while_detached_then_replays_on_connect() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         buf.write_all(b"boot: hello\n").unwrap();
         buf.write_all(b"login: ").unwrap();
@@ -169,7 +171,7 @@ mod tests {
     #[test]
     fn live_writes_pass_through_after_connect() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         let sink = TestSink::new();
         buf.set_out(Box::new(sink.clone()));
@@ -185,7 +187,7 @@ mod tests {
     #[test]
     fn output_while_detached_goes_to_next_client() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         // First client: connects, drains "early\n", then disconnects.
         let first = TestSink::new();
@@ -212,7 +214,7 @@ mod tests {
     #[test]
     fn drained_bytes_are_not_resent_to_a_second_client() {
         let write_out = Arc::new(AtomicBool::new(false));
-        let mut buf = SerialBuffer::new(Box::new(io::sink()), write_out.clone());
+        let mut buf = SerialBuffer::new(Box::new(io::sink()), Arc::clone(&write_out));
 
         buf.write_all(b"boot log\n").unwrap();
 

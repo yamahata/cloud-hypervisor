@@ -245,7 +245,7 @@ pub(super) fn scatter_read_sync(
 }
 
 #[cfg(test)]
-pub(crate) mod unit_tests {
+pub(crate) mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::os::unix::fs::FileExt;
@@ -282,7 +282,7 @@ pub(crate) mod unit_tests {
     }
 
     /// Compress every allocated cluster in a QCOW2 image file in place.
-    pub fn compress_allocated_clusters(file: &mut File) {
+    pub(crate) fn compress_allocated_clusters(file: &mut File) {
         let mut buf4 = [0u8; 4];
         file.read_exact_at(&mut buf4, HEADER_CLUSTER_BITS_OFFSET)
             .unwrap();

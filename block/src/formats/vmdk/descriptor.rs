@@ -21,9 +21,13 @@ const VMDK_DESCRIPTOR_EXTENTS: &str = "# Extent description";
 const VMDK_DESCRIPTOR_DDB: &str = "# The Disk Data Base";
 const VMDK_DESCRIPTOR_DDB_2: &str = "#DDB";
 
+// The maximum allowed VMDK descriptor length.
+// Max matches QEMU's implementation.
+const MAX_DESCRIPTOR_LEN: u64 = 1 << 20; // 1 MiB
+
 /// Flat VMDK create types.
 #[derive(Debug, Default)]
-pub enum VMDKDiskType {
+enum VMDKDiskType {
     #[default]
     CreateTypeUnsupported,
     MonolithicFlat,
@@ -61,7 +65,7 @@ impl FromStr for ExtentAccess {
 /// Format of each extent line:
 /// `<access> <sectors> <type> "<file>" [offset]`.
 #[derive(Debug)]
-pub struct VmdkExtentHeader {
+pub(super) struct VmdkExtentHeader {
     pub access: ExtentAccess,
     pub size_in_sectors: u64,
     pub extent_type: String,
@@ -71,13 +75,13 @@ pub struct VmdkExtentHeader {
 
 /// Descriptor header fields.
 #[derive(Debug, Default)]
-pub struct VmdkDescriptorHeader {
+struct VmdkDescriptorHeader {
     pub create_type: VMDKDiskType,
 }
 
 /// Ordered list of extents.
 #[derive(Debug, Default)]
-pub struct VmdkDescriptorExtents {
+pub(super) struct VmdkDescriptorExtents {
     pub extents: Vec<VmdkExtentHeader>,
 }
 
@@ -86,13 +90,13 @@ pub struct VmdkDescriptorExtents {
 /// extents_list: ordered extent list
 /// base_path: descriptor file's parent directory
 #[derive(Debug, Default)]
-pub struct VmdkDescriptor {
+pub(super) struct VmdkDescriptor {
     pub base_path: String,
     pub extents_list: VmdkDescriptorExtents,
 }
 
 impl VmdkDescriptor {
-    pub fn new(file: &File, path: &Path) -> io::Result<Self> {
+    pub(super) fn new(file: &File, path: &Path) -> io::Result<Self> {
         // The descriptor's directory anchors the relative extent filenames.
         let base_path = path
             .parent()
@@ -125,22 +129,39 @@ impl VmdkDescriptor {
     }
 }
 
-// Read the whole descriptor into memory through an `AlignedFile` and return it
+// Read the descriptor text into memory through an `AlignedFile` and return it
 // as a `String`.
 fn read_descriptor(file: &File) -> io::Result<String> {
     let aligned = AlignedFile::new(file.try_clone()?, true);
-    let len = file.metadata()?.len() as usize;
-    let mut buf = vec![0u8; len];
-    let mut filled = 0;
-    while filled < buf.len() {
-        match aligned.read_at(&mut buf[filled..], filled as u64) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+
+    // Confirm the descriptor header from a small prefix.
+    let mut head = [0u8; VMDK_DESCRIPTOR_HEADER.len()];
+    match aligned.read_exact_at(&mut head, 0) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid VMDK descriptor: the file is shorter than the header",
+            ));
         }
+        Err(e) => return Err(e),
     }
-    buf.truncate(filled);
+    if !has_descriptor_header(&head) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid VMDK descriptor: the file is missing the descriptor header",
+        ));
+    }
+
+    let len = file.metadata()?.len();
+    if len > MAX_DESCRIPTOR_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid VMDK descriptor: the file exceeds the maximum descriptor size",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    aligned.read_exact_at(&mut buf, 0)?;
     // A descriptor is ASCII text, so invalid UTF-8 means "not a descriptor".
     String::from_utf8(buf).map_err(|_| {
         io::Error::new(
@@ -150,9 +171,7 @@ fn read_descriptor(file: &File) -> io::Result<String> {
     })
 }
 
-pub(crate) fn parse_header<'a>(
-    lines: &mut Lines<'a>,
-) -> io::Result<(VmdkDescriptorHeader, &'a str)> {
+fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, &'a str)> {
     let header_line = lines.next().unwrap_or_default();
 
     // Reject actual disk data (or an embedded descriptor, which is
@@ -187,7 +206,7 @@ pub(crate) fn parse_header<'a>(
     Ok((header, last_comment_line))
 }
 
-pub(crate) fn parse_extents(
+fn parse_extents(
     lines: &mut Lines<'_>,
     last_comment_line: &str,
 ) -> io::Result<VmdkDescriptorExtents> {
@@ -313,6 +332,25 @@ mod tests {
         let (header, last) = parse_header(&mut lines)?;
         let extents = parse_extents(&mut lines, last)?;
         Ok((header, extents))
+    }
+
+    #[test]
+    fn oversized_descriptor_is_rejected() {
+        use std::io::Write;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        // A well-formed header followed by padding so the file exceeds the cap.
+        let mut body = String::from("# Disk DescriptorFile\n");
+        body.push_str(&"#\n".repeat((MAX_DESCRIPTOR_LEN as usize / 2) + 1));
+        assert!(body.len() as u64 > MAX_DESCRIPTOR_LEN);
+
+        let tmp = TempFile::new().unwrap();
+        let mut file: &File = tmp.as_file();
+        file.write_all(body.as_bytes()).unwrap();
+
+        VmdkDescriptor::new(file, tmp.as_path()).unwrap_err();
+        assert!(!is_flat_vmdk(&mut tmp.into_file()).unwrap());
     }
 
     #[test]

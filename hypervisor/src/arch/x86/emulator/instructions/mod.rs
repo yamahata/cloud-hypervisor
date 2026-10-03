@@ -8,15 +8,14 @@ use anyhow::anyhow;
 use iced_x86::*;
 
 use crate::arch::emulator::{EmulationError, PlatformEmulator, PlatformError};
-use crate::arch::x86::Exception;
 use crate::arch::x86::emulator::CpuStateManager;
 use crate::arch::x86::regs::DF;
 
-pub mod cmp;
-pub mod mov;
-pub mod movs;
-pub mod or;
-pub mod stos;
+pub(super) mod cmp;
+pub(super) mod mov;
+pub(super) mod movs;
+pub(super) mod or;
+pub(super) mod stos;
 
 pub fn string_op_repeat_count(has_rep_prefix: bool, rcx: u64) -> u64 {
     if has_rep_prefix { rcx } else { 1 }
@@ -146,13 +145,13 @@ fn memory_operand_address<T: CpuStateManager>(
     state.linearize(insn.memory_segment(), address, write)
 }
 
-pub trait InstructionHandler<T: CpuStateManager> {
+pub(super) trait InstructionHandler<T: CpuStateManager> {
     fn emulate(
         &self,
         insn: &Instruction,
         state: &mut T,
         platform: &mut dyn PlatformEmulator<CpuState = T>,
-    ) -> Result<(), EmulationError<Exception>>;
+    ) -> Result<(), EmulationError>;
 }
 
 #[cfg(test)]

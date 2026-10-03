@@ -137,7 +137,7 @@ impl AsyncIo for QcowSync {
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use std::fs::{File, OpenOptions, create_dir};
     use std::io::Write;
     use std::os::unix::fs::FileExt;
@@ -156,7 +156,7 @@ mod unit_tests {
     use crate::error::BlockErrorKind;
     use crate::formats::qcow;
     use crate::formats::qcow::common::apply_dealloc_action;
-    use crate::formats::qcow::common::unit_tests::compress_allocated_clusters;
+    use crate::formats::qcow::common::tests::compress_allocated_clusters;
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
         BackingFileConfig, Error as QcowError, ImageType, QcowDisk, QcowHeader, QcowTempDisk,
@@ -168,7 +168,8 @@ mod unit_tests {
     const TEST_CLUSTER_USED_FLAG: u64 = 1 << 63;
     const TEST_COMPRESSED_FLAG: u64 = 1 << 62;
     const TEST_ZERO_FLAG: u64 = 1;
-    const TEST_OUT_OF_BOUNDS_CLUSTER: u64 = 0x0000_0001_4000_0000;
+    // Past the 16 TiB a one-cluster refcount table covers.
+    const TEST_OUT_OF_BOUNDS_CLUSTER: u64 = 0x0000_2000_0000_0000;
 
     fn read_be_u64_at(file: &mut File, offset: u64) -> u64 {
         let mut bytes = [0u8; 8];
@@ -331,7 +332,7 @@ mod unit_tests {
         let ranges: Vec<(GuestAddress, u32)> = (0..ranges_count)
             .map(|i| (GuestAddress((i * chunk) as u64), chunk as u32))
             .collect();
-        let target = GuestMemoryTarget::new(mem.clone(), &ranges).unwrap();
+        let target = GuestMemoryTarget::new(Arc::clone(&mem), &ranges).unwrap();
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.read_to_memory(0, target, 1).unwrap();
@@ -442,6 +443,80 @@ mod unit_tests {
             tracked_after <= tracked_before + 8,
             "reopen recovered {} clusters the allocator had stranded",
             tracked_after.saturating_sub(tracked_before),
+        );
+    }
+
+    // A cluster freed by a nested refcount block move must reach the free list.
+    #[test]
+    fn freed_clusters_are_tracked_across_refcount_blocks() {
+        const CL: u64 = 65536;
+        // Just over 2 GiB, so the file spans two refcount blocks.
+        const HOST_SIZE: u64 = (2 << 30) + 64 * CL;
+        let virtual_size = 1 << 30;
+        let (temp, disk) = create_disk_with_data(virtual_size, &[], 0, true, false);
+        drop(disk);
+        temp.as_file().set_len(HOST_SIZE).unwrap();
+        let disk = QcowDisk::new(
+            temp.as_file().try_clone().unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut written = Vec::new();
+        for i in 0..600u64 {
+            let offset = next() % (virtual_size / CL) * CL;
+            async_write(&disk, offset, &vec![i as u8; CL as usize]);
+            written.push(offset);
+            if i % 3 == 0 {
+                let victim = written.swap_remove((next() % written.len() as u64) as usize);
+                let mut async_io = disk.create_async_io(1).unwrap();
+                async_io.punch_hole(victim, CL, 3).unwrap();
+                assert_eq!(next_completion(async_io.as_mut()), (3, 0));
+            }
+            if i % 2 == 0 {
+                async_fsync(&disk);
+            }
+        }
+        async_fsync(&disk);
+
+        let file_clusters = temp.as_file().metadata().unwrap().len() / CL;
+        let free_on_disk = (0..file_clusters)
+            .filter(|c| disk.metadata().cluster_refcount(c * CL).unwrap() == 0)
+            .count();
+        let tracked = disk.metadata().free_list_len();
+        assert_eq!(
+            free_on_disk, tracked,
+            "{free_on_disk} free clusters on disk, {tracked} on the free list",
+        );
+    }
+
+    // The old L1 table freed by a resize must reach the free list.
+    #[test]
+    fn freed_l1_table_clusters_are_tracked() {
+        const CL: u64 = 65536;
+        let (temp, mut disk) = create_disk_with_data(1 << 30, &[], 0, true, false);
+        // 2 GiB needs a larger L1 table than 1 GiB.
+        disk.resize(2 << 30).unwrap();
+
+        let file_clusters = temp.as_file().metadata().unwrap().len() / CL;
+        let free_on_disk = (0..file_clusters)
+            .filter(|c| disk.metadata().cluster_refcount(c * CL).unwrap() == 0)
+            .count();
+        let tracked = disk.metadata().free_list_len();
+        assert!(free_on_disk > 0, "growing the L1 table freed no cluster");
+        assert_eq!(
+            free_on_disk, tracked,
+            "{free_on_disk} free clusters on disk, {tracked} on the free list",
         );
     }
 

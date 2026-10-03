@@ -71,7 +71,7 @@ popd
 pushd $CLOUDH
 sudo $CLOUDH/cloud-hypervisor/target/debug/cloud-hypervisor \
            --kernel $CLOUDH/linux/arch/riscv64/boot/Image \
-           --disk path=jammy-server-cloudimg-riscv64.raw \
+           --disk path=jammy-server-cloudimg-riscv64.raw,image_type=raw \
            --cmdline "console=hvc0 root=/dev/vda rw" \
            --cpus boot=1 \
            --memory size=1024M \
@@ -129,12 +129,13 @@ qemu-img resize -f raw <ubuntu-image> +5G
 
 ### Boot VM
 
-Note the inclusion of the AIA interrupt controller in the 
-invocation.
+Note the inclusion of the AIA interrupt controller and the Smstateen
+extension in the invocation.
 
 ```console
 qemu-system-riscv64 \
   -machine virt,aia=aplic-imsic \
+  -cpu rv64,smstateen=true \
   -nographic -m 1G -smp 8 \
   -kernel /usr/lib/u-boot/qemu-riscv64_smode/uboot.elf \
   -device virtio-rng-pci \

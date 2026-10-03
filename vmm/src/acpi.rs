@@ -17,6 +17,8 @@ use arch::DeviceType;
 use arch::aarch64::DeviceInfoForFdt;
 use arch::{NumaNodes, layout};
 use bitflags::bitflags;
+#[cfg(target_arch = "aarch64")]
+use devices::iommu::Smmuv3AcpiInfo;
 use log::{info, warn};
 use pci::PciBdf;
 use thiserror::Error;
@@ -45,7 +47,7 @@ pub enum Error {
     FwCfg(#[source] io::Error),
 }
 
-pub type Result<T> = result::Result<T, Error>;
+pub(crate) type Result<T> = result::Result<T, Error>;
 
 fn next_table_address(address: GuestAddress, length: u64) -> Result<GuestAddress> {
     address.checked_add(length).ok_or(Error::AddressOverflow)
@@ -53,25 +55,25 @@ fn next_table_address(address: GuestAddress, length: u64) -> Result<GuestAddress
 
 /* Values for Type in APIC sub-headers */
 #[cfg(target_arch = "x86_64")]
-pub const ACPI_X2APIC_PROCESSOR: u8 = 9;
+pub(crate) const ACPI_X2APIC_PROCESSOR: u8 = 9;
 #[cfg(target_arch = "x86_64")]
-pub const ACPI_APIC_IO: u8 = 1;
+pub(crate) const ACPI_APIC_IO: u8 = 1;
 #[cfg(target_arch = "x86_64")]
-pub const ACPI_APIC_XRUPT_OVERRIDE: u8 = 2;
+pub(crate) const ACPI_APIC_XRUPT_OVERRIDE: u8 = 2;
 #[cfg(target_arch = "aarch64")]
-pub const ACPI_APIC_GENERIC_CPU_INTERFACE: u8 = 11;
+pub(crate) const ACPI_APIC_GENERIC_CPU_INTERFACE: u8 = 11;
 #[cfg(target_arch = "aarch64")]
-pub const ACPI_APIC_GENERIC_DISTRIBUTOR: u8 = 12;
+pub(crate) const ACPI_APIC_GENERIC_DISTRIBUTOR: u8 = 12;
 #[cfg(target_arch = "aarch64")]
-pub const ACPI_APIC_GIC_MSI_FRAME: u8 = 13;
+pub(crate) const ACPI_APIC_GIC_MSI_FRAME: u8 = 13;
 #[cfg(target_arch = "aarch64")]
-pub const ACPI_APIC_GENERIC_REDISTRIBUTOR: u8 = 14;
+pub(crate) const ACPI_APIC_GENERIC_REDISTRIBUTOR: u8 = 14;
 #[cfg(target_arch = "aarch64")]
-pub const ACPI_APIC_GENERIC_TRANSLATOR: u8 = 15;
+pub(crate) const ACPI_APIC_GENERIC_TRANSLATOR: u8 = 15;
 #[cfg(target_arch = "riscv64")]
-pub const ACPI_RISC_V_IMSIC: u8 = 0x19;
+pub(crate) const ACPI_RISC_V_IMSIC: u8 = 0x19;
 #[cfg(target_arch = "riscv64")]
-pub const ACPI_RISC_V_APLIC: u8 = 0x1A;
+pub(crate) const ACPI_RISC_V_APLIC: u8 = 0x1A;
 
 #[repr(C, packed)]
 #[derive(Default, IntoBytes, Immutable, FromBytes)]
@@ -153,11 +155,28 @@ struct GenericInitiatorAffinity {
 // ACPI fixes this SRAT structure at 32 bytes.
 const _: () = assert!(size_of::<GenericInitiatorAffinity>() == 32);
 
+// ACPI 6.6 Section 5.2.16.6 - PCI device handle
+// Bytes 0-1: PCI Segment (little-endian)
+// Byte 2: Bus Number
+// Byte 3: Device Number (bits 7:3) and Function Number (bits 2:0)
+// Bytes 4-15: Reserved
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct PciDeviceHandle {
+    segment: u16,
+    bus: u8,
+    device_function: u8,
+    _reserved: [u8; 12],
+}
+
+// ACPI defines a PCI device handle structure as 16 bytes long.
+const _: () = assert!(size_of::<PciDeviceHandle>() == 16);
+
 impl GenericInitiatorAffinity {
     #[cfg(test)]
     fn from_acpi_device(hid: u64, uid: u32, proximity_domain: u32) -> Self {
         let mut device_handle = [0u8; 16];
-        // ACPI 6.6 Table 5-66: ACPI device handle
+        // ACPI 6.6 Section 5.2.16.6: ACPI device handle
         // Bytes 0-7: Hardware ID (HID) as 64-bit value
         // Bytes 8-11: Unique ID (UID) as 32-bit value
         device_handle[0..8].copy_from_slice(&hid.to_le_bytes());
@@ -176,22 +195,15 @@ impl GenericInitiatorAffinity {
     }
 
     fn from_pci_bdf(bdf: PciBdf, proximity_domain: u32) -> Self {
-        let mut device_handle = [0u8; 16];
-        let segment = bdf.segment();
-        let bus = bdf.bus();
-        let device = bdf.device();
-        let function = bdf.function();
+        let handle = PciDeviceHandle {
+            segment: bdf.segment(),
+            bus: bdf.bus(),
+            device_function: (bdf.device() << 3) | bdf.function(),
+            _reserved: [0; 12],
+        };
 
-        // ACPI 6.6 Table 5-66: PCI Device Handle
-        device_handle[0] = (segment & 0xff) as u8;
-        device_handle[1] = ((segment >> 8) & 0xff) as u8;
-        device_handle[2] = bus;
-        device_handle[3] = bus;
-        device_handle[4] = device;
-        device_handle[5] = device;
-        device_handle[6] = function;
-        device_handle[7] = function;
-        // Bytes 8-15 remain 0 (Reserved)
+        let mut device_handle = [0u8; 16];
+        device_handle.copy_from_slice(handle.as_bytes());
 
         GenericInitiatorAffinity {
             type_: 5,
@@ -281,7 +293,7 @@ struct ViotPciRangeNode {
     _reserved2: [u8; 6],
 }
 
-pub fn create_dsdt_table(
+pub(crate) fn create_dsdt_table(
     device_manager: &DeviceManager,
     cpu_manager: &CpuManager,
     memory_manager: &MemoryManager,
@@ -735,8 +747,47 @@ struct IortPciRootComplexBase {
     pub ats_attribute: u32,
     pub pci_segment_number: u32,
     pub memory_address_size_limit: u8,
-    _reserved: [u8; 3],
+    pub pasid_capabilities: u16,
+    _reserved: u8,
+    pub flags: u32,
     // ID mappings follow: array of `struct IortIdMapping`
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortSmmuV3Base {
+    pub common: IortNodeCommon,
+    pub base_address: u64,
+    pub flags: u32,
+    _reserved: u32,
+    pub vatos_address: u64,
+    pub model: u32,
+    pub event_gsiv: u32,
+    pub pri_gsiv: u32,
+    pub gerr_gsiv: u32,
+    pub sync_gsiv: u32,
+    pub proximity_domain: u32,
+    pub deviceid_mapping_index: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrBase {
+    pub common: IortNodeCommon,
+    pub flags: u32,
+    pub num_mem_range_descriptors: u32,
+    pub mem_range_desc_offset: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrMemRangeDescriptor {
+    pub base_address: u64,
+    pub length: u64,
+    _reserved: u32,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -746,13 +797,43 @@ fn align_to_8_bytes(len: usize) -> usize {
 }
 
 #[cfg(target_arch = "aarch64")]
-// Generate IORT table based on Spec Revision E.b:
-// https://developer.arm.com/documentation/den0049/eb/?lang=en
-fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
+fn next_node_id(next_id: &mut u32) -> u32 {
+    let id = *next_id;
+    *next_id += 1;
+    id
+}
+
+#[cfg(target_arch = "aarch64")]
+struct RcIdMapping {
+    input_base: u16,
+    count: u16,
+    smmu: Option<usize>,
+}
+
+#[cfg(target_arch = "aarch64")]
+// Generate IORT table based on Spec Revision E.e:
+// https://developer.arm.com/documentation/den0049/ee/?lang=en
+fn create_iort_table(pci_segments: &[PciSegment], smmus: &[Smmuv3AcpiInfo]) -> Sdt {
     const ACPI_IORT_HEADER_SIZE: u32 = 36;
-    const ACPI_IORT_REVISION: u8 = 3;
+    const DEVICE_IDS_PER_SEGMENT: usize = 256;
     const ACPI_IORT_NODE_ITS_GROUP: u8 = 0x00;
     const ACPI_IORT_NODE_PCI_ROOT_COMPLEX: u8 = 0x02;
+    const ACPI_IORT_NODE_SMMU_V3: u8 = 0x04;
+    const ACPI_IORT_SMMU_V3_GENERIC: u32 = 0;
+    const ACPI_IORT_NODE_RMR: u8 = 0x06;
+    const ACPI_IORT_SMMU_V3_COHACC_OVERRIDE: u32 = 1 << 0;
+    const ACPI_IORT_SMMU_V3_DEVICEID_VALID: u32 = 1 << 4;
+    const ACPI_IORT_ATS_SUPPORTED: u32 = 1 << 0;
+    const ACPI_IORT_REVISION: u8 = 6;
+    const ACPI_IORT_RMR_MSI_IOVA_BASE: u64 = 0x0800_0000;
+    const ACPI_IORT_RMR_MSI_IOVA_LENGTH: u64 = 0x0010_0000;
+
+    let num_rmr = smmus
+        .iter()
+        .filter(|smmu| !smmu.attached_bdfs.is_empty())
+        .count();
+
+    let mut next_id = 0;
 
     // IORT header
     let mut iort = Sdt::new(
@@ -768,8 +849,11 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
     // The IORT table contains:
     // - IortBodyBase
     // - 1 x ITS Group Node
+    // - M x SMMUv3 Node (M = number of SMMUv3s)
+    // - R x RMR Node (R = number of SMMUv3s with attached devices)
     // - N x PCI Root Complex Node (N = number of pci segments)
-    let num_nodes = (1 + pci_segments.len()) as u32;
+    let num_smmu = smmus.len();
+    let num_nodes = (1 + num_smmu + pci_segments.len() + num_rmr) as u32;
     // First node is the ITS Group Node located right after the IORT Body Base
     let offset_its_node = iort.len() + size_of::<IortBodyBase>();
     assert!(align_to_8_bytes(offset_its_node) == 0); // Ensure the ITS node is 8-byte aligned
@@ -794,7 +878,7 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
             type_: ACPI_IORT_NODE_ITS_GROUP,
             length: (its_group_node_size + padding) as u16,
             revision: 1,
-            node_id: 0, // todo
+            node_id: next_node_id(&mut next_id),
             num_id_mappings: 0,
             id_mappings_array_offset: 0,
         },
@@ -803,6 +887,101 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
     iort.append(its_id_array);
     iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
 
+    let mut smmu_node_offsets: Vec<usize> = Vec::with_capacity(smmus.len());
+    for smmu in smmus {
+        assert!(align_to_8_bytes(iort.len()) == 0);
+        let smmu_node_offset = iort.len();
+        smmu_node_offsets.push(smmu_node_offset);
+
+        // Single ID mapping since all StreamIDs map to a single ITS group
+        let num_id_mappings = 1;
+        let node_size = size_of::<IortSmmuV3Base>() + num_id_mappings * size_of::<IortIdMapping>();
+        let padding = align_to_8_bytes(iort.len() + node_size);
+        let mut flags = 0;
+        if smmu.coherent {
+            flags |= ACPI_IORT_SMMU_V3_COHACC_OVERRIDE;
+        }
+        if smmu.deviceid_mapping_index_valid {
+            flags |= ACPI_IORT_SMMU_V3_DEVICEID_VALID;
+        }
+        iort.append(IortSmmuV3Base {
+            common: IortNodeCommon {
+                type_: ACPI_IORT_NODE_SMMU_V3,
+                length: (node_size + padding) as u16,
+                revision: 5,
+                node_id: next_node_id(&mut next_id),
+                num_id_mappings: num_id_mappings as u32,
+                id_mappings_array_offset: size_of::<IortSmmuV3Base>() as u32,
+            },
+            base_address: smmu.base,
+            flags,
+            _reserved: 0,
+            vatos_address: 0,
+            model: ACPI_IORT_SMMU_V3_GENERIC,
+            event_gsiv: smmu.event_gsiv,
+            pri_gsiv: smmu.pri_gsiv,
+            gerr_gsiv: smmu.gerror_gsiv,
+            sync_gsiv: smmu.sync_gsiv,
+            proximity_domain: 0,
+            deviceid_mapping_index: 0,
+        });
+        // Identity StreamID to DeviceID mapping, so a device gets the same ITS
+        // DeviceID from its root complex mapping whether it sits behind an
+        // SMMUv3 or not.
+        iort.append(IortIdMapping {
+            input_base: 0,
+            num_ids: (DEVICE_IDS_PER_SEGMENT * pci_segments.len() - 1) as u32,
+            output_base: 0,
+            output_reference: offset_its_node as u32,
+            flags: 0,
+        });
+        iort.append_slice(&vec![0u8; padding]);
+
+        if smmu.attached_bdfs.is_empty() {
+            continue;
+        }
+        assert!(align_to_8_bytes(iort.len()) == 0);
+
+        let num_id_mappings = smmu.attached_bdfs.len();
+        let num_mem_range_descriptors = 1usize;
+        let node_size = size_of::<IortRmrBase>()
+            + num_id_mappings * size_of::<IortIdMapping>()
+            + num_mem_range_descriptors * size_of::<IortRmrMemRangeDescriptor>();
+        let padding = align_to_8_bytes(iort.len() + node_size);
+        iort.append(IortRmrBase {
+            common: IortNodeCommon {
+                type_: ACPI_IORT_NODE_RMR,
+                length: (node_size + padding) as u16,
+                revision: 3,
+                node_id: next_node_id(&mut next_id),
+                num_id_mappings: num_id_mappings as u32,
+                id_mappings_array_offset: size_of::<IortRmrBase>() as u32,
+            },
+            flags: 0,
+            num_mem_range_descriptors: num_mem_range_descriptors as u32,
+            mem_range_desc_offset: (size_of::<IortRmrBase>()
+                + num_id_mappings * size_of::<IortIdMapping>())
+                as u32,
+        });
+        for bdf in &smmu.attached_bdfs {
+            let stream_id =
+                DEVICE_IDS_PER_SEGMENT as u32 * u32::from(bdf.segment()) + (u32::from(*bdf) & 0xff);
+            iort.append(IortIdMapping {
+                input_base: stream_id,
+                num_ids: 0,
+                output_base: stream_id,
+                output_reference: smmu_node_offset as u32,
+                flags: 0,
+            });
+        }
+        iort.append(IortRmrMemRangeDescriptor {
+            base_address: ACPI_IORT_RMR_MSI_IOVA_BASE,
+            length: ACPI_IORT_RMR_MSI_IOVA_LENGTH,
+            _reserved: 0,
+        });
+        iort.append_slice(&vec![0u8; padding]);
+    }
+
     // Create PCI Root Complex Node for each PCI segment
     for segment in pci_segments.iter() {
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure each node is 8-byte aligned
@@ -810,9 +989,48 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
         // Each PCI Root Complex Node contains:
         // - IortPciRootComplexBase
         // - ID mapping Array: Array of IortIdMapping
-        //   Currently contains a single mapping that maps all device IDs
-        //   in the segment to the ITS Group Node.
-        let num_id_mappings = 1;
+        let id_mappings: Vec<RcIdMapping> = if smmus.is_empty() {
+            vec![RcIdMapping {
+                input_base: 0,
+                count: DEVICE_IDS_PER_SEGMENT as u16,
+                smmu: None,
+            }]
+        } else {
+            let mut id_to_smmu: [Option<usize>; DEVICE_IDS_PER_SEGMENT] =
+                [None; DEVICE_IDS_PER_SEGMENT];
+            for (i, smmu) in smmus.iter().enumerate() {
+                for bdf in &smmu.attached_bdfs {
+                    if bdf.segment() == segment.id {
+                        id_to_smmu[(u32::from(*bdf) & 0xff) as usize] = Some(i);
+                    }
+                }
+            }
+            let mut mappings = Vec::new();
+            let mut id = 0usize;
+            for id_range in id_to_smmu.chunk_by(|a, b| a == b) {
+                mappings.push(RcIdMapping {
+                    input_base: id as u16,
+                    count: id_range.len() as u16,
+                    smmu: id_range[0],
+                });
+                id += id_range.len();
+            }
+            mappings
+        };
+
+        let ats_attribute = if smmus.iter().any(|smmu| {
+            smmu.ats_supported
+                && smmu
+                    .attached_bdfs
+                    .iter()
+                    .any(|bdf| bdf.segment() == segment.id)
+        }) {
+            ACPI_IORT_ATS_SUPPORTED
+        } else {
+            0
+        };
+
+        let num_id_mappings = id_mappings.len();
         let node_size =
             size_of::<IortPciRootComplexBase>() + num_id_mappings * size_of::<IortIdMapping>();
         let padding = align_to_8_bytes(iort.len() + node_size);
@@ -820,8 +1038,8 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
             common: IortNodeCommon {
                 type_: ACPI_IORT_NODE_PCI_ROOT_COMPLEX,
                 length: (node_size + padding) as u16,
-                revision: 3,
-                node_id: segment.id as u32, // todo to avoid conflict with ITS node IDs
+                revision: 4,
+                node_id: next_node_id(&mut next_id),
                 num_id_mappings: num_id_mappings as u32,
                 // ID mapping array starts right after `IortPciRootComplexBase`
                 id_mappings_array_offset: size_of::<IortPciRootComplexBase>() as u32,
@@ -832,31 +1050,35 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
                 _reserved: 0,
                 maf: 3, // CPM = DCAS = 1
             },
-            ats_attribute: 0,
+            ats_attribute,
             pci_segment_number: segment.id as u32,
             memory_address_size_limit: 64u8,
-            _reserved: [0; 3],
+            pasid_capabilities: 0,
+            _reserved: 0,
+            flags: 0,
         });
         // ID Mapping for this Root Complex
         // Maps 256 device IDs (1 bus × 32 devices × 8 functions)
         assert!(segment.id < 256, "Up to 256 PCI segments are supported.");
-        iort.append(IortIdMapping {
-            input_base: 0,
-            // The number of IDs in the range minus one:
-            // This should cover all the devices of a segment:
-            // 1 (bus) x 32 (devices) x 8 (functions) = 256
-            // Note: Currently only 1 bus is supported in a segment.
-            num_ids: 255,
-            // Output base maps to ITS device IDs which must match the
-            // device ID encoding used in KVM MSI routing setup, which
-            // shares the same limitation - only 1 bus per segment and
-            // up to 256 segments.
-            // See: https://github.com/cloud-hypervisor/cloud-hypervisor/commit/c9374d87ac453d49185aa7b734df089444166484
-            output_base: (256 * segment.id) as u32,
-            // Output reference node is the ITS group node as there is no SMMU node
-            output_reference: offset_its_node as u32,
-            flags: 0,
-        });
+        for mapping in &id_mappings {
+            let output_reference = match mapping.smmu {
+                Some(i) => smmu_node_offsets[i],
+                None => offset_its_node,
+            } as u32;
+            iort.append(IortIdMapping {
+                input_base: u32::from(mapping.input_base),
+                num_ids: u32::from(mapping.count - 1),
+                // Output base maps to ITS device IDs which must match the
+                // device ID encoding used in KVM MSI routing setup, which
+                // shares the same limitation - only 1 bus per segment and
+                // up to 256 segments.
+                // See: https://github.com/cloud-hypervisor/cloud-hypervisor/commit/c9374d87ac453d49185aa7b734df089444166484
+                output_base: (DEVICE_IDS_PER_SEGMENT * segment.id as usize) as u32
+                    + u32::from(mapping.input_base),
+                output_reference,
+                flags: 0,
+            });
+        }
         iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
     }
 
@@ -1063,7 +1285,7 @@ fn create_acpi_tables_internal(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let iort = create_iort_table(device_manager.pci_segments());
+        let iort = create_iort_table(device_manager.pci_segments(), &[]);
         let iort_addr = next_table_address(prev_tbl_addr, prev_tbl_len)?;
         tables_bytes.extend_from_slice(iort.as_slice());
         xsdt_table_pointers.push(iort_addr.0);
@@ -1098,7 +1320,7 @@ fn create_acpi_tables_internal(
 }
 
 #[cfg(feature = "fw_cfg")]
-pub fn create_acpi_tables_for_fw_cfg(
+pub(crate) fn create_acpi_tables_for_fw_cfg(
     device_manager: &DeviceManager,
     cpu_manager: &CpuManager,
     memory_manager: &MemoryManager,
@@ -1154,7 +1376,7 @@ pub fn create_acpi_tables_for_fw_cfg(
         .map_err(Error::FwCfg)
 }
 
-pub fn create_acpi_tables(
+pub(crate) fn create_acpi_tables(
     guest_mem: &GuestMemoryMmap,
     device_manager: &DeviceManager,
     cpu_manager: &CpuManager,
@@ -1195,7 +1417,7 @@ pub fn create_acpi_tables(
 }
 
 #[cfg(feature = "tdx")]
-pub fn create_acpi_tables_tdx(
+pub(crate) fn create_acpi_tables_tdx(
     device_manager: &DeviceManager,
     cpu_manager: &CpuManager,
     memory_manager: &MemoryManager,
@@ -1295,21 +1517,17 @@ mod tests {
         assert_eq!(gi_reserved2, 0, "Reserved field must be 0");
 
         // Verify PCI BDF encoding in device_handle
-        // ACPI 6.6 Table 5-66 format:
+        // ACPI 6.6 Section 5.2.16.6 format:
         // Bytes 0-1: PCI Segment (little-endian)
-        // Byte 2: Start Bus Number
-        // Byte 3: End Bus Number
-        // Byte 4: Start Device Number
-        // Byte 5: End Device Number
-        // Byte 6: Start Function
-        // Byte 7: End Function
-        // Bytes 8-15: Reserved
-        let expected_handle: [u8; 16] = [
-            0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Reserved
-        ];
+        // Byte 2: Bus Number
+        // Byte 3: Device Number (bits 7:3) and Function Number (bits 2:0)
+        // Bytes 4-15: Reserved
+        //
+        // 0000:00:05.0 -> device_function = (5 << 3) | 0 = 0x28.
+        let expected_handle: [u8; 16] = [0, 0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             gi.device_handle, expected_handle,
-            "Device handle must encode PCI BDF correctly per ACPI 6.6 Table 5-66"
+            "Device handle must encode PCI BDF correctly per ACPI 6.6 Section 5.2.16.6"
         );
     }
 
@@ -1380,7 +1598,7 @@ mod tests {
     #[test]
     fn test_generic_initiator_acpi_device_handle() {
         // Test ACPI device handle (device_handle_type=0) for completeness
-        // This validates HID and UID encoding per ACPI 6.6 spec (Table 5.65)
+        // This validates HID and UID encoding per ACPI 6.6 Section 5.2.16.6
         let hid: u64 = 0x0123456789ABCDEF;
         let uid: u32 = 0x12345678;
         let proximity_domain = 2;
@@ -1407,7 +1625,7 @@ mod tests {
         assert_eq!(gi_reserved2, 0, "Reserved field must be 0");
 
         // Verify ACPI device handle encoding
-        // Expected format per ACPI 6.6 Table 5.65:
+        // Expected format per ACPI 6.6 Section 5.2.16.6:
         // Bytes 0-7: HID (64-bit, little-endian)
         // Bytes 8-11: UID (32-bit, little-endian)
         // Bytes 12-15: Reserved

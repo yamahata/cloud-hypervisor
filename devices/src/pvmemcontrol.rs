@@ -42,15 +42,10 @@ pub enum Error {
     GuestMemory(#[source] GuestMemoryError),
     #[error("Guest sent us invalid request")]
     InvalidRequest,
-
-    #[error("Guest sent us invalid command: {0}")]
-    InvalidCommand(u32),
     #[error("Guest sent us invalid connection: {0}")]
     InvalidConnection(u32),
 
     // pvmemcontrol errors
-    #[error("Request contains invalid arguments: {0}")]
-    InvalidArgument(u64),
     #[error("Unknown function code: {0}")]
     UnknownFunctionCode(u64),
     #[error("Libc call fail")]
@@ -565,11 +560,6 @@ impl PvmemcontrolBusDevice {
         let resp = match resp_or_err {
             Ok(resp) => resp,
             Err(e) => match e {
-                Error::InvalidArgument(arg) => PvmemcontrolResp {
-                    ret_errno: (libc::EINVAL as u32).into(),
-                    ret_code: (arg as u32).into(),
-                    ..Default::default()
-                },
                 Error::LibcFail(err) => PvmemcontrolResp {
                     ret_errno: (err.raw_os_error().unwrap_or(libc::EFAULT) as u32).into(),
                     ret_code: 0u32.into(),
@@ -771,9 +761,9 @@ impl PciDevice for PvmemcontrolPciDevice {
         Ok(())
     }
 
-    fn move_bar(&mut self, old_base: u64, new_base: u64) -> io::Result<()> {
+    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         for bar in self.bar_regions.iter_mut() {
-            if bar.addr() == old_base {
+            if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
             }
         }

@@ -51,9 +51,9 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
-    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot,
+    VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -84,7 +84,7 @@ mod fds_helper {
 
     /// Abstraction over configuration types received via the HTTP API that
     /// have associated externally opened FDs.
-    pub trait ConfigWithFDs {
+    pub(super) trait ConfigWithFDs {
         /// Returns the ID of the device.
         ///
         /// Used for logging.
@@ -111,7 +111,7 @@ mod fds_helper {
     /// Extension of [`ConfigWithFDs`] for config objects that know how many
     /// FDs they want (e.g., a restore configuration that is aware of the
     /// previous state).
-    pub trait ConfigWithVariableFDs: ConfigWithFDs {
+    pub(super) trait ConfigWithVariableFDs: ConfigWithFDs {
         /// Returns how many FDs this type wants to have from the pool of
         /// available FDs.
         fn expected_num_fds(&self) -> usize;
@@ -239,7 +239,7 @@ mod fds_helper {
     /// - `cfgs`: List of network configurations where each network can have up to `n` FDs.
     ///
     /// [module description]: self
-    pub fn attach_fds_to_cfgs<T: ConfigWithVariableFDs>(
+    pub(super) fn attach_fds_to_cfgs<T: ConfigWithVariableFDs>(
         device_fds: Vec<File>,
         cfgs: &mut [&mut T],
     ) -> Result<(), HttpError> {
@@ -283,7 +283,7 @@ mod fds_helper {
     /// - `cfg`: The config object that wants to take ownership of all available FDs.
     ///
     /// [module description]: self
-    pub fn attach_fds_to_cfg<T: ConfigWithFDs>(
+    pub(super) fn attach_fds_to_cfg<T: ConfigWithFDs>(
         device_fds: Vec<File>,
         cfg: &mut T,
     ) -> Result<(), HttpError> {
@@ -472,6 +472,7 @@ vm_action_put_handler!(VmPause);
 vm_action_put_handler!(VmResume);
 vm_action_put_handler!(VmPowerButton);
 vm_action_put_handler!(VmNmi);
+vm_action_put_handler!(VmCancelMigration);
 
 vm_action_put_handler_body!(AddDisk);
 vm_action_put_handler_body!(VmAddFs);
@@ -725,6 +726,33 @@ impl EndpointHandler for VmInfo {
                     let info_serialized = serde_json::to_string(&info).unwrap();
 
                     response.set_body(Body::new(info_serialized));
+                    response
+                }
+                Err(e) => error_response(e),
+            },
+            _ => error_response(HttpError::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.balloon-stats handler
+pub struct VmBalloonStats {}
+
+impl EndpointHandler for VmBalloonStats {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Get => match api::VmBalloonStats
+                .send(api_notifier, api_sender, ())
+                .map_err(HttpError::ApiError)
+            {
+                Ok(stats) => {
+                    let mut response = Response::new(Version::Http11, StatusCode::OK);
+                    response.set_body(Body::new(serde_json::to_string(&stats).unwrap()));
                     response
                 }
                 Err(e) => error_response(e),

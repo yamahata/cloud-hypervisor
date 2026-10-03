@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use arch::layout;
 use hypervisor::arch::riscv64::aia::{Vaia, VaiaConfig};
-use hypervisor::{AiaState, CpuState};
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
     LegacyIrqSourceConfig, MsiIrqGroupConfig,
@@ -64,19 +63,6 @@ impl Aia {
         Ok(aia)
     }
 
-    pub fn restore_vaia(
-        &mut self,
-        state: Option<AiaState>,
-        _saved_vcpu_states: &[CpuState],
-    ) -> Result<()> {
-        self.vaia
-            .clone()
-            .lock()
-            .unwrap()
-            .set_state(&state.unwrap())
-            .map_err(Error::RestoreAia)
-    }
-
     fn enable(&self) -> Result<()> {
         // Set irqfd for legacy interrupts
         self.interrupt_source_group
@@ -118,7 +104,7 @@ impl Aia {
     }
 
     pub fn get_vaia(&mut self) -> Result<Arc<Mutex<dyn Vaia>>> {
-        Ok(self.vaia.clone())
+        Ok(Arc::clone(&self.vaia))
     }
 }
 
