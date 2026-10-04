@@ -617,7 +617,15 @@ fn start_vmm(
 
     let log_file: Box<dyn io::Write + Send> =
         if let Some(ref file) = cmd_arguments.get_one::<String>("log-file") {
-            Box::new(File::create(Path::new(file)).map_err(Error::LogFileCreation)?)
+            // Append: a VMM restarted with the same log file (one per VM under
+            // systemd) must not erase the previous run's shutdown errors.
+            Box::new(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(Path::new(file))
+                    .map_err(Error::LogFileCreation)?,
+            )
         } else {
             Box::new(io::stderr())
         };

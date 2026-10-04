@@ -7,7 +7,7 @@ The target audience of this document is both:
 
 ## Control
 
-The number of `-v` parameters passed to the `cloud-hypervisor` binary will determine the log level. Currently the default is log messages up to `WARN:` (`warn!`) are included by default. The `--log-file` allows the log to be sent to a location other than `stderr`.
+The number of `-v` parameters passed to the `cloud-hypervisor` binary will determine the log level. Currently the default is log messages up to `WARN:` (`warn!`) are included by default. The `--log-file` allows the log to be sent to a location other than `stderr`; an existing file is appended to, not truncated.
 
 ## Levels
 
