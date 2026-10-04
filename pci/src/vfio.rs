@@ -1523,10 +1523,19 @@ impl VfioCommon {
             let cap_id: u16 = (ext_cap_hdr & 0xffff) as u16;
             let cap_next: u16 = ((ext_cap_hdr >> 20) & 0xfff) as u16;
 
-            match PciExpressCapabilityId::from(cap_id) {
+            let id = PciExpressCapabilityId::from(cap_id);
+            // A capability CH synthesizes replaces the device's own one, so
+            // the guest never sees it twice. Upstream vfio-pci hides PASID,
+            // but some vendor kernels expose the physical capability.
+            let hide = matches!(
+                id,
                 PciExpressCapabilityId::AlternativeRoutingIdentificationInterpretation
-                | PciExpressCapabilityId::ResizeableBar
-                | PciExpressCapabilityId::SingleRootIoVirtualization => match last_kept_offset {
+                    | PciExpressCapabilityId::ResizeableBar
+                    | PciExpressCapabilityId::SingleRootIoVirtualization
+            ) || self.extended_caps.iter().any(|cap| cap.id() == id);
+
+            if hide {
+                match last_kept_offset {
                     Some(offset) => self.override_next_extended_cap(offset, cap_next.into()),
                     None => self.patch_reg(
                         (PCI_CONFIG_EXTENDED_CAPABILITY_OFFSET / 4) as usize,
@@ -1535,8 +1544,9 @@ impl VfioCommon {
                             | (u32::from(cap_next) << PCI_EXT_CAP_NEXT_SHIFT),
                         0,
                     ),
-                },
-                _ => last_kept_offset = Some(current_offset),
+                }
+            } else {
+                last_kept_offset = Some(current_offset);
             }
 
             if cap_next == 0 {
@@ -4522,6 +4532,39 @@ mod tests {
         let head = common.read_config_register(0x100 / 4);
         assert_eq!(head & 0xffff, PciExpressCapabilityId::NullCapability as u32);
         assert_eq!(head >> PCI_EXT_CAP_NEXT_SHIFT, offset);
+    }
+
+    #[test]
+    fn device_capability_replaced_by_a_synthesized_one_is_hidden() {
+        // The device exposes its own PASID capability in the middle of the
+        // chain; the synthesized one replaces it instead of duplicating it.
+        let mock = MockConfigSpace::new(&[
+            (0x100, PciExpressCapabilityId::AdvancedErrorReporting, 0x140),
+            (0x140, PciExpressCapabilityId::ProcessAddressSpaceId, 0x180),
+            (0x180, PciExpressCapabilityId::DeviceSerialNumber, 0),
+        ]);
+        let mut common = test_vfio_common_with_pasid(mock);
+
+        common.parse_extended_capabilities().unwrap();
+
+        let mut chain = Vec::new();
+        let mut offset = 0x100;
+        while offset != 0 && chain.len() < 16 {
+            let hdr = common.read_config_register((offset / 4) as usize);
+            chain.push((offset, hdr & 0xffff));
+            offset = hdr >> PCI_EXT_CAP_NEXT_SHIFT;
+        }
+
+        let pasid_id = PciExpressCapabilityId::ProcessAddressSpaceId as u32;
+        let appended = PCIE_CONFIG_SPACE_SIZE - PasidCap::new(16, false, false).size();
+        assert_eq!(
+            chain,
+            vec![
+                (0x100, PciExpressCapabilityId::AdvancedErrorReporting as u32),
+                (0x180, PciExpressCapabilityId::DeviceSerialNumber as u32),
+                (appended, pasid_id),
+            ]
+        );
     }
 
     #[test]
