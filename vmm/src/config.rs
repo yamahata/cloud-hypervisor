@@ -2614,6 +2614,7 @@ impl DeviceConfig {
             fd,
             x_nv_gpudirect_clique,
             x_exclude_mmap_bars,
+            iommufd_dev_id: None,
         })
     }
 
@@ -5154,6 +5155,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             fd: None,
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
+            iommufd_dev_id: None,
         }
     }
 
@@ -5893,6 +5895,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 fd: None,
                 x_nv_gpudirect_clique: None,
                 x_exclude_mmap_bars: Vec::new(),
+                iommufd_dev_id: None,
             }]),
             user_devices: None,
             vdpa: None,

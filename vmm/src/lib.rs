@@ -4157,6 +4157,7 @@ mod tests {
                     fd: None,
                     x_nv_gpudirect_clique: None,
                     x_exclude_mmap_bars: Vec::new(),
+                    iommufd_dev_id: None,
                 })
                 .collect(),
         );
