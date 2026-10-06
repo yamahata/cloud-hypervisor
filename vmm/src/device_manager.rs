@@ -968,6 +968,89 @@ impl AccessPlatform for SevSnpPageAccessProxy {
     }
 }
 
+/// Parse the physical PASID Extended Capability's advertised Max
+/// PASID Width (bits [12:8] of the dword at cap_offset+4) by walking
+/// a raw PCI config-space byte buffer's extended capability chain,
+/// the same way `pci::vfio`'s capability parsing does. `None` when
+/// the chain never reaches a PASID capability (cap ID 0x001B), the
+/// buffer is too short to hold it, the walk exceeds its TTL (a
+/// malformed or cyclic chain - the same `(4096 - 256) / 8` bound the
+/// kernel's own extended-capability walk uses, pci.c, so a hostile
+/// or corrupt config blob cannot hang the VMM), or a next-pointer is
+/// nonzero but below the extended-capability region (also
+/// kernel-parity: `pos < PCI_CFG_SPACE_SIZE` is end of chain, never
+/// followed). Upstream vfio-pci hides the physical PASID capability
+/// from the VFIO-visible config region CH otherwise reads (some vendor
+/// kernels expose it; `pci::vfio` then hides it behind the synthesized
+/// one), so the device manager reads the host's sysfs config file instead
+/// (`host_physical_pasid_enabled`, below). Pure and unit-testable with
+/// a hand-built fixture buffer, independent of any real device.
+#[cfg(any(test, all(target_arch = "aarch64", feature = "kvm")))]
+fn parse_pasid_cap_width(config: &[u8]) -> Option<u8> {
+    pasid_cap_dword(config).map(|dw| ((dw >> 8) & 0x1f) as u8)
+}
+
+/// Whether the host has *enabled* the physical PASID capability: the
+/// PASID Control register's Enable bit (offset +6, bit 0; bit 16 of
+/// the dword at cap_offset+4). The host IOMMU driver enables PASID on a
+/// device only when the IOMMU supports PASID for it, so this answers
+/// "can the host back PASID here" on a kernel whose IOMMU_GET_HW_INFO
+/// predates `out_max_pasid_log2` (it always reads 0 there). Same walk
+/// and the same `None` cases as `parse_pasid_cap_width`.
+#[cfg(any(test, all(target_arch = "aarch64", feature = "kvm")))]
+fn parse_pasid_cap_enabled(config: &[u8]) -> Option<bool> {
+    pasid_cap_dword(config).map(|dw| (dw >> 16) & 1 != 0)
+}
+
+/// The physical PASID capability's second dword (Capability register
+/// in bits [15:0], Control register in [31:16]), found by the
+/// extended-capability walk described at `parse_pasid_cap_width`.
+#[cfg(any(test, all(target_arch = "aarch64", feature = "kvm")))]
+fn pasid_cap_dword(config: &[u8]) -> Option<u32> {
+    const PASID_CAP_ID: u32 = 0x001b;
+    const EXTENDED_CAPABILITY_OFFSET: usize = 0x100;
+    const CHAIN_WALK_TTL: u32 = (4096 - 256) / 8;
+
+    let mut offset = EXTENDED_CAPABILITY_OFFSET;
+    let mut ttl = CHAIN_WALK_TTL;
+    loop {
+        if ttl == 0 {
+            return None;
+        }
+        ttl -= 1;
+
+        let hdr = u32::from_le_bytes(config.get(offset..offset + 4)?.try_into().unwrap());
+        let next = ((hdr >> 20) & 0xfff) as usize;
+
+        if (hdr & 0xffff) == PASID_CAP_ID {
+            return Some(u32::from_le_bytes(
+                config.get(offset + 4..offset + 8)?.try_into().unwrap(),
+            ));
+        }
+
+        // A nonzero next-pointer below the extended-capability region
+        // is malformed and must never be followed - kernel parity
+        // with `pos < PCI_CFG_SPACE_SIZE -> break` (pci.c).
+        if next < EXTENDED_CAPABILITY_OFFSET || next == offset {
+            return None;
+        }
+        offset = next;
+    }
+}
+
+/// The physical PASID capability's width and host Enable bit, read
+/// from the host's sysfs config-space file of the device at `sysfs_dev`.
+/// `None` when that read is truncated, the device has no extended
+/// config space, or it has no PASID capability.
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+fn host_physical_pasid_enabled(sysfs_dev: &Path) -> io::Result<Option<(u8, bool)>> {
+    let config = fs::read(sysfs_dev.join("config"))?;
+    if config.len() < 4096 {
+        return Ok(None);
+    }
+    Ok(parse_pasid_cap_width(&config).zip(parse_pasid_cap_enabled(&config)))
+}
+
 pub struct DeviceManager {
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
@@ -4142,9 +4225,11 @@ impl DeviceManager {
         Ok(self.smmuv3s.entry(key.to_string()).or_insert(smmu))
     }
 
+    /// The host sysfs directory of a passthrough device, given by path or
+    /// by an open VFIO cdev fd.
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-    fn find_physical_iommu(device_cfg: &DeviceConfig) -> DeviceManagerResult<String> {
-        let pci_dir: PathBuf = match (&device_cfg.path, device_cfg.fd) {
+    fn passthrough_sysfs_dir(device_cfg: &DeviceConfig) -> DeviceManagerResult<PathBuf> {
+        Ok(match (&device_cfg.path, device_cfg.fd) {
             (Some(path), None) => path.clone(),
             (None, Some(fd)) => {
                 use std::mem::zeroed;
@@ -4183,8 +4268,12 @@ impl DeviceManager {
                     .to_path_buf()
             }
             _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
-        };
+        })
+    }
 
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn find_physical_iommu(device_cfg: &DeviceConfig) -> DeviceManagerResult<String> {
+        let pci_dir = Self::passthrough_sysfs_dir(device_cfg)?;
         let iommu_link = pci_dir.join("iommu");
         let target = fs::read_link(&iommu_link).map_err(DeviceManagerError::FindPhysicalIommu)?;
         let name = target.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
@@ -4194,6 +4283,45 @@ impl DeviceManager {
             ))
         })?;
         Ok(name.to_string())
+    }
+
+    /// A PASID capability for a device whose IOMMU_GET_HW_INFO reports no
+    /// PASID width. `out_max_pasid_log2` exists from Linux 6.15
+    /// (803f97298e7d); before that the field is reserved and reads 0, so
+    /// on such a host (the production GB200 kernel is 6.11) no device
+    /// would get a PASID capability, the guest could not enable SVA, and
+    /// CUDA fails with error 802. The host IOMMU driver enables a
+    /// device's PASID capability only when the IOMMU can back PASID for
+    /// it, so read that Enable bit from the physical capability in the
+    /// host's sysfs config space (vfio-pci hides the capability from
+    /// the VFIO view) and, when it is set, offer the physical width
+    /// without Exec/Priv, as the host enabled it.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn host_enabled_pasid_cap(device_cfg: &DeviceConfig, bdf: PciBdf) -> Option<PasidCap> {
+        let dir = match Self::passthrough_sysfs_dir(device_cfg) {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!("SMMUv3: {bdf}: no host sysfs directory for the PASID fallback: {e}");
+                return None;
+            }
+        };
+        match host_physical_pasid_enabled(&dir) {
+            Ok(Some((width, true))) => {
+                info!(
+                    "SMMUv3: {bdf}: host reports no PASID width; using the host-enabled \
+                     physical PASID capability, width {width}"
+                );
+                Some(PasidCap::new(width, false, false))
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    "SMMUv3: {bdf}: cannot read {}/config for the PASID fallback: {e}",
+                    dir.display()
+                );
+                None
+            }
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -4226,9 +4354,13 @@ impl DeviceManager {
                 dev_id,
             )
             .map_err(DeviceManagerError::Smmuv3)?;
-        let pasid_cap = viommu
+        let pasid_cap = match viommu
             .pasid_cap(dev_id)
-            .map_err(DeviceManagerError::Smmuv3)?;
+            .map_err(DeviceManagerError::Smmuv3)?
+        {
+            Some(cap) => Some(cap),
+            None => Self::host_enabled_pasid_cap(device_cfg, bdf),
+        };
 
         self.msi_interrupt_manager.register_remapping(
             bdf.into(),
@@ -6640,6 +6772,109 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 4096-byte config space whose chain reaches a PASID capability
+    /// at 0x140 with width 14 and the given Control register.
+    fn pasid_fixture(control: u16) -> Vec<u8> {
+        let mut config = vec![0u8; 4096];
+        let first = 0x0003u32 | (1 << 16) | (0x140 << 20);
+        config[0x100..0x104].copy_from_slice(&first.to_le_bytes());
+        let pasid_hdr = 0x001bu32 | (1 << 16);
+        config[0x140..0x144].copy_from_slice(&pasid_hdr.to_le_bytes());
+        let pasid_dw = (14u32 << 8) | (u32::from(control) << 16);
+        config[0x144..0x148].copy_from_slice(&pasid_dw.to_le_bytes());
+        config
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_enabled_reads_the_control_enable_bit() {
+        // Enable set, as the host leaves a GB200 GPU (PASIDCtl: Enable+ Exec- Priv-).
+        assert_eq!(parse_pasid_cap_enabled(&pasid_fixture(0x1)), Some(true));
+        // Exec/Priv enables without Enable do not count.
+        assert_eq!(parse_pasid_cap_enabled(&pasid_fixture(0x6)), Some(false));
+        assert_eq!(parse_pasid_cap_enabled(&pasid_fixture(0x0)), Some(false));
+        // The Control register must not leak into the width.
+        assert_eq!(parse_pasid_cap_width(&pasid_fixture(0x7)), Some(14));
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_enabled_without_a_pasid_capability_is_none() {
+        let mut config = vec![0u8; 4096];
+        let only = 0x0003u32 | (1 << 16);
+        config[0x100..0x104].copy_from_slice(&only.to_le_bytes());
+        assert_eq!(parse_pasid_cap_enabled(&config), None);
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_from_fixture_chain() {
+        let mut config = vec![0u8; 4096];
+        // Chain: 0x100 (some other cap, 0x0003) -> 0x140 (PASID cap,
+        // 0x001b, width 14) -> end.
+        let first = 0x0003u32 | (1 << 16) | (0x140 << 20);
+        config[0x100..0x104].copy_from_slice(&first.to_le_bytes());
+        let pasid_hdr = 0x001bu32 | (1 << 16);
+        config[0x140..0x144].copy_from_slice(&pasid_hdr.to_le_bytes());
+        let pasid_cap = 14u32 << 8; // width 14, no exec/priv
+        config[0x144..0x148].copy_from_slice(&pasid_cap.to_le_bytes());
+
+        assert_eq!(parse_pasid_cap_width(&config), Some(14));
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_no_extended_capabilities() {
+        // An all-zero extended-capability region (no PASID cap, no
+        // chain at all) must report absent, not panic or misread.
+        let config = vec![0u8; 4096];
+        assert_eq!(parse_pasid_cap_width(&config), None);
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_chain_without_pasid_returns_none() {
+        let mut config = vec![0u8; 4096];
+        // A single real capability, not PASID, end of chain.
+        let hdr = 0x0003u32 | (1 << 16);
+        config[0x100..0x104].copy_from_slice(&hdr.to_le_bytes());
+
+        assert_eq!(parse_pasid_cap_width(&config), None);
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_truncated_buffer_returns_none() {
+        // A buffer too short to hold the extended capability region
+        // must report absent rather than panic.
+        let config = vec![0u8; 0x10];
+        assert_eq!(parse_pasid_cap_width(&config), None);
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_cycle_returns_none_instead_of_hanging() {
+        // A 2-cycle chain (A -> B -> A) must exhaust the TTL and
+        // return None rather than loop forever.
+        const CAP_A_OFFSET: usize = 0x100;
+        const CAP_B_OFFSET: usize = 0x140;
+
+        let mut config = vec![0u8; 4096];
+        let hdr_a = 0x0003u32 | (1 << 16) | ((CAP_B_OFFSET as u32) << 20);
+        config[CAP_A_OFFSET..CAP_A_OFFSET + 4].copy_from_slice(&hdr_a.to_le_bytes());
+        let hdr_b = 0x0005u32 | (1 << 16) | ((CAP_A_OFFSET as u32) << 20);
+        config[CAP_B_OFFSET..CAP_B_OFFSET + 4].copy_from_slice(&hdr_b.to_le_bytes());
+
+        assert_eq!(parse_pasid_cap_width(&config), None);
+    }
+
+    #[test]
+    fn test_parse_pasid_cap_width_malformed_next_below_ext_offset_returns_none() {
+        // A next-pointer that is nonzero but below the extended-
+        // capability region (0x100) is malformed; kernel parity
+        // (pci.c: `pos < PCI_CFG_SPACE_SIZE` is end of chain) says
+        // never follow it, so the walk must stop and report absent
+        // rather than read into legacy config space.
+        let mut config = vec![0u8; 4096];
+        let hdr = 0x0003u32 | (1 << 16) | (0x040 << 20);
+        config[0x100..0x104].copy_from_slice(&hdr.to_le_bytes());
+
+        assert_eq!(parse_pasid_cap_width(&config), None);
+    }
 
     #[test]
     fn test_s5_sleep_state_uses_complete_package() {
