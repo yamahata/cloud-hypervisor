@@ -26,6 +26,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
@@ -388,6 +390,30 @@ pub enum DeviceManagerError {
          would alias another device's"
     )]
     Smmuv3NonZeroBus(PciBdf),
+
+    /// WORKAROUND (shared IOAS across host SMMUs): could not resolve the
+    /// host SMMU behind a plain VFIO device.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Shared-IOAS workaround: cannot resolve the host SMMU of {0}")]
+    SharedIoasWorkaroundHostSmmu(String, #[source] io::Error),
+
+    /// WORKAROUND (shared IOAS across host SMMUs): the device has no
+    /// iommufd device id.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Shared-IOAS workaround: {0} has no iommufd device id")]
+    SharedIoasWorkaroundNoDevId(String),
+
+    /// WORKAROUND (shared IOAS across host SMMUs): could not allocate the
+    /// page table for a host SMMU.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Shared-IOAS workaround: cannot allocate the HWPT for the host SMMU of {0}")]
+    SharedIoasWorkaroundHwptAlloc(String, #[source] iommufd_ioctls::IommufdError),
+
+    /// WORKAROUND (shared IOAS across host SMMUs): could not attach the
+    /// device to its host SMMU's page table.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Shared-IOAS workaround: cannot attach {0} to its host SMMU's HWPT")]
+    SharedIoasWorkaroundAttach(String, #[source] vfio_ioctls::VfioError),
 
     /// Failed to find the physical IOMMU of a passthrough device
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -1151,6 +1177,19 @@ pub struct DeviceManager {
     #[cfg(target_arch = "aarch64")]
     gic_placement: layout::GicV3Placement,
 
+    /// WORKAROUND (shared IOAS across host SMMUs): the paging HWPT allocated
+    /// on the shared IOAS for each host SMMU instance, keyed by the SMMU's
+    /// canonical sysfs path. See `shared_ioas_workaround_attach`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    shared_ioas_hwpts: HashMap<PathBuf, u32>,
+
+    /// WORKAROUND (shared IOAS across host SMMUs): every device attached to
+    /// one of `shared_ioas_hwpts`, so the ordered teardown in `Drop` can
+    /// detach it before destroying the HWPTs. `Weak`: a hot-unplugged device
+    /// must still close its cdev (which detaches it) when it is ejected.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    shared_ioas_attached: Vec<Weak<VfioDevice>>,
+
     // Tree of devices, representing the dependencies between devices.
     // Useful for introspection, snapshot and restore.
     device_tree: Arc<Mutex<DeviceTree>>,
@@ -1494,6 +1533,10 @@ impl DeviceManager {
             smmuv3s: BTreeMap::new(),
             #[cfg(target_arch = "aarch64")]
             gic_placement,
+            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+            shared_ioas_hwpts: HashMap::new(),
+            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+            shared_ioas_attached: Vec::new(),
             pci_segments: pci_segments.into_boxed_slice(),
             device_tree,
             exit_evt,
@@ -4225,6 +4268,80 @@ impl DeviceManager {
         Ok(self.smmuv3s.entry(key.to_string()).or_insert(smmu))
     }
 
+    /// WORKAROUND, not design: attach a plain (non-vSMMUv3) VFIO device to
+    /// a paging HWPT allocated for its own host SMMU, instead of letting the
+    /// kernel pick a domain when the device attaches to the shared IOAS.
+    ///
+    /// Why: Linux arm-smmu-v3 from 48e7b8e284e5 ("Remove
+    /// arm_smmu_domain_finalise() during attach", v6.14) until be5a2d3f8f97
+    /// ("Fix incorrect return in arm_smmu_attach_dev", v6.16) returns 0 when
+    /// a device is attached to a domain finalised on a *different* SMMU
+    /// instance, without installing a stream table entry. iommufd's
+    /// auto-domain then reuses the first device's domain for every later
+    /// device on the shared IOAS, and each device behind another SMMU keeps
+    /// the abort STE VFIO installed at open: its DMA is silently dropped.
+    /// Backports carry the bug too (seen on 6.11.0-161.crusoe, GB200: NVMe
+    /// and IB VFs dead, one device's poisoned completion took its PF down).
+    ///
+    /// An HWPT allocated with a device on each SMMU is finalised on that
+    /// SMMU, so every attach installs a real STE. The IOAS stays shared, so
+    /// guest memory mappings reach every HWPT unchanged. On a fixed kernel
+    /// this does what auto-domain would have done.
+    ///
+    /// Remove once no supported host kernel lacks be5a2d3f8f97.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn shared_ioas_workaround_attach(
+        &mut self,
+        vfio_name: &str,
+        sysfs_dev: &Path,
+        vfio_ops: &Arc<dyn VfioOps>,
+        vfio_device: &VfioDevice,
+    ) -> DeviceManagerResult<()> {
+        let vfio_iommufd = vfio_ops
+            .as_any()
+            .downcast_ref::<VfioIommufd>()
+            .expect("the caller only takes this path with an iommufd backend");
+        let dev_id = vfio_device.iommufd_dev_id().ok_or_else(|| {
+            DeviceManagerError::SharedIoasWorkaroundNoDevId(vfio_name.to_string())
+        })?;
+        // Own resolver rather than host_iommu_of(): this must not depend on
+        // the smmuv3-accel feature.
+        let host_smmu = fs::read_link(sysfs_dev.join("iommu"))
+            .and_then(|target| sysfs_dev.join(target).canonicalize())
+            .map_err(|e| {
+                DeviceManagerError::SharedIoasWorkaroundHostSmmu(vfio_name.to_string(), e)
+            })?;
+
+        let hwpt_id = if let Some(id) = self.shared_ioas_hwpts.get(&host_smmu) {
+            *id
+        } else {
+            let mut alloc = iommufd_bindings::iommu_hwpt_alloc {
+                size: size_of::<iommufd_bindings::iommu_hwpt_alloc>() as u32,
+                dev_id,
+                pt_id: vfio_iommufd.ioas_id(),
+                ..Default::default()
+            };
+            vfio_iommufd
+                .iommufd()
+                .alloc_iommu_hwpt(&mut alloc)
+                .map_err(|e| {
+                    DeviceManagerError::SharedIoasWorkaroundHwptAlloc(vfio_name.to_string(), e)
+                })?;
+            info!(
+                "WORKAROUND (shared IOAS across host SMMUs): HWPT {} for host SMMU {} \
+                 (first device {vfio_name})",
+                alloc.out_hwpt_id,
+                host_smmu.display()
+            );
+            self.shared_ioas_hwpts.insert(host_smmu, alloc.out_hwpt_id);
+            alloc.out_hwpt_id
+        };
+
+        vfio_device
+            .attach_hwpt(hwpt_id)
+            .map_err(|e| DeviceManagerError::SharedIoasWorkaroundAttach(vfio_name.to_string(), e))
+    }
+
     /// The host sysfs directory of a passthrough device, given by path or
     /// by an open VFIO cdev fd.
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -4446,13 +4563,30 @@ impl DeviceManager {
             vfio_ops
         };
 
+        // Set when the device is bound without the IOAS and attached to its
+        // host SMMU's HWPT by the shared-IOAS workaround below.
+        #[allow(unused_mut)]
+        let mut per_smmu_hwpt = false;
         // Devices behind an emulated SMMUv3 are attached to its vIOMMU, not the IOAS.
         let (vfio_device, device_path) = match (&device_cfg.path, device_cfg.fd) {
             (Some(path), None) => {
+                // WORKAROUND (shared IOAS across host SMMUs): a plain device
+                // on an iommufd backend is bound without attaching to the
+                // IOAS and attached to its host SMMU's own HWPT instead; see
+                // shared_ioas_workaround_attach(). A device behind a virtual
+                // IOMMU is not plain: behind the SMMUv3 it is attached to
+                // its vIOMMU, and behind the virtio-iommu it has an IOAS of
+                // its own, in a context of its own unless `iommufd_fd` is
+                // given, where the HWPTs of the shared IOAS do not apply.
+                #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+                {
+                    per_smmu_hwpt = !device_cfg.pci_common.iommu.attached()
+                        && vfio_ops.as_any().downcast_ref::<VfioIommufd>().is_some();
+                }
                 let vfio_device = VfioDevice::new(
                     path,
                     Arc::clone(&vfio_ops) as Arc<dyn VfioOps>,
-                    !smmuv3_attached,
+                    !smmuv3_attached && !per_smmu_hwpt,
                 )
                 .map_err(DeviceManagerError::VfioCreate)?;
                 (vfio_device, path.clone())
@@ -4475,6 +4609,17 @@ impl DeviceManager {
             _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
         };
         let vfio_device = Arc::new(vfio_device);
+
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        if per_smmu_hwpt {
+            self.shared_ioas_workaround_attach(
+                &vfio_name,
+                &device_path,
+                &(Arc::clone(&vfio_ops) as Arc<dyn VfioOps>),
+                &vfio_device,
+            )?;
+            self.shared_ioas_attached.push(Arc::downgrade(&vfio_device));
+        }
 
         if let Some(dev_id) = vfio_device.iommufd_dev_id() {
             device_cfg.iommufd_dev_id = Some(dev_id);
@@ -6124,7 +6269,60 @@ impl DeviceManager {
         // Drop the VfioOps instance when "Self" is the only reference.
         if let Some(1) = self.vfio_ops.as_ref().map(Arc::strong_count) {
             debug!("Drop VfioOps given no active VFIO devices.");
+            // WORKAROUND (shared IOAS across host SMMUs): the per-SMMU HWPTs
+            // keep the IOAS alive (EBUSY), and their ids are only valid in
+            // this context: destroy them, so the next device gets fresh
+            // ones in the context it is bound to.
+            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+            self.destroy_shared_ioas_hwpts();
             self.vfio_ops = None;
+        }
+    }
+
+    /// WORKAROUND (shared IOAS across host SMMUs): detach every device still
+    /// attached to a per-SMMU HWPT, then destroy the HWPTs. The IOAS cannot
+    /// be destroyed (EBUSY) while one is alive, and an HWPT cannot be
+    /// destroyed while a device is attached to it. Called with every
+    /// remaining cdev still open (`Drop`), or with none left
+    /// (`cleanup_vfio_ops`).
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn destroy_shared_ioas_hwpts(&mut self) {
+        if self.shared_ioas_hwpts.is_empty() {
+            self.shared_ioas_attached.clear();
+            return;
+        }
+        for dev in self.shared_ioas_attached.drain(..) {
+            // A device already gone (hot-unplugged) detached itself when
+            // its cdev closed.
+            if let Some(dev) = dev.upgrade()
+                && let Err(e) = dev.detach_hwpt()
+            {
+                warn!("WORKAROUND (shared IOAS across host SMMUs): detach failed: {e}");
+            }
+        }
+        match self
+            .vfio_ops
+            .as_ref()
+            .and_then(|ops| ops.as_any().downcast_ref::<VfioIommufd>())
+        {
+            Some(vfio_iommufd) => {
+                for (host_smmu, hwpt_id) in self.shared_ioas_hwpts.drain() {
+                    if let Err(e) = vfio_iommufd.iommufd().destroy_iommu_object(hwpt_id) {
+                        warn!(
+                            "WORKAROUND (shared IOAS across host SMMUs): destroying HWPT \
+                             {hwpt_id} for host SMMU {} failed: {e}",
+                            host_smmu.display()
+                        );
+                    }
+                }
+            }
+            None => {
+                self.shared_ioas_hwpts.clear();
+                warn!(
+                    "WORKAROUND (shared IOAS across host SMMUs): no iommufd backend to destroy \
+                     the per-SMMU HWPTs"
+                );
+            }
         }
     }
 
@@ -6761,6 +6959,14 @@ impl Drop for DeviceManager {
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
         }
+
+        // WORKAROUND (shared IOAS across host SMMUs): each per-SMMU paging
+        // HWPT holds a reference on the shared IOAS, so VfioIommufd::drop
+        // cannot destroy the IOAS (EBUSY) while one is alive - and an HWPT
+        // cannot be destroyed while a device is attached to it. With every
+        // cdev still open here, detach the devices, then destroy the HWPTs.
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        self.destroy_shared_ioas_hwpts();
 
         if let Some(termios) = *self.original_termios_opt.lock().unwrap() {
             // SAFETY: FFI call
