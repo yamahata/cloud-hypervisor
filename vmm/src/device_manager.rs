@@ -698,6 +698,10 @@ pub enum DeviceManagerError {
     #[error("Cannot remove device from behind vIOMMU: bdf={0}")]
     InvalidIommuRemove(PciBdf),
 
+    /// Cannot remove a device from behind the SMMUv3
+    #[error("Cannot remove device {0} from behind the SMMUv3")]
+    InvalidSmmuv3Remove(String),
+
     /// Invalid identifier as it is not unique.
     #[error("Invalid identifier as it is not unique: {0}")]
     IdentifierNotUnique(String),
@@ -5933,6 +5937,24 @@ impl DeviceManager {
     }
 
     pub fn remove_device(&mut self, id: &str) -> DeviceManagerResult<()> {
+        // A device behind the SMMUv3 stays registered with its vIOMMU, in
+        // the IORT and in the guest's stream table for the life of the
+        // guest: nothing unregisters it, so it cannot be unplugged.
+        #[cfg(target_arch = "aarch64")]
+        if self
+            .config
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .flatten()
+            .any(|d| {
+                d.pci_common.id.as_deref() == Some(id) && d.pci_common.iommu == IommuType::Smmuv3
+            })
+        {
+            return Err(DeviceManagerError::InvalidSmmuv3Remove(id.to_string()));
+        }
+
         // The node can be directly a PCI node in case the 'id' refers to a
         // VFIO device or a virtio-pci one.
         // In case the 'id' refers to a virtio device, we must find the PCI
