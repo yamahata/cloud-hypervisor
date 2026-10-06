@@ -302,6 +302,13 @@ Limitations:
   `iommu=virtio` across devices is rejected, and so is combining it with the
   `iommu_segments` option of `--platform`, which implies a virtio-iommu.
 - Devices cannot be hotplugged behind it, they have to be assigned at boot.
+- The guest must boot through UEFI firmware. Only the ACPI IORT places a
+  device behind the emulated SMMUv3; a direct kernel boot describes the
+  platform by device tree, so it is refused when a device asks for
+  `iommu=smmuv3`.
+- A device must be on bus 0 of its PCI segment, as every Cloud Hypervisor
+  device is: its StreamID is `256 * segment + devfn`, the same value as its
+  ITS DeviceID.
 - Snapshot, restore and live migration are not supported. A snapshot does
   capture the emulated SMMUv3 registers, but they are not applied back on
   restore, and the nested translation set up through iommufd is not rebuilt.
@@ -315,4 +322,58 @@ Limitations:
     --kernel CLOUDHV_EFI.fd \
     --platform iommufd=on \
     --device path=/sys/bus/pci/devices/0009:01:00.0/,iommu=smmuv3
+```
+
+### Capabilities and placement
+
+The emulated SMMUv3 advertises what its host SMMUv3 backs: coherency, ATS,
+the substream ID width, the stage-1 table formats and granules, the output
+address size (at most 48 bits), range invalidation, the break-before-make
+level and 52-bit virtual addresses. A guest kernel checks the last two before
+it shares its page tables with the SMMU (SVA), which CUDA on a Grace GPU
+requires.
+
+A device is offered a PASID capability when the host reports a PASID width
+for it (`IOMMU_GET_HW_INFO`, Linux 6.15 and later). On an older host kernel,
+which reports none, the capability is taken from the device's physical one
+when the host has enabled it, as the host IOMMU driver does only when it can
+back PASID. A device with a PASID capability is presented as a root complex
+integrated endpoint.
+
+The emulated SMMUv3s sit in a 16 MiB MMIO window at `0x0E00_0000`, one
+128 KiB frame each, so a guest can have one per host SMMU of a large host.
+
+### Tegra241 CMDQV
+
+Built with the `smmuv3-accel` feature (reported by `vmm.ping`), an emulated
+SMMUv3 whose host SMMU carries a compatible NVIDIA Tegra241 CMDQV is given one
+too, described in the DSDT as `NVDA200C`. The guest then issues invalidations
+through hardware queues instead of trapping each command into the VMM. Each
+CMDQV sits in a 64 MiB window at `0x0A00_0000`, and the host's VINTF page is
+mapped into the guest so queue doorbells need no exit.
+
+A hardware queue's memory must be physically contiguous, so the command queue
+size the SMMUv3 advertises is capped by how guest memory is backed: the host
+page size, or the hugepage size when every memory zone uses hugepages of an
+explicit size.
+
+### Grace GPUs
+
+The NVIDIA driver for a Grace GPU with coherent memory (GH200, GB200, GB300)
+requires the GPU at guest device and function `00.0`, and 8 memory-less guest
+NUMA nodes with an SRAT Generic Initiator naming it, into which it onlines the
+GPU memory. Device 0 of PCI segment 0 is the host bridge, so put each GPU on
+its own segment with `pci_device_id=0`, and name it in `--numa` with
+`device_id`:
+
+```bash
+--platform iommufd=on,num_pci_segments=2 \
+--device path=/sys/bus/pci/devices/0009:01:00.0/,iommu=smmuv3,pci_segment=1,pci_device_id=0,id=gpu0 \
+--memory size=0 \
+--memory-zone id=mem0,size=64G \
+--numa guest_numa_id=0,cpus=[0-15],memory_zones=[mem0] \
+       guest_numa_id=1,device_id=gpu0 guest_numa_id=2,device_id=gpu0 \
+       guest_numa_id=3,device_id=gpu0 guest_numa_id=4,device_id=gpu0 \
+       guest_numa_id=5,device_id=gpu0 guest_numa_id=6,device_id=gpu0 \
+       guest_numa_id=7,device_id=gpu0 guest_numa_id=8,device_id=gpu0
 ```
