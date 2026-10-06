@@ -237,6 +237,16 @@ struct Command {
     word1: u64,
 }
 
+// CMD_CFGI_STE_RANGE word 1: Range [4:0].
+const CFGI_1_RANGE_MASK: u64 = 0x1f;
+
+/// The inclusive StreamID span a CMD_CFGI_STE_RANGE covers.
+fn cfgi_ste_range(sid: u32, range: u8) -> (u64, u64) {
+    let span = 1u64 << (u32::from(range) + 1);
+    let start = u64::from(sid) & !(span - 1);
+    (start, start + span - 1)
+}
+
 impl Command {
     fn stream_id(&self) -> u32 {
         (self.word0 >> 32) as u32
@@ -796,6 +806,31 @@ impl Smmuv3 {
         self.configure_stream(sid)
     }
 
+    /// CMD_CFGI_STE_RANGE, and CMD_CFGI_ALL, which is the same command with
+    /// Range 31 (Linux issues it at every SMMU reset). The span is
+    /// naturally aligned and 2^(Range + 1) StreamIDs wide, so the command's
+    /// SID has its low Range + 1 bits cleared to find the start; u64
+    /// arithmetic, since Range 31 covers all 2^32 StreamIDs. Only the
+    /// streams the guest has named are walked, never the span itself.
+    fn handle_cfgi_ste_range(&mut self, cmd: &Command) -> Result<(), Error> {
+        let (start, end) = cfgi_ste_range(cmd.stream_id(), (cmd.word1 & CFGI_1_RANGE_MASK) as u8);
+        let sids: Vec<u32> = self
+            .stream_ids
+            .iter()
+            .copied()
+            .filter(|&sid| (start..=end).contains(&u64::from(sid)))
+            .collect();
+        debug!(
+            "SMMUv3 CFGI_STE_RANGE [{start:#x}, {end:#x}]: refreshing {} stream(s)",
+            sids.len()
+        );
+        for sid in sids {
+            self.configure_stream(sid)?;
+        }
+
+        Ok(())
+    }
+
     fn configure_stream(&mut self, sid: u32) -> Result<(), Error> {
         if self.cr0 & CR0_SMMUEN == 0 {
             return if self.gbpa & GBPA_ABORT != 0 {
@@ -847,13 +882,7 @@ impl Smmuv3 {
 
         match cmd.opcode {
             CMD_CFGI_STE => self.handle_cfgi_ste(cmd.stream_id()),
-            CMD_CFGI_STE_RANGE => {
-                debug!(
-                    "SMMUv3 CFGI_STE_RANGE (SID {:#x}): no cached STE state",
-                    cmd.stream_id()
-                );
-                Ok(())
-            }
+            CMD_CFGI_STE_RANGE => self.handle_cfgi_ste_range(cmd),
             CMD_ATC_INV if self.idr0 & IDR0_ATS == 0 => Err(Error::IllegalCommand(cmd.opcode)),
             CMD_ATC_INV if self.cr0 & CR0_SMMUEN == 0 => Ok(()),
             CMD_CFGI_CD | CMD_CFGI_CD_ALL | CMD_TLBI_NH_ALL | CMD_TLBI_NH_ASID | CMD_TLBI_NH_VA
@@ -1061,6 +1090,85 @@ mod tests {
         fn invalidate(&self, _invalidation: Invalidation) -> Result<(), IommuError> {
             Ok(())
         }
+    }
+
+    /// Records the StreamIDs it is asked to put on bypass.
+    #[derive(Default)]
+    struct PassthroughRecorder(Mutex<Vec<u32>>);
+
+    impl PhysicalIommu for PassthroughRecorder {
+        fn hw_info(&self) -> Result<HwInfo, IommuError> {
+            Ok(HwInfo::Smmuv3 {
+                idr: [0; 6],
+                ats_supported: false,
+            })
+        }
+
+        fn install_table_entry(
+            &self,
+            _device_id: u32,
+            _entry: TableEntry,
+        ) -> Result<(), IommuError> {
+            Ok(())
+        }
+
+        fn set_passthrough(&self, device_id: u32) -> Result<(), IommuError> {
+            self.0.lock().unwrap().push(device_id);
+            Ok(())
+        }
+
+        fn set_blocking(&self, _device_id: u32) -> Result<(), IommuError> {
+            Ok(())
+        }
+
+        fn invalidate(&self, _invalidation: Invalidation) -> Result<(), IommuError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_cfgi_ste_range_span() {
+        // Naturally aligned, 2^(Range + 1) wide.
+        assert_eq!(cfgi_ste_range(0x12, 0), (0x12, 0x13));
+        assert_eq!(cfgi_ste_range(0x13, 0), (0x12, 0x13));
+        assert_eq!(cfgi_ste_range(0x12, 4), (0x00, 0x1f));
+        // CFGI_ALL: Range 31 covers every 32-bit StreamID.
+        assert_eq!(cfgi_ste_range(0xdead_beef, 31), (0, u64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn test_cfgi_ste_range_refreshes_the_named_streams_in_the_span() {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
+        );
+        let group = || Arc::new(NoopInterrupts) as Arc<dyn InterruptSourceGroup>;
+        let recorder = Arc::new(PassthroughRecorder::default());
+        let mut smmuv3 = Smmuv3::new(
+            "smmuv3".to_string(),
+            mem,
+            Smmuv3Interrupts {
+                event: group(),
+                gerror: group(),
+                sync: group(),
+            },
+            Arc::clone(&recorder) as Arc<dyn PhysicalIommu>,
+            None,
+        );
+        // SMMUEN is clear and GBPA does not abort, so every refreshed
+        // stream goes to bypass, which the recorder sees.
+        smmuv3.stream_ids.extend([0x10, 0x11, 0x30, 0x100]);
+        let range = |sid: u32, range: u64| Command {
+            opcode: CMD_CFGI_STE_RANGE,
+            word0: u64::from(CMD_CFGI_STE_RANGE) | (u64::from(sid) << 32),
+            word1: range,
+        };
+
+        smmuv3.dispatch_command(&range(0x12, 4)).unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), [0x10, 0x11]);
+
+        recorder.0.lock().unwrap().clear();
+        smmuv3.dispatch_command(&range(0, 31)).unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), [0x10, 0x11, 0x30, 0x100]);
     }
 
     fn test_smmuv3() -> Smmuv3 {
