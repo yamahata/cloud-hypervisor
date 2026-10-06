@@ -80,7 +80,7 @@ use devices::legacy::{
 #[cfg(feature = "pvmemcontrol")]
 use devices::pvmemcontrol::{self, PvmemcontrolBusDevice, PvmemcontrolPciDevice};
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-use devices::smmuv3::{SMMU_V3_MMIO_PAGE_SIZE, SMMU_V3_MMIO_SIZE, Smmuv3Interrupts};
+use devices::smmuv3::{SMMU_V3_MMIO_SIZE, Smmuv3Interrupts};
 #[cfg(not(target_arch = "riscv64"))]
 use devices::tpm;
 use devices::{AcpiNotificationFlags, acpi, interrupt_controller, legacy, pvpanic};
@@ -4219,13 +4219,13 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::CreateInterruptGroup)?,
         };
 
-        let smmuv3_addr = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_platform_mmio_addresses(None, SMMU_V3_MMIO_SIZE, Some(SMMU_V3_MMIO_PAGE_SIZE))
-            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
+        // A dedicated window: the platform device area holds fewer frames
+        // than a host has SMMUs.
+        const _: () = assert!(layout::SMMUV3_INSTANCE_SIZE == SMMU_V3_MMIO_SIZE);
+        if index >= layout::SMMUV3_MAX_INSTANCES as usize {
+            return Err(DeviceManagerError::AllocateMmioAddress);
+        }
+        let smmuv3_addr = layout::smmuv3_instance_addr(index as u32);
 
         let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
 

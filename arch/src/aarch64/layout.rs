@@ -178,6 +178,34 @@ pub const LEGACY_GPIO_MAPPED_IO_START: GuestAddress = GuestAddress(0x0902_0000);
 pub const MEM_PCI_IO_START: GuestAddress = GuestAddress(0x0905_0000);
 pub const MEM_PCI_IO_SIZE: u64 = 0x10000;
 
+/// Emulated SMMUv3 region: a 16 MiB window at 0x0E00_0000 ~ 0x0F00_0000,
+/// one 128 KiB register frame per instance, so up to 128 instances (the
+/// SPIs each instance takes are the practical limit). The platform device
+/// area is 1 MiB, shared with the ACPI devices, which holds fewer frames
+/// than a host has SMMUs (eight behind a GB300 guest's devices). It sits
+/// below the 32-bit PCI MMIO window rather than inside it so that window
+/// stays exactly upstream's for every guest: moving it would put the BARs
+/// of a VM restored or migrated from another build outside the window.
+pub const SMMUV3_REGION_START: GuestAddress = GuestAddress(0x0E00_0000);
+pub const SMMUV3_REGION_SIZE: u64 = 0x100_0000; // 16 MiB
+pub const SMMUV3_INSTANCE_SIZE: u64 = 0x2_0000; // 128 KiB per instance
+pub const SMMUV3_MAX_INSTANCES: u32 = 128;
+
+/// The MMIO base of SMMUv3 instance N.
+#[inline]
+pub const fn smmuv3_instance_addr(instance: u32) -> GuestAddress {
+    GuestAddress(SMMUV3_REGION_START.0 + (instance as u64 * SMMUV3_INSTANCE_SIZE))
+}
+
+const _: () = assert!(
+    SMMUV3_REGION_START.0 + SMMUV3_REGION_SIZE <= MEM_32BIT_DEVICES_START.0,
+    "SMMU region must not overlap with PCI MMIO space"
+);
+const _: () = assert!(
+    SMMUV3_INSTANCE_SIZE * SMMUV3_MAX_INSTANCES as u64 <= SMMUV3_REGION_SIZE,
+    "SMMU instances must fit within the SMMU region"
+);
+
 /// Starting from 0x1000_0000 (256MiB) to 0x3000_0000 (768MiB) is used for PCIE MMIO
 pub const MEM_32BIT_DEVICES_START: GuestAddress = GuestAddress(0x1000_0000);
 pub const MEM_32BIT_DEVICES_SIZE: u64 = 0x2000_0000;
