@@ -116,6 +116,18 @@ const IDR5_GRAN4K: u32 = 1 << 4;
 const IDR5_GRAN16K: u32 = 1 << 5;
 const IDR5_GRAN64K: u32 = 1 << 6;
 const IDR5_GRAN_MASK: u32 = IDR5_GRAN4K | IDR5_GRAN16K | IDR5_GRAN64K;
+//   VAX: 52-bit virtual addresses, which a guest with a 52-bit VA kernel
+//        needs before it will share its page tables with the SMMU (SVA).
+const IDR5_VAX_MASK: u32 = 0b11 << 10;
+
+// IDR3 fields, all taken from the host, which carries them out:
+//   RIL: range invalidation commands, forwarded as the guest issues them.
+//   BBM: break-before-make level; a guest kernel whose CPUs support
+//        BBML2 without aborts refuses SVA unless the SMMU reports level 2.
+// FWB (bit 8) is a stage-2 feature and stays hidden, as stage 2 is.
+const IDR3_RIL: u32 = 1 << 10;
+const IDR3_BBM_MASK: u32 = 0b11 << 11;
+const IDR3_HOST_FEATURES_MASK: u32 = IDR3_RIL | IDR3_BBM_MASK;
 const IDR5_MODEL_FEATURES: u32 = 0;
 
 // CR0 fields
@@ -372,6 +384,8 @@ pub struct Smmuv3Interrupts {
 pub struct Smmuv3State {
     idr0: u32,
     idr1: u32,
+    #[serde(default)]
+    idr3: u32,
     idr5: u32,
     cr0: u32,
     cr0ack: u32,
@@ -399,6 +413,7 @@ pub struct Smmuv3 {
 
     idr0: u32,
     idr1: u32,
+    idr3: u32,
     idr5: u32,
 
     cr0: u32,
@@ -442,6 +457,7 @@ impl Smmuv3 {
         let state = state.unwrap_or(Smmuv3State {
             idr0: IDR0_MODEL_FEATURES,
             idr1: IDR1_MODEL_FEATURES,
+            idr3: 0,
             idr5: IDR5_MODEL_FEATURES,
             ..Default::default()
         });
@@ -450,6 +466,7 @@ impl Smmuv3 {
             id,
             idr0: state.idr0,
             idr1: state.idr1,
+            idr3: state.idr3,
             idr5: state.idr5,
             cr0: state.cr0,
             cr0ack: state.cr0ack,
@@ -484,6 +501,7 @@ impl Smmuv3 {
         Smmuv3State {
             idr0: self.idr0,
             idr1: self.idr1,
+            idr3: self.idr3,
             idr5: self.idr5,
             cr0: self.cr0,
             cr0ack: self.cr0ack,
@@ -523,7 +541,7 @@ impl Smmuv3 {
     }
 
     fn set_host_id_regs(&mut self, idr: &[u32; 6], ats_supported: bool) -> Result<(), Error> {
-        let (h0, h1, h5) = (idr[0], idr[1], idr[5]);
+        let (h0, h1, h3, h5) = (idr[0], idr[1], idr[3], idr[5]);
 
         self.idr0 = IDR0_MODEL_FEATURES | (h0 & IDR0_HOST_FEATURES_MASK);
         if ats_supported {
@@ -532,12 +550,14 @@ impl Smmuv3 {
 
         self.idr1 = IDR1_MODEL_FEATURES | (h1 & IDR1_SSIDSIZE_MASK);
 
+        self.idr3 = h3 & IDR3_HOST_FEATURES_MASK;
+
         let oas = IDR5_OAS_48BIT.min(h5 & IDR5_OAS_MASK);
         let granules = h5 & IDR5_GRAN_MASK;
         if granules == 0 {
             return Err(Error::MissingHostGranules);
         }
-        self.idr5 = oas | granules;
+        self.idr5 = oas | granules | (h5 & IDR5_VAX_MASK);
 
         Ok(())
     }
@@ -550,7 +570,8 @@ impl Smmuv3 {
         let value = match offset {
             IDR0 => self.idr0 as u64,
             IDR1 => self.idr1 as u64,
-            IDR2 | IDR3 | IDR4 => 0,
+            IDR3 => self.idr3 as u64,
+            IDR2 | IDR4 => 0,
             IDR5 => self.idr5 as u64,
             IIDR => 0,
             // SMMUv3.0
@@ -1515,6 +1536,35 @@ mod tests {
         backend.idr.lock().unwrap()[1] = 0;
         smmuv3.initialize().unwrap();
         assert_eq!(smmuv3.idr1 & IDR1_SSIDSIZE_MASK, 0);
+    }
+
+    #[test]
+    fn test_set_host_id_regs_mirrors_the_sva_gate_bits() {
+        // RIL, BBM level 2, FWB, and 52-bit VA on the host.
+        let mut idr = [0u32; 6];
+        idr[3] = IDR3_RIL | (2 << 11) | (1 << 8);
+        idr[5] = IDR5_OAS_48BIT | IDR5_GRAN4K | (1 << 10);
+        let backend = HostInfoBackend::new(idr, false);
+        let mut smmuv3 = smmuv3_with_host_info(&backend);
+
+        smmuv3.initialize().unwrap();
+
+        assert_eq!(smmuv3.idr3, IDR3_RIL | (2 << 11), "RIL and BBM, never FWB");
+        assert_eq!(smmuv3.idr5 & IDR5_VAX_MASK, 1 << 10);
+        assert_eq!(smmuv3.read_reg(IDR3, 4).unwrap(), u64::from(smmuv3.idr3));
+    }
+
+    #[test]
+    fn test_set_host_id_regs_without_the_sva_gate_bits() {
+        let mut idr = [0u32; 6];
+        idr[5] = IDR5_GRAN4K;
+        let backend = HostInfoBackend::new(idr, false);
+        let mut smmuv3 = smmuv3_with_host_info(&backend);
+
+        smmuv3.initialize().unwrap();
+
+        assert_eq!(smmuv3.idr3, 0);
+        assert_eq!(smmuv3.idr5 & IDR5_VAX_MASK, 0);
     }
 
     #[test]
