@@ -40,6 +40,7 @@ sev_snp = [
   "igvm",
   "virtio-devices/sev_snp",
 ]
+smmuv3-accel = ["devices/smmuv3-accel", "kvm"]
 tdx = ["arch/tdx", "hypervisor/tdx"]
 tracing = ["tracer/tracing"]
 

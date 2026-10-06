@@ -53,6 +53,8 @@ fw_cfg = ["arch/fw_cfg", "bitfield-struct", "linux-loader", "zerocopy"]
 ivshmem = []
 kvm = ["arch/kvm"]
 pvmemcontrol = ["dep:num_enum"]
+# NVIDIA Tegra241 CMDQV beside the emulated SMMUv3 (aarch64).
+smmuv3-accel = []
 
 [lints]
 workspace = true
