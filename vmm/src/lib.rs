@@ -397,6 +397,8 @@ pub fn feature_list() -> Vec<String> {
         "mshv".to_string(),
         #[cfg(feature = "sev_snp")]
         "sev_snp".to_string(),
+        #[cfg(feature = "smmuv3-accel")]
+        "smmuv3-accel".to_string(),
         #[cfg(feature = "tdx")]
         "tdx".to_string(),
         #[cfg(feature = "tracing")]

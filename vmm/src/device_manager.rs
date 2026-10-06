@@ -83,6 +83,8 @@ use devices::pvmemcontrol::{self, PvmemcontrolBusDevice, PvmemcontrolPciDevice};
 use devices::smmuv3::{SMMU_V3_MMIO_SIZE, Smmuv3Interrupts};
 #[cfg(not(target_arch = "riscv64"))]
 use devices::tpm;
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+use devices::vsmmuv3::Tegra241Cmdqv;
 use devices::{AcpiNotificationFlags, acpi, interrupt_controller, legacy, pvpanic};
 use event_monitor::event;
 use hypervisor::IoEventAddress;
@@ -142,6 +144,8 @@ use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+use crate::acpi::iort_smmu_node_ids;
 use crate::console_devices::{ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
@@ -155,6 +159,8 @@ use crate::sev::SevSnpSharedPageTracker;
 use crate::util::flatten_error_chain_to_string;
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+use crate::vm_config::MemoryConfig;
 use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, IommuType, NetConfig,
@@ -414,6 +420,52 @@ pub enum DeviceManagerError {
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Shared-IOAS workaround: cannot attach {0} to its host SMMU's HWPT")]
     SharedIoasWorkaroundAttach(String, #[source] vfio_ioctls::VfioError),
+
+    /// The host CMDQV device's hw-info query itself failed
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error("Failed to query the host Tegra241 CMDQV hardware info")]
+    Smmuv3CmdqvHwInfo(#[source] iommufd_ioctls::IommufdError),
+
+    /// The host CMDQV hw-info does not match what this device model
+    /// implements (design §6: wrong type/version/log2vcmdqs/
+    /// log2vsids)
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error("Host Tegra241 CMDQV hardware is not compatible with this device model")]
+    Smmuv3CmdqvHwInfoIncompatible,
+
+    /// The host stopped reporting the Tegra241 CMDQV an earlier query on
+    /// the same device found
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error("The host no longer reports the Tegra241 CMDQV it reported for this device")]
+    Smmuv3CmdqvHwInfoAbsent,
+
+    /// The hw-info check passed (the host reports Tegra241 CMDQV-
+    /// compatible hardware), but the vIOMMU has no VINTF page0
+    /// mapping coordinates to back it with. Distinct from
+    /// `Smmuv3CmdqvHwInfoIncompatible`: the hardware itself is fine,
+    /// but the vIOMMU was allocated without the CMDQV type - e.g. the
+    /// kernel's `/sys/bus/acpi` NVDA200C scan failed - so there is
+    /// nothing to mmap.
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error(
+        "Host Tegra241 CMDQV hardware is compatible, but its vIOMMU has no VINTF page0 mapping \
+         (allocated without the CMDQV type - e.g. the kernel's NVDA200C ACPI scan failed)"
+    )]
+    Smmuv3CmdqvVintfPageMissing,
+
+    /// The host CMDQV VINTF page0 is not the one 64 KiB page size this
+    /// device model assumes for both the mmap and the two guest-
+    /// physical memslot aliases (design §3: a 64 KiB-aligned mapping
+    /// satisfies both 4 KiB- and 64 KiB-page hosts, but only at this
+    /// exact size).
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error("Host Tegra241 CMDQV VINTF page0 size {0:#x} is not the expected 64 KiB")]
+    Smmuv3CmdqvVintfPageSize(u64),
+
+    /// Failed to mmap the host CMDQV VINTF page0
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[error("Failed to mmap the host Tegra241 CMDQV VINTF page0")]
+    Smmuv3CmdqvMmap(#[source] io::Error),
 
     /// Failed to find the physical IOMMU of a passthrough device
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -1077,6 +1129,147 @@ fn host_physical_pasid_enabled(sysfs_dev: &Path) -> io::Result<Option<(u8, bool)
     Ok(parse_pasid_cap_width(&config).zip(parse_pasid_cap_enabled(&config)))
 }
 
+/// What the host SMMU behind a device says about a Tegra241 CMDQV.
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+enum HostCmdqv {
+    /// A CMDQV this device model can drive.
+    Compatible,
+    /// A CMDQV of a version or shape this device model does not implement.
+    Incompatible,
+    /// No CMDQV: the typed query came back as a plain SMMUv3, which is
+    /// how a kernel that ignores the requested type answers.
+    Absent,
+}
+
+/// Ask the host, through the device's iommufd `dev_id`, about the
+/// Tegra241 CMDQV behind it. A host SMMU without one fails the typed
+/// GET_HW_INFO with EOPNOTSUPP, which is an answer (`Absent`); any other
+/// failure is not, and is returned.
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+fn probe_host_cmdqv(
+    iommufd: &IommuFd,
+    dev_id: u32,
+) -> result::Result<HostCmdqv, iommufd_ioctls::IommufdError> {
+    use iommufd_bindings::{
+        iommu_hw_info, iommu_hw_info__bindgen_ty_1, iommu_hw_info_tegra241_cmdqv,
+        iommu_hw_info_type_IOMMU_HW_INFO_TYPE_TEGRA241_CMDQV,
+        iommufd_hw_info_flags_IOMMU_HW_INFO_FLAG_INPUT_TYPE,
+    };
+
+    let mut data = iommu_hw_info_tegra241_cmdqv::default();
+    let mut hw_info = iommu_hw_info {
+        size: size_of::<iommu_hw_info>() as u32,
+        flags: iommufd_hw_info_flags_IOMMU_HW_INFO_FLAG_INPUT_TYPE,
+        dev_id,
+        data_len: size_of::<iommu_hw_info_tegra241_cmdqv>() as u32,
+        data_uptr: &mut data as *mut iommu_hw_info_tegra241_cmdqv as u64,
+        __bindgen_anon_1: iommu_hw_info__bindgen_ty_1 {
+            in_data_type: iommu_hw_info_type_IOMMU_HW_INFO_TYPE_TEGRA241_CMDQV,
+        },
+        ..Default::default()
+    };
+    match iommufd.get_hw_info(&mut hw_info) {
+        Ok(()) => {}
+        Err(e) if cmdqv_query_says_absent(&e) => return Ok(HostCmdqv::Absent),
+        Err(e) => return Err(e),
+    }
+    // SAFETY: the union holds one __u32 under either name.
+    let out_data_type = unsafe { hw_info.__bindgen_anon_1.out_data_type };
+    Ok(
+        if out_data_type != iommu_hw_info_type_IOMMU_HW_INFO_TYPE_TEGRA241_CMDQV {
+            HostCmdqv::Absent
+        } else if data.version != 1 || data.log2vcmdqs != 1 || data.log2vsids != 4 {
+            HostCmdqv::Incompatible
+        } else {
+            HostCmdqv::Compatible
+        },
+    )
+}
+
+/// Whether a failed Tegra241 CMDQV query says only that the host SMMU has
+/// none: the kernel fails a typed GET_HW_INFO for a type the SMMU does not
+/// implement with EOPNOTSUPP.
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+fn cmdqv_query_says_absent(e: &iommufd_ioctls::IommufdError) -> bool {
+    use iommufd_ioctls::IommufdError;
+
+    matches!(e, IommufdError::IommuGetHwInfo(e) if e.errno() == libc::EOPNOTSUPP)
+}
+
+/// The largest run of guest RAM that is guaranteed host-physically
+/// contiguous, used to bound the advertised SMMUv3 command-queue size
+/// when CMDQV is on (a VCMDQ's memory must be physically contiguous).
+///
+/// The smallest granule across guest RAM wins, because the guest kernel
+/// chooses where its queue lands. `hugepages` without an explicit
+/// `hugepage_size` cannot be verified from here and therefore yields the
+/// host page, disabling the relaxation rather than guessing.
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+fn cmdqs_backing_granule(memory: &MemoryConfig, host_page: u64) -> u64 {
+    let zone_granule = |hugepages: bool, size: Option<u64>| -> u64 {
+        match (hugepages, size) {
+            (true, Some(sz)) if sz >= host_page => sz,
+            _ => host_page,
+        }
+    };
+    match memory.zones.as_ref() {
+        Some(zones) if !zones.is_empty() => zones
+            .iter()
+            .map(|z| zone_granule(z.hugepages, z.hugepage_size))
+            .min()
+            .unwrap_or(host_page),
+        _ => zone_granule(memory.hugepages, memory.hugepage_size),
+    }
+}
+
+/// ACPI DSDT node for a live Tegra241 CMDQV instance (design §5).
+///
+/// `_UID` is load-bearing, not just diagnostic: the guest driver
+/// matches the CMDQV to its SMMU by `_UID` string == the SMMUv3 IORT
+/// node's `Identifier` == `IortNodeCommon.node_id` == the SMMUv3
+/// instance index (cross-referenced at the IORT SMMUv3 node in
+/// acpi.rs). `base`/`len` are the CMDQV's decoded MMIO span (not the
+/// wider, mostly-reserved per-instance stride); `irq` its SPI, which
+/// the guest treats as optional in v1 (no vEVENTQ wiring yet).
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+struct Tegra241CmdqvAcpiDevice {
+    instance_id: u32,
+    /// The IORT node identifier of the owning SMMUv3, which Linux matches
+    /// against `_UID` to pair the two (`acpi_smmu_dsdt_probe_tegra241_cmdqv()`).
+    uid: u32,
+    base: u64,
+    len: u64,
+    irq: u32,
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+impl Aml for Tegra241CmdqvAcpiDevice {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        aml::Device::new(
+            format!("_SB_.CV{:02X}", self.instance_id).as_str().into(),
+            vec![
+                &aml::Name::new("_HID".into(), &"NVDA200C"),
+                &aml::Name::new("_UID".into(), &self.uid),
+                &aml::Name::new("_CCA".into(), &aml::ONE),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::AddressSpace::new_memory(
+                            aml::AddressSpaceCacheable::Cacheable,
+                            true,
+                            self.base,
+                            self.base + self.len - 1,
+                            None,
+                        ),
+                        &aml::Interrupt::new(true, true, false, false, self.irq),
+                    ]),
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
 pub struct DeviceManager {
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
@@ -1176,6 +1369,11 @@ pub struct DeviceManager {
     // asking the configuration then would give the other answer.
     #[cfg(target_arch = "aarch64")]
     gic_placement: layout::GicV3Placement,
+
+    // Tegra241 CMDQVs, keyed like `smmuv3s` by the physical SMMUv3 their
+    // emulated SMMUv3 sits on, for those whose host SMMU has one.
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    cmdqv_devices: BTreeMap<String, Arc<Mutex<Tegra241Cmdqv>>>,
 
     /// WORKAROUND (shared IOAS across host SMMUs): the paging HWPT allocated
     /// on the shared IOAS for each host SMMU instance, keyed by the SMMU's
@@ -1533,6 +1731,8 @@ impl DeviceManager {
             smmuv3s: BTreeMap::new(),
             #[cfg(target_arch = "aarch64")]
             gic_placement,
+            #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+            cmdqv_devices: BTreeMap::new(),
             #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
             shared_ioas_hwpts: HashMap::new(),
             #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -4151,6 +4351,133 @@ impl DeviceManager {
         Ok((vfio_device, device_path))
     }
 
+    /// Pair the emulated SMMUv3 `smmuv3_id` (instance `index`) with a
+    /// Tegra241 CMDQV backed by its CMDQV vIOMMU: cap the SMMUv3's CMDQS by
+    /// the guest memory's backing granule, place the CMDQV in its window,
+    /// map the host VINTF page0 and alias it into the guest as the VCMDQ
+    /// page0s, so the guest's doorbell writes reach the host directly.
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    fn add_cmdqv(
+        &mut self,
+        key: &str,
+        smmuv3_id: &str,
+        index: u32,
+        smmu: &Smmuv3Iommufd,
+        viommu: &Arc<IommufdVIommu>,
+    ) -> DeviceManagerResult<()> {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        use iommufd_ioctls::IommufdViommuData;
+        use pci::mmap::MmapRegion;
+
+        // A VCMDQ's memory must be physically contiguous, so the guest must
+        // not size a command queue beyond what the backing granule
+        // guarantees: CMDQS is a log2 count of 16-byte entries, hence
+        // log2(granule) - 4. The smallest granule across guest RAM wins,
+        // because the guest kernel chooses where its queue lands.
+        // SAFETY: sysconf(_SC_PAGESIZE) has no side effects.
+        let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let granule = cmdqs_backing_granule(&self.config.lock().unwrap().memory, host_page);
+        smmu.device()
+            .lock()
+            .unwrap()
+            .clamp_cmdqs(granule.trailing_zeros().saturating_sub(4));
+
+        const VINTF_PAGE_LEN: u64 = 0x1_0000;
+        let IommufdViommuData::Tegra241Cmdqv {
+            mmap_offset: pgoff,
+            mmap_length: pgsz,
+        } = viommu.data()
+        else {
+            return Err(DeviceManagerError::Smmuv3CmdqvVintfPageMissing);
+        };
+        if pgsz != VINTF_PAGE_LEN {
+            return Err(DeviceManagerError::Smmuv3CmdqvVintfPageSize(pgsz));
+        }
+        // SAFETY: the vIOMMU holds the iommufd open for as long as it lives,
+        // which outlives this mmap() call.
+        let fd = unsafe { BorrowedFd::borrow_raw(viommu.iommufd().as_raw_fd()) };
+        let mapping = MmapRegion::mmap(VINTF_PAGE_LEN, PROT_READ | PROT_WRITE, fd, pgoff, 0)
+            .map_err(DeviceManagerError::Smmuv3CmdqvMmap)?;
+
+        // The guest driver treats the SPI as optional; nothing asserts it
+        // yet, but it keeps the DSDT node stable for a vEVENTQ follow-up.
+        let irq = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()?;
+        let base = layout::smmuv3_cmdqv_instance_addr(index).0;
+        let id = format!("{smmuv3_id}_cmdqv");
+        let cmdqv = Arc::new(Mutex::new(Tegra241Cmdqv::new(
+            id.clone(),
+            index,
+            irq,
+            self.memory_manager.lock().unwrap().guest_memory(),
+        )));
+        cmdqv.lock().unwrap().set_queue_size_cap(granule);
+
+        // Two memslots alias the host VINTF page0 into the guest: the native
+        // VCMDQ page0 (+0x10000) and its VI_VCMDQ alias (+0x30000, the one a
+        // guest in VINTF mode uses). A failed memslot only costs that alias
+        // its exitless doorbell: the device traps and mirrors into `mapping`
+        // instead, so each is attempted on its own.
+        let mut memslots = Vec::new();
+        for (offset, what) in [(0x1_0000, "VCMDQ"), (0x3_0000, "VI_VCMDQ")] {
+            // SAFETY: `mapping.addr()` points to VINTF_PAGE_LEN bytes of
+            // valid MAP_SHARED memory for the mapping's lifetime, which the
+            // CMDQV holds for as long as the memslot exists.
+            let slot = unsafe {
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .create_userspace_mapping(
+                        base + offset,
+                        VINTF_PAGE_LEN as usize,
+                        mapping.addr(),
+                        false,
+                        false,
+                        false,
+                        hypervisor::MemoryVisibility::Shared,
+                    )
+            };
+            match slot {
+                Ok(slot) => memslots.push(slot),
+                Err(e) => warn!(
+                    "Tegra241 CMDQV {id}: no {what} page0 memslot ({e:?}); that alias \
+                     traps instead of ringing the host directly"
+                ),
+            }
+        }
+        {
+            let mut cmdqv = cmdqv.lock().unwrap();
+            cmdqv.set_vintf_page(mapping);
+            cmdqv.set_viommu(Arc::clone(viommu));
+            cmdqv.set_memslots(memslots);
+            cmdqv.set_enabled(true);
+        }
+
+        self.bus_devices
+            .push(Arc::clone(&cmdqv) as Arc<dyn BusDeviceSync>);
+        self.address_manager
+            .mmio_bus
+            .insert(
+                Arc::clone(&cmdqv) as Arc<dyn BusDeviceSync>,
+                base,
+                layout::SMMUV3_CMDQV_SPAN_SIZE,
+            )
+            .map_err(DeviceManagerError::BusError)?;
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, cmdqv));
+        self.cmdqv_devices.insert(key.to_string(), cmdqv);
+        info!("Tegra241 CMDQV {id}: hardware-backed at {base:#x}, IRQ {irq}");
+
+        Ok(())
+    }
+
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     fn add_smmuv3(
         &mut self,
@@ -4161,12 +4488,33 @@ impl DeviceManager {
         let vfio_iommufd = (Arc::clone(vfio_ops) as Arc<dyn Any + Send + Sync>)
             .downcast::<VfioIommufd>()
             .map_err(|_| DeviceManagerError::ExpectedIommufdBackend)?;
+        // A host SMMU with a Tegra241 CMDQV this device model can drive gets
+        // a CMDQV vIOMMU, which is decided at allocation.
+        #[cfg(feature = "smmuv3-accel")]
+        let cmdqv = match probe_host_cmdqv(vfio_iommufd.iommufd(), dev_id)
+            .map_err(DeviceManagerError::Smmuv3CmdqvHwInfo)?
+        {
+            HostCmdqv::Compatible => true,
+            HostCmdqv::Incompatible => {
+                warn!(
+                    "SMMUv3: host SMMU {key} has a Tegra241 CMDQV this device model does not \
+                     implement; its emulated SMMUv3 gets none"
+                );
+                false
+            }
+            HostCmdqv::Absent => {
+                info!("SMMUv3: host SMMU {key} has no Tegra241 CMDQV");
+                false
+            }
+        };
+        #[cfg(not(feature = "smmuv3-accel"))]
+        let cmdqv = false;
         let viommu = Arc::new(
             IommufdVIommu::new(
                 Arc::clone(vfio_iommufd.iommufd()),
                 vfio_iommufd.ioas_id(),
                 dev_id,
-                false,
+                cmdqv,
             )
             .map_err(DeviceManagerError::IommufdCreate)?,
         );
@@ -4242,11 +4590,16 @@ impl DeviceManager {
             guest_memory,
             interrupts,
             acpi_info,
-            viommu,
+            Arc::clone(&viommu),
             dev_id,
         )
         .map_err(DeviceManagerError::Smmuv3)?;
         let smmuv3_device = Arc::clone(smmu.device());
+
+        #[cfg(feature = "smmuv3-accel")]
+        if cmdqv {
+            self.add_cmdqv(key, &smmuv3_id, index as u32, &smmu, &viommu)?;
+        }
 
         self.bus_devices
             .push(Arc::clone(&smmuv3_device) as Arc<dyn BusDeviceSync>);
@@ -6686,6 +7039,30 @@ impl Aml for DeviceManager {
             TpmDevice {}.to_aml_bytes(sink);
         }
 
+        // A CMDQV's `_UID` is its SMMUv3's IORT node identifier. Both maps
+        // are keyed by host SMMU, so `smmuv3s` order is the IORT order.
+        #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+        {
+            let uids = iort_smmu_node_ids(&self.smmuv3_acpi_infos());
+            for (position, key) in self.smmuv3s.keys().enumerate() {
+                let Some(cmdqv) = self.cmdqv_devices.get(key) else {
+                    continue;
+                };
+                let cmdqv = cmdqv.lock().unwrap();
+                if !cmdqv.is_enabled() {
+                    continue;
+                }
+                Tegra241CmdqvAcpiDevice {
+                    instance_id: cmdqv.instance_id(),
+                    uid: uids[position],
+                    base: layout::smmuv3_cmdqv_instance_addr(cmdqv.instance_id()).0,
+                    len: layout::SMMUV3_CMDQV_SPAN_SIZE,
+                    irq: cmdqv.irq(),
+                }
+                .to_aml_bytes(sink);
+            }
+        }
+
         self.ged_notification_device
             .as_ref()
             .unwrap()
@@ -6964,6 +7341,12 @@ impl Drop for DeviceManager {
         // whose stage-2 parent holds the shared IOAS. Release them now, with
         // every cdev still open: the fields that close the cdevs and destroy
         // the IOAS drop before `smmuv3s` and the device tree would.
+        // A CMDQV holds hardware queues on its SMMUv3's vIOMMU and a
+        // handle to it: release those first.
+        #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+        for cmdqv in self.cmdqv_devices.values() {
+            cmdqv.lock().unwrap().release_accel();
+        }
         #[cfg(target_arch = "aarch64")]
         for smmuv3 in self.smmuv3s.values_mut() {
             smmuv3.teardown();
@@ -6987,6 +7370,108 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[test]
+    fn test_tegra241_cmdqv_acpi_device_bytes() {
+        // instance_id 127 is the worst case for the `CV{:02X}` device
+        // name: the largest value that still fits the 4-byte ACPI
+        // namestring segment ("CV" + 2 hex digits).
+        let dev = Tegra241CmdqvAcpiDevice {
+            instance_id: 127,
+            uid: 5,
+            base: 0x0a00_0000,
+            len: 0x5_0000,
+            irq: 200,
+        };
+        let mut bytes = Vec::new();
+        dev.to_aml_bytes(&mut bytes);
+
+        // Device path: "\_SB_.CV7F" (dual name prefix + "_SB_" + "CV7F").
+        assert!(
+            bytes.windows(4).any(|w| w == b"CV7F"),
+            "device name CV7F not found"
+        );
+
+        // _HID "NVDA200C".
+        assert!(
+            bytes.windows(8).any(|w| w == b"NVDA200C"),
+            "_HID NVDA200C not found"
+        );
+
+        // _UID: the IORT node identifier, not the instance number: a
+        // Byte-encoded 5 (BYTEPREFIX 0x0A, then 0x05) right after the
+        // "_UID" name.
+        let uid_name = bytes
+            .windows(4)
+            .position(|w| w == b"_UID")
+            .expect("_UID name not found");
+        assert_eq!(
+            &bytes[uid_name + 4..uid_name + 6],
+            &[0x0a, 0x05],
+            "_UID must encode the IORT identifier 5 as a Byte"
+        );
+
+        // _CRS: exactly one QWord address space descriptor (0x8A),
+        // covering [base, base + len).
+        let qword_desc = 0x8au8;
+        assert_eq!(
+            bytes.iter().filter(|&&b| b == qword_desc).count(),
+            1,
+            "expected exactly one QWord address space descriptor"
+        );
+        let marker = bytes.iter().position(|&b| b == qword_desc).unwrap();
+        let read_u64 =
+            |off: usize| -> u64 { u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) };
+        // marker(1) + length(2) + type(1) + generic_flags(1) +
+        // type_flags(1) = 6 bytes of header, then granularity(8),
+        // min(8), max(8), translation(8), length(8).
+        let field_base = marker + 6;
+        assert_eq!(read_u64(field_base), 0, "granularity must be 0");
+        assert_eq!(read_u64(field_base + 8), dev.base, "min must be base");
+        assert_eq!(
+            read_u64(field_base + 16),
+            dev.base + dev.len - 1,
+            "max must be base + len - 1"
+        );
+        assert_eq!(read_u64(field_base + 24), 0, "translation must be 0");
+        assert_eq!(read_u64(field_base + 32), dev.len, "length must be len");
+
+        // _CRS: exactly one extended IRQ descriptor (0x89), naming a
+        // consumer, edge-triggered, active-high, exclusive interrupt
+        // (flags 0x03) at the given SPI.
+        let irq_desc = 0x89u8;
+        assert_eq!(
+            bytes.iter().filter(|&&b| b == irq_desc).count(),
+            1,
+            "expected exactly one extended IRQ descriptor"
+        );
+        let marker = bytes.iter().position(|&b| b == irq_desc).unwrap();
+        assert_eq!(
+            bytes[marker + 3],
+            0x03,
+            "expected consumer|edge-triggered, not active-low, not shared"
+        );
+        assert_eq!(bytes[marker + 4], 1, "expected a single interrupt number");
+        let irq = u32::from_le_bytes(bytes[marker + 5..marker + 9].try_into().unwrap());
+        assert_eq!(irq, dev.irq);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "smmuv3-accel"))]
+    #[test]
+    fn test_cmdqv_query_says_absent() {
+        use iommufd_ioctls::IommufdError;
+        use vmm_sys_util::errno::Error as SysError;
+
+        // EOPNOTSUPP is the kernel's "this SMMU has no CMDQV"; anything
+        // else (a denied ioctl, a malformed request, a kernel without
+        // typed queries) is a failure to find out, not an answer.
+        let hw_info = |errno| IommufdError::IommuGetHwInfo(SysError::new(errno));
+        assert!(cmdqv_query_says_absent(&hw_info(libc::EOPNOTSUPP)));
+        for errno in [libc::EPERM, libc::EINVAL, libc::ENOTTY, libc::EFAULT] {
+            assert!(!cmdqv_query_says_absent(&hw_info(errno)), "errno {errno}");
+        }
+    }
 
     /// A 4096-byte config space whose chain reaches a PASID capability
     /// at 0x140 with width 14 and the given Control register.
@@ -7179,5 +7664,77 @@ mod tests {
             res[1].lock().unwrap().end(),
             vm_memory::GuestAddress(0x3fffff)
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", feature = "smmuv3-accel"))]
+mod cmdqs_granule_tests {
+    use super::cmdqs_backing_granule;
+    use crate::vm_config::{MemoryConfig, MemoryZoneConfig};
+
+    const PAGE: u64 = 0x1_0000; // 64 KiB, the GH200/GB300 host page
+
+    fn mem(hugepages: bool, hugepage_size: Option<u64>) -> MemoryConfig {
+        MemoryConfig {
+            hugepages,
+            hugepage_size,
+            ..Default::default()
+        }
+    }
+
+    fn zone(id: &str, hugepages: bool, hugepage_size: Option<u64>) -> MemoryZoneConfig {
+        MemoryZoneConfig {
+            id: id.to_string(),
+            size: 1 << 30,
+            hugepages,
+            hugepage_size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_memory_is_bounded_by_the_host_page() {
+        assert_eq!(cmdqs_backing_granule(&mem(false, None), PAGE), PAGE);
+    }
+
+    #[test]
+    fn hugepages_without_a_size_do_not_relax() {
+        // The size cannot be verified from here, so guessing it would risk
+        // advertising a queue the kernel must reject.
+        assert_eq!(cmdqs_backing_granule(&mem(true, None), PAGE), PAGE);
+    }
+
+    #[test]
+    fn an_explicit_hugepage_size_relaxes_the_bound() {
+        let g = cmdqs_backing_granule(&mem(true, Some(512 << 20)), PAGE);
+        assert_eq!(g, 512 << 20);
+        // log2(512 MiB) - 4 = 25, against 12 for a 64 KiB page: the
+        // difference between 2^12 and 2^25 command entries.
+        assert_eq!(g.trailing_zeros() - 4, 25);
+        assert_eq!(PAGE.trailing_zeros() - 4, 12);
+    }
+
+    #[test]
+    fn the_smallest_zone_granule_wins() {
+        // The guest kernel picks where its queue lands, so one un-hugepaged
+        // zone has to bound the whole guest.
+        let mut m = mem(false, None);
+        m.zones = Some(vec![
+            zone("mem0", true, Some(512 << 20)),
+            zone("mem1", false, None),
+        ]);
+        assert_eq!(cmdqs_backing_granule(&m, PAGE), PAGE);
+
+        let mut m2 = mem(false, None);
+        m2.zones = Some(vec![
+            zone("mem0", true, Some(512 << 20)),
+            zone("mem1", true, Some(2 << 20)),
+        ]);
+        assert_eq!(cmdqs_backing_granule(&m2, PAGE), 2 << 20);
+    }
+
+    #[test]
+    fn a_hugepage_smaller_than_the_host_page_never_shrinks_the_bound() {
+        assert_eq!(cmdqs_backing_granule(&mem(true, Some(4096)), PAGE), PAGE);
     }
 }

@@ -1101,6 +1101,24 @@ fn create_iort_table_impl(segment_ids: &[u16], smmus: &[Smmuv3AcpiInfo]) -> Sdt 
     iort
 }
 
+/// The node identifier the IORT generator gives each SMMUv3 in `smmus`, in
+/// order: the ITS group node is 0, then each SMMUv3 node is followed by its
+/// RMR node when it has attached devices. A Tegra241 CMDQV's DSDT `_UID`
+/// must equal its SMMUv3's identifier: Linux pairs them that way
+/// (`acpi_smmu_dsdt_probe_tegra241_cmdqv()`).
+#[cfg(all(target_arch = "aarch64", any(test, feature = "smmuv3-accel")))]
+pub(crate) fn iort_smmu_node_ids(smmus: &[Smmuv3AcpiInfo]) -> Vec<u32> {
+    let mut next_id = 1;
+    smmus
+        .iter()
+        .map(|smmu| {
+            let id = next_id;
+            next_id += 1 + u32::from(!smmu.attached_bdfs.is_empty());
+            id
+        })
+        .collect()
+}
+
 fn create_viot_table(iommu_bdf: &PciBdf, devices_bdf: &[PciBdf]) -> Sdt {
     // VIOT
     let mut viot = Sdt::new(*b"VIOT", 36, 0, *b"CLOUDH", *b"CHVIOT  ", 0);
@@ -1756,6 +1774,35 @@ mod iort_tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), nodes.len(), "node identifiers are unique");
+    }
+
+    #[test]
+    fn test_iort_smmu_node_ids_match_the_generator() {
+        // The CMDQV _UID pairing depends on this helper agreeing with the
+        // identifiers the generator actually emits, RMR nodes included.
+        let a = PciBdf::new(0, 0, 4, 0);
+        let b = PciBdf::new(1, 0, 0, 0);
+        let smmus = [
+            smmu(0xe00_0000, &[a], false),
+            smmu(0xe02_0000, &[], false),
+            smmu(0xe04_0000, &[b], false),
+        ];
+        let table = create_iort_table_impl(&[0, 1], &smmus);
+        let emitted: Vec<u32> = parse_nodes(table.as_slice())
+            .iter()
+            .filter(|n| n.type_ == NODE_SMMU_V3)
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(iort_smmu_node_ids(&smmus), emitted);
+        assert_eq!(emitted, [1, 3, 4]);
+        let mut ids: Vec<u32> = parse_nodes(table.as_slice()).iter().map(|n| n.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            parse_nodes(table.as_slice()).len(),
+            "identifiers are unique"
+        );
     }
 
     #[test]

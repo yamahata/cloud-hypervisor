@@ -141,6 +141,9 @@ mod iommufd {
     pub(super) const IOMMU_VIOMMU_ALLOC: u64 = 0x3b90;
     pub(super) const IOMMU_VDEVICE_ALLOC: u64 = 0x3b91;
     pub(super) const IOMMU_VEVENTQ_ALLOC: u64 = 0x3b93;
+    // Tegra241 CMDQV hardware queue allocation: issued from the vCPU
+    // thread on a VCMDQ BASE write (an MMIO exit), and from the VMM
+    // thread at teardown.
     pub(super) const IOMMU_HW_QUEUE_ALLOC: u64 = 0x3b94;
     // File-backed BAR mapping: issued from the VMM thread at device setup
     // and from the vCPU thread when a guest un-revokes the dma-buf by
@@ -889,6 +892,7 @@ fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendE
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HW_QUEUE_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
         and![Cond::new(
             1,

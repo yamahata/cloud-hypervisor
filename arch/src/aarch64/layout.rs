@@ -197,6 +197,23 @@ pub const fn smmuv3_instance_addr(instance: u32) -> GuestAddress {
     GuestAddress(SMMUV3_REGION_START.0 + (instance as u64 * SMMUV3_INSTANCE_SIZE))
 }
 
+/// Tegra241 CMDQV region, one optional CMDQV per SMMUv3 instance: a 64 MiB
+/// window at 0x0A00_0000 ~ 0x0E00_0000 (between the PCIe I/O window and the
+/// SMMUv3 region), at a 512 KiB stride. Each instance decodes
+/// `SMMUV3_CMDQV_SPAN_SIZE` (320 KiB: the CONFIG, VINTF and VCMDQ registers
+/// and both VCMDQ page aliases, see `devices::vsmmuv3::cmdqv`); the rest of
+/// the stride is reserved.
+pub const SMMUV3_CMDQV_REGION_START: GuestAddress = GuestAddress(0x0A00_0000);
+pub const SMMUV3_CMDQV_REGION_SIZE: u64 = 0x400_0000; // 64 MiB
+pub const SMMUV3_CMDQV_INSTANCE_SIZE: u64 = 0x8_0000; // 512 KiB per instance
+pub const SMMUV3_CMDQV_SPAN_SIZE: u64 = 0x5_0000; // 320 KiB decoded
+
+/// The MMIO base of CMDQV instance N.
+#[inline]
+pub const fn smmuv3_cmdqv_instance_addr(instance: u32) -> GuestAddress {
+    GuestAddress(SMMUV3_CMDQV_REGION_START.0 + (instance as u64 * SMMUV3_CMDQV_INSTANCE_SIZE))
+}
+
 const _: () = assert!(
     SMMUV3_REGION_START.0 + SMMUV3_REGION_SIZE <= MEM_32BIT_DEVICES_START.0,
     "SMMU region must not overlap with PCI MMIO space"
@@ -204,6 +221,30 @@ const _: () = assert!(
 const _: () = assert!(
     SMMUV3_INSTANCE_SIZE * SMMUV3_MAX_INSTANCES as u64 <= SMMUV3_REGION_SIZE,
     "SMMU instances must fit within the SMMU region"
+);
+const _: () = assert!(
+    MEM_PCI_IO_START.0 + MEM_PCI_IO_SIZE <= SMMUV3_CMDQV_REGION_START.0,
+    "CMDQV region must not overlap with the PCIe I/O window"
+);
+const _: () = assert!(
+    SMMUV3_CMDQV_REGION_START.0 + SMMUV3_CMDQV_REGION_SIZE <= SMMUV3_REGION_START.0,
+    "CMDQV region must not overlap with the SMMUv3 region"
+);
+const _: () = assert!(
+    SMMUV3_CMDQV_SPAN_SIZE <= SMMUV3_CMDQV_INSTANCE_SIZE,
+    "CMDQV decoded span must fit within its instance stride"
+);
+const _: () = assert!(
+    SMMUV3_CMDQV_INSTANCE_SIZE * SMMUV3_MAX_INSTANCES as u64 <= SMMUV3_CMDQV_REGION_SIZE,
+    "CMDQV instances must fit within the CMDQV region"
+);
+// The VCMDQ page aliases at +0x10000 and +0x30000 become KVM memslots,
+// which need 64 KiB alignment on a 64 KiB-page host; both the stride and
+// the region start must be multiples of 64 KiB for that to hold.
+const _: () = assert!(
+    SMMUV3_CMDQV_INSTANCE_SIZE.is_multiple_of(0x1_0000)
+        && SMMUV3_CMDQV_REGION_START.0.is_multiple_of(0x1_0000),
+    "CMDQV instances must be 64 KiB-aligned"
 );
 
 /// Starting from 0x1000_0000 (256MiB) to 0x3000_0000 (768MiB) is used for PCIE MMIO
