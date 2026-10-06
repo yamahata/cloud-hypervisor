@@ -35,6 +35,30 @@ use crate::smmuv3::{Error as Smmuv3Error, EventRecord, IDR0_COHACC, Smmuv3, Smmu
 
 const VEVENTQ_DEPTH: u32 = 64;
 
+// The STE fields the kernel lets userspace set for a nested stage 1
+// (STRTAB_STE_{0,1}_NESTING_ALLOWED, arm-smmu-v3.h). It refuses an STE
+// with any other bit set (EIO), and a Linux guest does set others: SHCFG
+// whenever S1DSS is bypass, as for a PASID endpoint whose default domain
+// is identity. The kernel derives the rest from its own stage 2.
+//   word 0: V [0], Config [3:1], S1Fmt [5:4], S1ContextPtr [51:6],
+//           S1CDMax [63:59]
+//   word 1: S1DSS [1:0], S1CIR [3:2], S1COR [5:4], S1CSH [7:6],
+//           S1STALLD [27], EATS [29:28]
+#[cfg(target_arch = "aarch64")]
+const STE0_NESTING_ALLOWED: u64 = 0xf80f_ffff_ffff_ffff;
+#[cfg(target_arch = "aarch64")]
+const STE1_NESTING_ALLOWED: u64 = 0x0000_0000_3800_00ff;
+
+/// The two STE words the kernel takes for a nested stage 1, cut down to
+/// the fields it accepts.
+#[cfg(target_arch = "aarch64")]
+fn nested_ste(words: &[u64; 8]) -> [u64; 2] {
+    [
+        words[0] & STE0_NESTING_ALLOWED,
+        words[1] & STE1_NESTING_ALLOWED,
+    ]
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Failed to query host IOMMU information")]
@@ -209,7 +233,7 @@ impl PhysicalIommu for IommufdIommu {
         let hwpt_data = match entry {
             #[cfg(target_arch = "aarch64")]
             TableEntry::Smmuv3Ste(words) => IommufdHwptData::Smmuv3(iommu_hwpt_arm_smmuv3 {
-                ste: [words[0], words[1]],
+                ste: nested_ste(&words),
             }),
         };
 
@@ -441,5 +465,47 @@ impl Drop for FaultForwarder {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    /// Bits [hi:lo] set, as the kernel's GENMASK_ULL.
+    fn genmask(hi: u32, lo: u32) -> u64 {
+        (u64::MAX >> (63 - hi)) & (u64::MAX << lo)
+    }
+
+    #[test]
+    fn test_nested_ste_mask_matches_the_kernel() {
+        let ste0 = 1 | genmask(3, 1) | genmask(5, 4) | genmask(51, 6) | genmask(63, 59);
+        let ste1 = genmask(1, 0)
+            | genmask(3, 2)
+            | genmask(5, 4)
+            | genmask(7, 6)
+            | (1 << 27)
+            | genmask(29, 28);
+        assert_eq!(STE0_NESTING_ALLOWED, ste0);
+        assert_eq!(STE1_NESTING_ALLOWED, ste1);
+    }
+
+    #[test]
+    fn test_nested_ste_drops_fields_the_kernel_refuses() {
+        // SHCFG [45:44] = incoming, as Linux writes with S1DSS bypass;
+        // STRW [31:30] and the word 2-7 stage-2 fields are the kernel's.
+        let shcfg_incoming = 1 << 44;
+        let strw = 0b10 << 30;
+        let words = [
+            u64::MAX,
+            0b01 | (1 << 28) | shcfg_incoming | strw,
+            u64::MAX,
+            u64::MAX,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(nested_ste(&words), [STE0_NESTING_ALLOWED, 0b01 | (1 << 28)]);
     }
 }
