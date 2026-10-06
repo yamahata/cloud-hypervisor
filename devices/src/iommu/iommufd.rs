@@ -20,7 +20,7 @@ use iommufd_ioctls::{
     IommufdVDevice, IommufdVEvent, IommufdVEventData, IommufdVEventQ, IommufdVIommu,
     IommufdViommuData,
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use pci::{PasidCap, PciBdf};
 use thiserror::Error;
 use vm_memory::bitmap::AtomicBitmap;
@@ -79,6 +79,8 @@ pub enum Error {
     CreateEventFd(#[source] io::Error),
     #[error("Failed to spawn fault forwarder thread")]
     SpawnFaultForwarder(#[source] io::Error),
+    #[error("The vIOMMU was torn down")]
+    TornDown,
     #[error("Failed to initialize the emulated SMMUv3 from host information")]
     DeviceInit(#[source] Smmuv3Error),
 }
@@ -271,7 +273,8 @@ fn install_s1(
 
 /// Iommufd backend of an emulated IOMMU.
 pub struct IommufdIommu {
-    viommu: Arc<IommufdVIommu>,
+    /// `None` once `teardown()` has released it.
+    viommu: Mutex<Option<Arc<IommufdVIommu>>>,
     hw_info_data: IommufdHwInfoData,
     ats_supported: bool,
     endpoints: Mutex<BTreeMap<u32, Endpoint>>,
@@ -282,7 +285,7 @@ impl IommufdIommu {
         let (hw_info, hw_info_data) = Self::query_hw_info(&viommu, dev_id)?;
 
         Ok(Self {
-            viommu,
+            viommu: Mutex::new(Some(viommu)),
             hw_info_data,
             ats_supported: hw_info.out_capabilities
                 & u64::from(iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_ATS_NOT_SUPPORTED)
@@ -291,8 +294,12 @@ impl IommufdIommu {
         })
     }
 
+    fn viommu(&self) -> Result<Arc<IommufdVIommu>, Error> {
+        self.viommu.lock().unwrap().clone().ok_or(Error::TornDown)
+    }
+
     pub fn allocate_veventq(&self) -> Result<IommufdVEventQ, Error> {
-        self.viommu
+        self.viommu()?
             .allocate_veventq(VEVENTQ_DEPTH)
             .map_err(Error::AllocateVeventq)
     }
@@ -304,9 +311,10 @@ impl IommufdIommu {
         device: Arc<dyn AttachHwpt>,
         dev_id: u32,
     ) -> Result<(), Error> {
-        let vdevice = IommufdVDevice::new(Arc::clone(&self.viommu), dev_id, u64::from(virt_id))
+        let viommu = self.viommu()?;
+        let vdevice = IommufdVDevice::new(Arc::clone(&viommu), dev_id, u64::from(virt_id))
             .map_err(Error::CreateVdevice)?;
-        self.viommu
+        viommu
             .attach_bypass(&*device)
             .map_err(Error::AttachBypass)?;
 
@@ -325,7 +333,8 @@ impl IommufdIommu {
     }
 
     pub fn pasid_cap(&self, dev_id: u32) -> Result<Option<PasidCap>, Error> {
-        let (hw_info, _) = Self::query_hw_info(&self.viommu, dev_id)?;
+        let viommu = self.viommu()?;
+        let (hw_info, _) = Self::query_hw_info(&viommu, dev_id)?;
         Ok((hw_info.out_max_pasid_log2 != 0).then(|| {
             PasidCap::new(
                 hw_info.out_max_pasid_log2,
@@ -366,10 +375,69 @@ impl IommufdIommu {
         Ok((hw_info, hw_info_data))
     }
 
+    /// Release the endpoints and the vIOMMU, in the order iommufd needs,
+    /// while every VFIO cdev is still open: detach each endpoint (detach,
+    /// not park: a park would hold a vIOMMU-owned HWPT), destroy the
+    /// stage-1 HWPTs, drop the vDevices, then drop this backend's vIOMMU
+    /// handle so the vIOMMU and its stage-2 parent go before the shared
+    /// IOAS. Run late, after the cdevs close, the vDevice destroys find a
+    /// tombstone and the IOAS destroy fails with EBUSY.
+    ///
+    /// Idempotent: Drop calls it again as a fallback, and the second call
+    /// finds nothing to do. The success line reports what this function
+    /// released; destroy failures are logged separately, so a gate reads
+    /// both.
+    pub fn teardown(&self) {
+        let mut endpoints = self.endpoints.lock().unwrap();
+        let viommu = self.viommu.lock().unwrap().take();
+        if endpoints.is_empty() && viommu.is_none() {
+            return;
+        }
+        for endpoint in endpoints.values() {
+            if let Err(e) = endpoint.device.detach_hwpt() {
+                error!(
+                    "Failed to detach device {} from the vIOMMU: {e}",
+                    endpoint.bdf
+                );
+            }
+        }
+        let mut s1_ids = Vec::new();
+        for endpoint in endpoints.values_mut() {
+            let Some(id) = endpoint.s1.hwpt_id.take() else {
+                continue;
+            };
+            s1_ids.push(id.to_string());
+            if let Some(viommu) = &viommu
+                && let Err(e) = viommu.iommufd().destroy_iommu_object(id)
+            {
+                error!(
+                    "Failed to destroy S1 HWPT {id} of device {}: {e}",
+                    endpoint.bdf
+                );
+            }
+        }
+        let dev_ids: Vec<String> = endpoints.values().map(|e| e.dev_id.to_string()).collect();
+        endpoints.clear();
+        drop(endpoints);
+        drop(viommu);
+        if dev_ids.is_empty() {
+            return;
+        }
+        info!(
+            "SMMUv3 accel: teardown: detached {} endpoint(s) (iommufd dev {}), released S1 \
+             HWPT [{}], their vDevices and the vIOMMU (destroy failures, if any, are reported \
+             separately)",
+            dev_ids.len(),
+            dev_ids.join(", "),
+            s1_ids.join(", ")
+        );
+    }
+
     /// Forward one raw command; whether the kernel consumed it.
     fn forward_one(&self, cmd: [u64; 2]) -> bool {
         let mut data = IommufdInvalidateData::Smmuv3(iommu_viommu_arm_smmuv3_invalidate { cmd });
-        matches!(self.viommu.invalidate(&mut data), Ok(true))
+        self.viommu()
+            .is_ok_and(|viommu| matches!(viommu.invalidate(&mut data), Ok(true)))
     }
 
     /// Recover from an invalidation the host did not apply. The kernel's
@@ -399,21 +467,22 @@ impl IommufdIommu {
     /// destroy its stage-1. The park comes first: an HWPT cannot be
     /// destroyed while a device is attached to it.
     fn uninstall_s1(&self, device_id: u32, abort: bool) -> Result<(), IommuError> {
+        let viommu = self.viommu()?;
         let mut endpoints = self.endpoints.lock().unwrap();
         let Some(endpoint) = endpoints.get_mut(&device_id) else {
             return Ok(());
         };
         if abort {
-            self.viommu.attach_abort(&*endpoint.device)
+            viommu.attach_abort(&*endpoint.device)
         } else {
-            self.viommu.attach_bypass(&*endpoint.device)
+            viommu.attach_bypass(&*endpoint.device)
         }
         .map_err(Error::UninstallStage1)?;
         endpoint.s1.eats = false;
         endpoint.s1.ste = None;
 
         if let Some(id) = endpoint.s1.hwpt_id {
-            match self.viommu.iommufd().destroy_iommu_object(id) {
+            match viommu.iommufd().destroy_iommu_object(id) {
                 Ok(()) => {
                     endpoint.s1.hwpt_id = None;
                     // Counted by the hardware gates as "uninstall done".
@@ -436,27 +505,7 @@ impl IommufdIommu {
 
 impl Drop for IommufdIommu {
     fn drop(&mut self) {
-        let endpoints = self.endpoints.get_mut().unwrap();
-        for endpoint in endpoints.values() {
-            if let Err(e) = endpoint.device.detach_hwpt() {
-                error!(
-                    "Failed to detach device {} from the vIOMMU: {e}",
-                    endpoint.bdf
-                );
-            }
-        }
-        // The stage-1 HWPTs are this backend's, not the vDevices': destroy
-        // them now that nothing is attached to them.
-        for endpoint in endpoints.values_mut() {
-            if let Some(id) = endpoint.s1.hwpt_id.take()
-                && let Err(e) = self.viommu.iommufd().destroy_iommu_object(id)
-            {
-                error!(
-                    "Failed to destroy S1 HWPT {id} of device {}: {e}",
-                    endpoint.bdf
-                );
-            }
-        }
+        self.teardown();
     }
 }
 
@@ -477,6 +526,7 @@ impl PhysicalIommu for IommufdIommu {
             TableEntry::Smmuv3Ste(words) => nested_ste(&words),
         };
 
+        let viommu = self.viommu()?;
         let mut endpoints = self.endpoints.lock().unwrap();
         let Some(endpoint) = endpoints.get_mut(&device_id) else {
             return Ok(());
@@ -484,7 +534,7 @@ impl PhysicalIommu for IommufdIommu {
         let Endpoint {
             device, dev_id, s1, ..
         } = endpoint;
-        install_s1(&*self.viommu, &**device, device_id, *dev_id, ste, s1)
+        install_s1(&*viommu, &**device, device_id, *dev_id, ste, s1)
             .map_err(|e| Error::InstallNestedStage1(e).into())
     }
 
@@ -503,7 +553,7 @@ impl PhysicalIommu for IommufdIommu {
                 IommufdInvalidateData::Smmuv3(iommu_viommu_arm_smmuv3_invalidate { cmd })
             }
         };
-        match self.viommu.invalidate(&mut data) {
+        match self.viommu()?.invalidate(&mut data) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 warn!("SMMUv3 accel: invalidation forwarded but no entry consumed");
@@ -525,7 +575,8 @@ pub struct Smmuv3Iommufd {
     device: Arc<Mutex<Smmuv3>>,
     backend: Arc<IommufdIommu>,
     acpi_info: Smmuv3AcpiInfo,
-    _fault_forwarder: FaultForwarder,
+    /// `None` once `teardown()` has stopped it.
+    fault_forwarder: Option<FaultForwarder>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -561,8 +612,16 @@ impl Smmuv3Iommufd {
             device,
             backend,
             acpi_info,
-            _fault_forwarder: fault_forwarder,
+            fault_forwarder: Some(fault_forwarder),
         })
+    }
+
+    /// Ordered iommufd teardown, for the device manager to run while every
+    /// VFIO cdev is still open. The vEVENTQ reader goes first: its queue
+    /// holds the vIOMMU. Idempotent.
+    pub fn teardown(&mut self) {
+        self.fault_forwarder = None;
+        self.backend.teardown();
     }
 
     /// Stream ID of a device encoded similarly to the ITS Device ID in the

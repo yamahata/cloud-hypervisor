@@ -6960,6 +6960,15 @@ impl Drop for DeviceManager {
             handle.virtio_device.lock().unwrap().shutdown();
         }
 
+        // The emulated SMMUv3s hold vDevices on the VFIO devices and a vIOMMU
+        // whose stage-2 parent holds the shared IOAS. Release them now, with
+        // every cdev still open: the fields that close the cdevs and destroy
+        // the IOAS drop before `smmuv3s` and the device tree would.
+        #[cfg(target_arch = "aarch64")]
+        for smmuv3 in self.smmuv3s.values_mut() {
+            smmuv3.teardown();
+        }
+
         // WORKAROUND (shared IOAS across host SMMUs): each per-SMMU paging
         // HWPT holds a reference on the shared IOAS, so VfioIommufd::drop
         // cannot destroy the IOAS (EBUSY) while one is alive - and an HWPT
