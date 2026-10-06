@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::result;
 use std::sync::{Arc, Barrier};
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 use vm_device::BusDevice;
@@ -101,7 +101,9 @@ const IDR1_SIDSIZE: u32 = 16;
 const IDR1_SIDSIZE_MASK: u32 = 0x3f;
 const IDR1_SSIDSIZE_SHIFT: u32 = 6;
 const IDR1_SSIDSIZE_MASK: u32 = 0x1f << IDR1_SSIDSIZE_SHIFT;
-const IDR1_CMDQS: u32 = Q_MAX_LOG2SIZE << 21;
+const IDR1_CMDQS_SHIFT: u32 = 21;
+const IDR1_CMDQS_MASK: u32 = 0x1f << IDR1_CMDQS_SHIFT;
+const IDR1_CMDQS: u32 = Q_MAX_LOG2SIZE << IDR1_CMDQS_SHIFT;
 const IDR1_EVENTQS: u32 = Q_MAX_LOG2SIZE << 16;
 // Emulation model supported features
 //   SIDSIZE: StreamIDs are 16 bits.
@@ -560,6 +562,21 @@ impl Smmuv3 {
         self.idr5 = oas | granules | (h5 & IDR5_VAX_MASK);
 
         Ok(())
+    }
+
+    /// Cap the advertised command queue size, IDR1.CMDQS (a log2 count
+    /// of 16-byte entries), at `max_log2`. A Tegra241 CMDQV's VCMDQs are
+    /// sized from it, and their memory must be physically contiguous, so
+    /// the caller derives the cap from the guest memory's backing granule:
+    /// log2(granule) - 4. Not QEMU behaviour: QEMU applies no cap. Call it
+    /// after `initialize()`, which sets IDR1.
+    pub fn clamp_cmdqs(&mut self, max_log2: u32) {
+        let cur = (self.idr1 & IDR1_CMDQS_MASK) >> IDR1_CMDQS_SHIFT;
+        let new = cur.min(max_log2 & (IDR1_CMDQS_MASK >> IDR1_CMDQS_SHIFT));
+        if new != cur {
+            self.idr1 = (self.idr1 & !IDR1_CMDQS_MASK) | (new << IDR1_CMDQS_SHIFT);
+            info!("SMMUv3 {}: CMDQS clamped {cur} -> {new} for CMDQV", self.id);
+        }
     }
 
     fn read_reg(&self, offset: u64, len: usize) -> Result<u64, Error> {
@@ -1536,6 +1553,21 @@ mod tests {
         backend.idr.lock().unwrap()[1] = 0;
         smmuv3.initialize().unwrap();
         assert_eq!(smmuv3.idr1 & IDR1_SSIDSIZE_MASK, 0);
+    }
+
+    #[test]
+    fn test_clamp_cmdqs_only_lowers_the_command_queue_size() {
+        let mut smmuv3 = test_smmuv3();
+        let others = smmuv3.idr1 & !IDR1_CMDQS_MASK;
+
+        // A 64 KiB granule: 2^16 bytes of 16-byte entries.
+        smmuv3.clamp_cmdqs(12);
+        assert_eq!((smmuv3.idr1 & IDR1_CMDQS_MASK) >> IDR1_CMDQS_SHIFT, 12);
+        assert_eq!(smmuv3.idr1 & !IDR1_CMDQS_MASK, others);
+
+        // Never raised again.
+        smmuv3.clamp_cmdqs(Q_MAX_LOG2SIZE);
+        assert_eq!((smmuv3.idr1 & IDR1_CMDQS_MASK) >> IDR1_CMDQS_SHIFT, 12);
     }
 
     #[test]
