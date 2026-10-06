@@ -712,6 +712,14 @@ fn vmm_thread_rules(
         (libc::SYS_ftruncate, vec![]),
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_faccessat, vec![]),
+        // glibc >= 2.33 resolves access()/faccessat() to faccessat2 whenever
+        // the kernel provides it (Linux >= 5.8), falling back to the older
+        // calls only if it returns ENOSYS. Neither arch gate above covers
+        // that: aarch64 has no access() syscall at all, so a path-existence
+        // check on the VFIO cdev nodes traps with SIGSYS under the default
+        // policy and takes down every iommufd guest. Not arch-gated - the
+        // same glibc preference applies on x86_64.
+        (libc::SYS_faccessat2, vec![]),
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_newfstatat, vec![]),
         (libc::SYS_futex, vec![]),
