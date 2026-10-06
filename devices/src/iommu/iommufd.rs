@@ -145,6 +145,18 @@ fn ste_eats(ste: &[u64; 2]) -> bool {
     ((ste[1] >> 28) & 0b11) != 0
 }
 
+/// A full stage-1 TLB invalidation: CMD_TLBI_NH_ALL (opcode 0x10), every
+/// other field zero; the kernel inserts the VMID.
+const CMD_TLBI_NH_ALL: [u64; 2] = [0x10, 0];
+
+/// A whole-ATC invalidation of one stream: CMD_ATC_INV (opcode 0x40) with the
+/// virtual StreamID in word 0 bits [63:32] (the kernel rewrites it to the
+/// physical one), SSV clear for every substream, and Size 52 in word 1
+/// bits [5:0], the architected invalidate-all span (Linux ATC_INV_SIZE_ALL).
+fn cmd_atc_inv_all(sid: u32) -> [u64; 2] {
+    [0x40 | (u64::from(sid) << 32), 52]
+}
+
 fn hwpt_name(id: Option<u32>) -> String {
     id.map_or_else(|| "none".to_string(), |id| format!("S1 HWPT {id}"))
 }
@@ -354,6 +366,35 @@ impl IommufdIommu {
         Ok((hw_info, hw_info_data))
     }
 
+    /// Forward one raw command; whether the kernel consumed it.
+    fn forward_one(&self, cmd: [u64; 2]) -> bool {
+        let mut data = IommufdInvalidateData::Smmuv3(iommu_viommu_arm_smmuv3_invalidate { cmd });
+        matches!(self.viommu.invalidate(&mut data), Ok(true))
+    }
+
+    /// Recover from an invalidation the host did not apply. The kernel's
+    /// partial-success protocol (entry_num) over-reports on convert errors,
+    /// counting commands converted but never submitted, so the only safe
+    /// recovery is a full re-invalidate, never a resume. A full stage-1 TLB
+    /// invalidation cannot clear a device's ATC, so every endpoint whose
+    /// stage-1 enabled ATS also gets a whole-ATC invalidation, as the kernel
+    /// guards its own ATC invalidations by ATS being enabled. One attempt
+    /// each, no retry.
+    fn resync(&self) {
+        warn!("SMMUv3 accel: resyncing with TLBI_NH_ALL");
+        if !self.forward_one(CMD_TLBI_NH_ALL) {
+            warn!("SMMUv3 accel: TLBI_NH_ALL resync forward failed; giving up");
+        }
+        if !self.ats_supported {
+            return;
+        }
+        for (&sid, endpoint) in self.endpoints.lock().unwrap().iter() {
+            if endpoint.s1.eats && !self.forward_one(cmd_atc_inv_all(sid)) {
+                warn!("SMMUv3 accel: ATC_INV resync forward for SID {sid:#x} failed; giving up");
+            }
+        }
+    }
+
     /// Move the endpoint to the bypass (`abort == false`) or abort HWPT and
     /// destroy its stage-1. The park comes first: an HWPT cannot be
     /// destroyed while a device is attached to it.
@@ -462,15 +503,19 @@ impl PhysicalIommu for IommufdIommu {
                 IommufdInvalidateData::Smmuv3(iommu_viommu_arm_smmuv3_invalidate { cmd })
             }
         };
-        let applied = self
-            .viommu
-            .invalidate(&mut data)
-            .map_err(Error::Invalidate)?;
-        if !applied {
-            warn!("Invalidation was not applied by the host");
+        match self.viommu.invalidate(&mut data) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                warn!("SMMUv3 accel: invalidation forwarded but no entry consumed");
+                self.resync();
+                Ok(())
+            }
+            Err(e) => {
+                warn!("SMMUv3 accel: invalidation forward failed: {e}");
+                self.resync();
+                Err(Error::Invalidate(e).into())
+            }
         }
-
-        Ok(())
     }
 }
 
@@ -886,6 +931,20 @@ mod tests {
             install_failure_action(true),
             InstallFailureAction::KeepInstalled
         );
+    }
+
+    #[test]
+    fn test_resync_command_encodings() {
+        // Re-derived from arm-smmu-v3.h: CMDQ_OP_TLBI_NH_ALL = 0x10,
+        // CMDQ_OP_ATC_INV = 0x40, CMDQ_ATC_0_SID = [63:32],
+        // CMDQ_0_SSV = bit 11, CMDQ_ATC_1_SIZE = [5:0],
+        // ATC_INV_SIZE_ALL = 52.
+        assert_eq!(CMD_TLBI_NH_ALL, [0x10, 0]);
+        let cmd = cmd_atc_inv_all(0x0123);
+        assert_eq!(cmd[0] & 0xff, 0x40);
+        assert_eq!(cmd[0] >> 32, 0x0123);
+        assert_eq!(cmd[0] & (1 << 11), 0, "SSV clear: every substream");
+        assert_eq!(cmd[1] & 0x3f, 52);
     }
 
     #[test]
