@@ -4433,7 +4433,12 @@ impl DeviceManager {
             Arc::clone(&self.msi_interrupt_manager)
                 as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
             legacy_interrupt_group,
-            device_cfg.pci_common.iommu.attached(),
+            // Behind the virtio-iommu: its IOVA space is the guest's to
+            // manage, so the device's BARs are not mapped into the IOAS for
+            // peer-to-peer DMA. A device behind the SMMUv3 keeps that map,
+            // which is its stage-2: without it, no other device can DMA
+            // into its BARs.
+            device_cfg.pci_common.iommu == IommuType::Virtio,
             vfio_p2p_dma,
             pci_device_bdf,
             memory_slot_allocator,
