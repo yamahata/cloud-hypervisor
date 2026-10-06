@@ -377,6 +377,18 @@ pub enum DeviceManagerError {
     #[error("The VFIO device has no iommufd device id")]
     IommufdDevIdMissing,
 
+    /// The StreamID scheme (256 * segment + RID, the same value as the ITS
+    /// DeviceID) only identifies a device while its bus is 0: the RID
+    /// already puts the bus in the bits the segment would need. Every CH
+    /// bus is 0 today (`pci/src/bus.rs` refuses others), so this is a
+    /// tripwire against a bridge silently aliasing another device.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error(
+        "Device {0} on a non-zero PCI bus cannot sit behind the SMMUv3: its StreamID \
+         would alias another device's"
+    )]
+    Smmuv3NonZeroBus(PciBdf),
+
     /// Failed to find the physical IOMMU of a passthrough device
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Failed to find the physical IOMMU of a passthrough device")]
@@ -4192,6 +4204,10 @@ impl DeviceManager {
         device: &Arc<VfioDevice>,
         bdf: PciBdf,
     ) -> DeviceManagerResult<Option<PasidCap>> {
+        // Before any host-side state (vIOMMU, vDevice) exists.
+        if bdf.bus() != 0 {
+            return Err(DeviceManagerError::Smmuv3NonZeroBus(bdf));
+        }
         let key = Self::find_physical_iommu(device_cfg)?;
         let virt_id = Smmuv3Iommufd::stream_id(bdf);
         let dev_id = device_cfg
