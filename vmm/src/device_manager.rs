@@ -657,9 +657,25 @@ pub(crate) struct AddressManager {
 }
 
 impl AddressManager {
+    /// The PCI segment a device lives in. It selects the MMIO allocators a
+    /// BAR of the device is served from.
+    fn pci_segment_of(&self, pci_dev: &dyn PciDevice) -> result::Result<usize, io::Error> {
+        let id = pci_dev
+            .id()
+            .ok_or_else(|| io::Error::other("PCI device without an id"))?;
+        self.device_tree
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|node| node.pci_bdf)
+            .map(|bdf| usize::from(bdf.segment()))
+            .ok_or_else(|| io::Error::other(format!("No PCI BDF for device {id}")))
+    }
+
     fn allocator_free(
         &self,
-        old_base: u64,
+        segment: usize,
+        base: u64,
         len: u64,
         region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
@@ -668,7 +684,7 @@ impl AddressManager {
                 self.allocator
                     .lock()
                     .unwrap()
-                    .free_io_addresses(GuestAddress(old_base), len as GuestUsize);
+                    .free_io_addresses(GuestAddress(base), len as GuestUsize);
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
                 let allocators = if region_type == PciBarRegionType::Memory32BitRegion {
@@ -676,17 +692,10 @@ impl AddressManager {
                 } else {
                     &self.pci_mmio64_allocators
                 };
-
-                // Find the specific allocator that this BAR was allocated from.
-                for allocator in allocators {
-                    let mut allocator = allocator.lock().unwrap();
-
-                    if old_base >= allocator.base().0 && old_base <= allocator.end().0 {
-                        allocator.free(GuestAddress(old_base), len as GuestUsize);
-
-                        break;
-                    }
-                }
+                allocators[segment]
+                    .lock()
+                    .unwrap()
+                    .free(GuestAddress(base), len as GuestUsize);
             }
         }
 
@@ -695,8 +704,8 @@ impl AddressManager {
 
     fn allocator_allocate(
         &self,
-        old_base: u64,
-        new_base: u64,
+        segment: usize,
+        base: u64,
         len: u64,
         region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
@@ -705,9 +714,9 @@ impl AddressManager {
                 self.allocator
                     .lock()
                     .unwrap()
-                    .allocate_io_addresses(Some(GuestAddress(new_base)), len as GuestUsize, None)
+                    .allocate_io_addresses(Some(GuestAddress(base)), len as GuestUsize, None)
                     .ok_or_else(|| {
-                        io::Error::other(format!("failed allocating new IO range: 0x{new_base:x}"))
+                        io::Error::other(format!("failed allocating new IO range: 0x{base:x}"))
                     })?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
@@ -716,23 +725,17 @@ impl AddressManager {
                 } else {
                     &self.pci_mmio64_allocators
                 };
-
-                for allocator in allocators {
-                    let mut allocator = allocator.lock().unwrap();
-
-                    if old_base >= allocator.base().0 && old_base <= allocator.end().0 {
-                        // allocator checks if the requested area is within the region.
-                        allocator
-                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
-                            .ok_or_else(|| {
-                                io::Error::other(format!(
-                                    "failed allocating new MMIO range: 0x{new_base:x}(0x{len:x})"
-                                ))
-                            })?;
-
-                        break;
-                    }
-                }
+                // The allocator rejects a range outside its window: a BAR
+                // cannot be moved out of its device's PCI segment.
+                allocators[segment]
+                    .lock()
+                    .unwrap()
+                    .allocate(Some(GuestAddress(base)), len as GuestUsize, Some(len))
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "failed allocating new MMIO range: 0x{base:x}(0x{len:x})"
+                        ))
+                    })?;
             }
         }
 
@@ -750,11 +753,12 @@ impl DeviceRelocation for AddressManager {
         pci_dev: &mut dyn PciDevice,
         region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
+        let segment = self.pci_segment_of(pci_dev)?;
         // Free the old range first so allocate(new_base) sees it as available.
-        self.allocator_free(old_base, len, region_type)?;
-        if let Err(e) = self.allocator_allocate(old_base, new_base, len, region_type) {
+        self.allocator_free(segment, old_base, len, region_type)?;
+        if let Err(e) = self.allocator_allocate(segment, new_base, len, region_type) {
             if self
-                .allocator_allocate(old_base, old_base, len, region_type)
+                .allocator_allocate(segment, old_base, len, region_type)
                 .is_err()
             {
                 error!("Failed to restore old range 0x{old_base:x} after rejected BAR move");
