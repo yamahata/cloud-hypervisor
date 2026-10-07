@@ -11,12 +11,12 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::error;
+use log::{error, warn};
 use thiserror::Error;
 use vm_device::{BusDevice, BusDeviceSync};
 
 use crate::configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType};
-use crate::device::{BarRelocation, DeviceRelocation, PciDevice};
+use crate::device::{BarRelocation, DeviceRelocation, InstallParams, PciDevice};
 
 /// Denotes the PCI device ID of a bus' root bridge device.
 pub const PCI_ROOT_DEVICE_ID: u8 = 0;
@@ -173,6 +173,34 @@ impl PciBus {
         Ok(())
     }
 
+    /// Retry the owed installs of every device but `writer`: a BAR release
+    /// just freed a range one of them may have collided with. Devices are
+    /// visited in slot order so the outcome does not depend on map order.
+    fn retry_pending_installs(&self, writer: u8) {
+        let mut ids: Vec<u8> = self.devices.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            if id == writer {
+                continue;
+            }
+            let d = &self.devices[&id];
+            // The host bridge has no bus handle and no BARs.
+            let Some(bus_device) = d.bus.as_ref() else {
+                continue;
+            };
+            let mut device = d.pci.lock().unwrap();
+            for a in device.pending_bar_installs() {
+                if let Err(e) = install_bar(&*self.device_reloc, device.deref_mut(), bus_device, &a)
+                {
+                    warn!(
+                        "Retrying BAR {} install of device {} at 0x{:x} failed: {}; BAR left unmapped",
+                        a.bar_idx, id, a.new_base, e
+                    );
+                }
+            }
+        }
+    }
+
     pub fn remove_by_device(&mut self, device: &Arc<Mutex<dyn PciDevice>>) -> Result<()> {
         self.devices.retain(|_, dev| !Arc::ptr_eq(&dev.pci, device));
         Ok(())
@@ -321,8 +349,9 @@ impl PciConfigIo {
             return None;
         }
 
+        let device_id = device as u8;
         let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        if let Some(d) = pci_bus.devices.get(&device_id) {
             let mut device = d.pci.lock().unwrap();
 
             // Update the register value
@@ -334,6 +363,13 @@ impl PciConfigIo {
                 d.bus.as_ref(),
                 &reloc,
             );
+            // The writer's lock is released before other devices are
+            // locked: the bus lock already serializes config writes, and
+            // no path locks two devices at once.
+            drop(device);
+            if !reloc.release.is_empty() {
+                pci_bus.retry_pending_installs(device_id);
+            }
 
             ret
         } else {
@@ -437,8 +473,9 @@ impl PciConfigMmio {
             return;
         }
 
+        let device_id = device as u8;
         let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        if let Some(d) = pci_bus.devices.get(&device_id) {
             let mut device = d.pci.lock().unwrap();
 
             // Update the register value
@@ -450,6 +487,13 @@ impl PciConfigMmio {
                 d.bus.as_ref(),
                 &reloc,
             );
+            // The writer's lock is released before other devices are
+            // locked: the bus lock already serializes config writes, and
+            // no path locks two devices at once.
+            drop(device);
+            if !reloc.release.is_empty() {
+                pci_bus.retry_pending_installs(device_id);
+            }
         }
     }
 }
@@ -478,19 +522,25 @@ fn apply_bar_relocation(
             continue;
         };
 
-        match device_reloc.move_bar_commit(device, bus_device, a) {
-            Ok(()) => {
-                device.on_bar_installed(a.bar_idx);
-            }
-            Err(e) => {
-                error!(
-                    "Failed installing BAR {} at 0x{:x}: {}; BAR left unmapped, \
-retried on the next BAR or COMMAND write",
-                    a.bar_idx, a.new_base, e
-                );
-            }
+        if let Err(e) = install_bar(device_reloc, device, bus_device, a) {
+            error!(
+                "Failed installing BAR {} at 0x{:x}: {}; BAR left unmapped, retried on the next BAR or COMMAND write",
+                a.bar_idx, a.new_base, e
+            );
         }
     }
+}
+
+/// Install one BAR; on success the device records the slot as installed.
+fn install_bar(
+    device_reloc: &dyn DeviceRelocation,
+    device: &mut dyn PciDevice,
+    bus_device: &Arc<dyn BusDeviceSync>,
+    a: &InstallParams,
+) -> result::Result<(), io::Error> {
+    device_reloc.move_bar_commit(device, bus_device, a)?;
+    device.on_bar_installed(a.bar_idx);
+    Ok(())
 }
 
 impl BusDevice for PciConfigMmio {

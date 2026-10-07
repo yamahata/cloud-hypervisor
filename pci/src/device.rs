@@ -130,6 +130,13 @@ pub trait PciDevice: Send {
     /// its space is decoded, on this device's next BAR or COMMAND write and
     /// after any other device's BAR release.
     fn on_bar_installed(&mut self, _bar_idx: usize) {}
+    /// The released BARs whose address space is decoded, with their
+    /// config-space targets: installs still owed to the guest. The bus
+    /// retries them after another device releases a BAR, since that is
+    /// what can free the range they collided with.
+    fn pending_bar_installs(&self) -> Vec<InstallParams> {
+        Vec::new()
+    }
     /// Provides a mutable reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the trait.
     fn as_any_mut(&mut self) -> &mut dyn Any;
