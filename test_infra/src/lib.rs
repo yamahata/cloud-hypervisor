@@ -1188,6 +1188,46 @@ impl MetaEvent {
 
 pub const PIPE_SIZE: i32 = 32 << 20;
 
+// Appended to a guest command's output to carry its exit code. A guest
+// command run this way always exits 0, so ssh_command() does not retry it.
+const GUEST_EXIT_CODE_MARKER: &str = "CH_GUEST_EXIT_CODE:";
+
+/// Wraps `command` so that it exits 0 and reports its own exit code on the
+/// last line of its output, merged with its stderr.
+pub fn guest_command_with_exit_code(command: &str) -> String {
+    format!("{{ {command} ; }} 2>&1; echo {GUEST_EXIT_CODE_MARKER}$?")
+}
+
+/// Splits the output of a command wrapped by [`guest_command_with_exit_code`]
+/// into the command's own output and its exit code.
+pub fn split_guest_exit_code(output: &str) -> (&str, Option<i32>) {
+    match output.rfind(GUEST_EXIT_CODE_MARKER) {
+        Some(index) => (
+            &output[..index],
+            output[index + GUEST_EXIT_CODE_MARKER.len()..]
+                .trim()
+                .parse()
+                .ok(),
+        ),
+        None => (output, None),
+    }
+}
+
+/// Lines of nvidia-smi output that report a failed field. nvidia-smi prints
+/// such a field as "Unknown Error" (or "[Unknown Error]" in CSV output) and
+/// still exits 0, so the exit code alone does not show it.
+pub fn nvidia_smi_error_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.contains("Unknown Error"))
+        .collect()
+}
+
+// Fields whose values come from the GPU's PCI Express capability and from the
+// driver; a field nvidia-smi cannot read shows as "[Unknown Error]".
+pub const NVIDIA_SMI_CHECK_QUERY: &str = "index,name,pci.bus_id,pcie.link.gen.current,\
+    pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,memory.total,ecc.mode.current";
+
 pub struct Guest {
     pub tmp_dir: TempDir,
     pub disk_config: Box<dyn DiskConfig>,
@@ -1667,7 +1707,20 @@ impl Guest {
             .unwrap_or_else(|e| format!("failed to run nvidia-smi: {e:?}"));
 
         if output.contains("NVIDIA L40S") {
-            return true;
+            let problems = self.nvidia_smi_problems(&[
+                &format!("nvidia-smi --query-gpu={NVIDIA_SMI_CHECK_QUERY} --format=csv"),
+                "nvidia-smi -q",
+            ]);
+            if problems.is_empty() {
+                return true;
+            }
+
+            eprintln!(
+                "\n\n==== nvidia-smi reports errors ====\n\n{}\n\
+                 \n==== End nvidia-smi errors ====\n\n",
+                problems.join("\n")
+            );
+            return false;
         }
 
         let dmesg = self
@@ -1682,6 +1735,36 @@ impl Guest {
         eprintln!("nvidia-smi diagnostic output: {output}");
 
         false
+    }
+
+    /// Runs each nvidia-smi command in the guest and returns one line per
+    /// problem: a non-zero exit code, or a field reported as "Unknown Error".
+    #[cfg(target_arch = "x86_64")]
+    pub fn nvidia_smi_problems(&self, commands: &[&str]) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        for command in commands {
+            let output = match self.ssh_command(&guest_command_with_exit_code(command)) {
+                Ok(output) => output,
+                Err(e) => {
+                    problems.push(format!("{command}: ssh failed: {e:?}"));
+                    continue;
+                }
+            };
+
+            let (output, exit_code) = split_guest_exit_code(&output);
+            if exit_code != Some(0) {
+                problems.push(format!(
+                    "{command}: exit code {exit_code:?}: {}",
+                    output.lines().next().unwrap_or_default()
+                ));
+            }
+            for line in nvidia_smi_error_lines(output) {
+                problems.push(format!("{command}: {}", line.trim()));
+            }
+        }
+
+        problems
     }
 
     pub fn reboot_linux(&self, current_reboot_count: u32) {
@@ -2873,5 +2956,40 @@ mod tests {
 
         ProcessRegistry::cleanup(name).unwrap();
         assert!(!is_alive(pid2));
+    }
+
+    #[test]
+    fn guest_exit_code_round_trip() {
+        let command = guest_command_with_exit_code("nvidia-smi -q");
+        assert!(command.ends_with("echo CH_GUEST_EXIT_CODE:$?"));
+
+        assert_eq!(
+            split_guest_exit_code("line 1\nline 2\nCH_GUEST_EXIT_CODE:2\n"),
+            ("line 1\nline 2\n", Some(2))
+        );
+        assert_eq!(split_guest_exit_code("CH_GUEST_EXIT_CODE:0"), ("", Some(0)));
+        // No marker: the command never got to report, which is not success.
+        assert_eq!(split_guest_exit_code("no marker"), ("no marker", None));
+    }
+
+    #[test]
+    fn nvidia_smi_errors_are_found_in_csv_and_q_output() {
+        // GB200 behind a VMM that cleared Link Status, then after the fix.
+        let broken_csv = "pci.bus_id, pcie.link.gen.current, pcie.link.width.current\n\
+                          00000008:00:00.0, 1, [Unknown Error]\n";
+        let fixed_csv = "pci.bus_id, pcie.link.gen.current, pcie.link.width.current\n\
+                         00000008:00:00.0, 4, 1\n";
+        let broken_q = "        GPU Link Info\n\
+                        \x20           Link Width\n\
+                        \x20               Max                       : Unknown Error\n\
+                        \x20               Current                   : Unknown Error\n";
+        // N/A and missing permissions are ordinary in a guest; not errors.
+        let ordinary_q = "    Fan Speed                             : N/A\n\
+                          \x20   Power Smoothing                       : Insufficient Permissions\n";
+
+        assert_eq!(nvidia_smi_error_lines(broken_csv).len(), 1);
+        assert!(nvidia_smi_error_lines(fixed_csv).is_empty());
+        assert_eq!(nvidia_smi_error_lines(broken_q).len(), 2);
+        assert!(nvidia_smi_error_lines(ordinary_q).is_empty());
     }
 }
