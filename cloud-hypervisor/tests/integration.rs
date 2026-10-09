@@ -13218,6 +13218,7 @@ mod windows {
 
 #[cfg(target_arch = "x86_64")]
 mod vfio {
+    use std::collections::BTreeSet;
     use std::io;
 
     use crate::*;
@@ -13486,9 +13487,13 @@ mod vfio {
         test_nvidia_card_reboot_common(true);
     }
 
-    // Every nvidia-smi view: none may fail or read "Unknown Error". A field
-    // the VMM presents wrongly in config space shows up here while the
-    // command exits 0.
+    // Fewer properties than this means the sweep did not run, not that the
+    // GPU is healthy (driver 580 lists about 180).
+    const NVIDIA_SMI_MIN_PROPERTIES: usize = 50;
+
+    // Every nvidia-smi view and every --query-gpu property, queried one at a
+    // time: none may fail or read "Unknown Error". A field the VMM presents
+    // wrongly in config space shows up here while the command exits 0.
     fn test_nvidia_card_nvidia_smi_full_common(iommufd: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_VFIO_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -13512,6 +13517,34 @@ mod vfio {
             let mut problems = guest.nvidia_smi_problems(NVIDIA_SMI_VIEWS, true);
             problems.extend(guest.nvidia_smi_problems(NVIDIA_SMI_HARDWARE_VIEWS, false));
             assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+            let sweep = guest.nvidia_smi_sweep().unwrap();
+            let properties = sweep
+                .iter()
+                .map(|p| p.property.as_str())
+                .collect::<BTreeSet<_>>();
+            assert!(
+                properties.len() >= NVIDIA_SMI_MIN_PROPERTIES,
+                "only {} properties swept",
+                properties.len()
+            );
+
+            let errors = sweep
+                .iter()
+                .filter(|p| p.class.is_error())
+                .collect::<Vec<_>>();
+            assert!(errors.is_empty(), "{errors:#?}");
+
+            let not_available = sweep
+                .iter()
+                .filter(|p| !matches!(p.class, NvidiaSmiValue::Value))
+                .map(|p| format!("{}={}", p.property, p.value))
+                .collect::<BTreeSet<_>>();
+            println!(
+                "nvidia-smi: {} properties, {} values, without a value: {not_available:?}",
+                properties.len(),
+                sweep.len()
+            );
         });
 
         let _ = child.kill();
