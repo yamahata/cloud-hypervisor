@@ -1228,6 +1228,43 @@ pub fn nvidia_smi_error_lines(output: &str) -> Vec<&str> {
 pub const NVIDIA_SMI_CHECK_QUERY: &str = "index,name,pci.bus_id,pcie.link.gen.current,\
     pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,memory.total,ecc.mode.current";
 
+// nvidia-smi views that every GPU and driver supports: each must exit 0 and
+// report no field as "Unknown Error".
+pub const NVIDIA_SMI_VIEWS: &[&str] = &[
+    "nvidia-smi --version",
+    "nvidia-smi",
+    "nvidia-smi -L",
+    "nvidia-smi -q",
+    "nvidia-smi -q -x",
+    "nvidia-smi -q -d SUPPORTED_CLOCKS",
+    "nvidia-smi topo -m",
+    "nvidia-smi topo -p2p r",
+    "nvidia-smi topo -p2p w",
+    "nvidia-smi topo -p2p n",
+    "nvidia-smi topo -p2p a",
+    "nvidia-smi topo -p2p p",
+    "nvidia-smi dmon -c 3 -s pucvmet",
+    "nvidia-smi pmon -c 1",
+    "nvidia-smi --query-retired-pages=gpu_uuid,retired_pages.address,retired_pages.cause --format=csv",
+    "nvidia-smi --query-remapped-rows=gpu_uuid,remapped_rows.correctable,\
+     remapped_rows.uncorrectable,remapped_rows.pending,remapped_rows.failure --format=csv",
+    "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv",
+];
+
+// nvidia-smi views of hardware that not every GPU has (NVLink, the Grace C2C
+// link, MIG, confidential computing). Without the hardware, or with an older
+// nvidia-smi, they exit non-zero; they must still report no "Unknown Error".
+pub const NVIDIA_SMI_HARDWARE_VIEWS: &[&str] = &[
+    "nvidia-smi nvlink -s",
+    "nvidia-smi nvlink -c",
+    "nvidia-smi nvlink -e",
+    "nvidia-smi nvlink -R",
+    "nvidia-smi nvlink -p",
+    "nvidia-smi c2c -s",
+    "nvidia-smi mig -lgip",
+    "nvidia-smi conf-compute -grs",
+];
+
 pub struct Guest {
     pub tmp_dir: TempDir,
     pub disk_config: Box<dyn DiskConfig>,
@@ -1707,10 +1744,13 @@ impl Guest {
             .unwrap_or_else(|e| format!("failed to run nvidia-smi: {e:?}"));
 
         if output.contains("NVIDIA L40S") {
-            let problems = self.nvidia_smi_problems(&[
-                &format!("nvidia-smi --query-gpu={NVIDIA_SMI_CHECK_QUERY} --format=csv"),
-                "nvidia-smi -q",
-            ]);
+            let problems = self.nvidia_smi_problems(
+                &[
+                    &format!("nvidia-smi --query-gpu={NVIDIA_SMI_CHECK_QUERY} --format=csv"),
+                    "nvidia-smi -q",
+                ],
+                true,
+            );
             if problems.is_empty() {
                 return true;
             }
@@ -1738,9 +1778,10 @@ impl Guest {
     }
 
     /// Runs each nvidia-smi command in the guest and returns one line per
-    /// problem: a non-zero exit code, or a field reported as "Unknown Error".
+    /// problem: a field reported as "Unknown Error", or, when `require_success`
+    /// is set, a non-zero exit code.
     #[cfg(target_arch = "x86_64")]
-    pub fn nvidia_smi_problems(&self, commands: &[&str]) -> Vec<String> {
+    pub fn nvidia_smi_problems(&self, commands: &[&str], require_success: bool) -> Vec<String> {
         let mut problems = Vec::new();
 
         for command in commands {
@@ -1753,7 +1794,7 @@ impl Guest {
             };
 
             let (output, exit_code) = split_guest_exit_code(&output);
-            if exit_code != Some(0) {
+            if exit_code.is_none() || (require_success && exit_code != Some(0)) {
                 problems.push(format!(
                     "{command}: exit code {exit_code:?}: {}",
                     output.lines().next().unwrap_or_default()

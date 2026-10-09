@@ -13486,6 +13486,58 @@ mod vfio {
         test_nvidia_card_reboot_common(true);
     }
 
+    // Every nvidia-smi view: none may fail or read "Unknown Error". A field
+    // the VMM presents wrongly in config space shows up here while the
+    // command exits 0.
+    fn test_nvidia_card_nvidia_smi_full_common(iommufd: bool) {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_VFIO_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=4G"])
+            .args(["--platform", &platform_cfg(iommufd)])
+            .args(["--firmware", edk2_path().to_str().unwrap()])
+            .args(["--device", format!("path={NVIDIA_VFIO_DEVICE}").as_str()])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(guest.check_nvidia_gpu());
+
+            let mut problems = guest.nvidia_smi_problems(NVIDIA_SMI_VIEWS, true);
+            problems.extend(guest.nvidia_smi_problems(NVIDIA_SMI_HARDWARE_VIEWS, false));
+            assert!(problems.is_empty(), "{}", problems.join("\n"));
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[ignore = "Optional: full nvidia-smi coverage, run with --ignored"]
+    fn test_nvidia_card_nvidia_smi_full() {
+        if !nvidia_vfio_device_ready() {
+            return;
+        }
+        test_nvidia_card_nvidia_smi_full_common(false);
+    }
+
+    #[test]
+    #[ignore = "Optional: full nvidia-smi coverage, run with --ignored"]
+    fn test_iommufd_nvidia_card_nvidia_smi_full() {
+        if !nvidia_vfio_device_ready() {
+            return;
+        }
+        test_nvidia_card_nvidia_smi_full_common(true);
+    }
+
     // Pass the NVIDIA card to the guest via an externally-opened
     // /dev/vfio/devices/<n> FD instead of a sysfs path, and verify it
     // survives a guest reboot. Mirrors `_test_tap_from_fd` for VFIO.
