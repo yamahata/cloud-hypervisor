@@ -1188,6 +1188,157 @@ impl MetaEvent {
 
 pub const PIPE_SIZE: i32 = 32 << 20;
 
+// Appended to a guest command's output to carry its exit code. A guest
+// command run this way always exits 0, so ssh_command() does not retry it.
+const GUEST_EXIT_CODE_MARKER: &str = "CH_GUEST_EXIT_CODE:";
+
+/// Wraps `command` so that it exits 0 and reports its own exit code on the
+/// last line of its output, merged with its stderr.
+pub fn guest_command_with_exit_code(command: &str) -> String {
+    format!("{{ {command} ; }} 2>&1; echo {GUEST_EXIT_CODE_MARKER}$?")
+}
+
+/// Splits the output of a command wrapped by [`guest_command_with_exit_code`]
+/// into the command's own output and its exit code.
+pub fn split_guest_exit_code(output: &str) -> (&str, Option<i32>) {
+    match output.rfind(GUEST_EXIT_CODE_MARKER) {
+        Some(index) => (
+            &output[..index],
+            output[index + GUEST_EXIT_CODE_MARKER.len()..]
+                .trim()
+                .parse()
+                .ok(),
+        ),
+        None => (output, None),
+    }
+}
+
+/// Lines of nvidia-smi output that report a failed field. nvidia-smi prints
+/// such a field as "Unknown Error" (or "[Unknown Error]" in CSV output) and
+/// still exits 0, so the exit code alone does not show it.
+pub fn nvidia_smi_error_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.contains("Unknown Error"))
+        .collect()
+}
+
+// Fields whose values come from the GPU's PCI Express capability and from the
+// driver; a field nvidia-smi cannot read shows as "[Unknown Error]".
+pub const NVIDIA_SMI_CHECK_QUERY: &str = "index,name,pci.bus_id,pcie.link.gen.current,\
+    pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,memory.total,ecc.mode.current";
+
+// nvidia-smi views that every GPU and driver supports: each must exit 0 and
+// report no field as "Unknown Error".
+pub const NVIDIA_SMI_VIEWS: &[&str] = &[
+    "nvidia-smi --version",
+    "nvidia-smi",
+    "nvidia-smi -L",
+    "nvidia-smi -q",
+    "nvidia-smi -q -x",
+    "nvidia-smi -q -d SUPPORTED_CLOCKS",
+    "nvidia-smi topo -m",
+    "nvidia-smi topo -p2p r",
+    "nvidia-smi topo -p2p w",
+    "nvidia-smi topo -p2p n",
+    "nvidia-smi topo -p2p a",
+    "nvidia-smi topo -p2p p",
+    "nvidia-smi dmon -c 3 -s pucvmet",
+    "nvidia-smi pmon -c 1",
+    "nvidia-smi --query-retired-pages=gpu_uuid,retired_pages.address,retired_pages.cause --format=csv",
+    "nvidia-smi --query-remapped-rows=gpu_uuid,remapped_rows.correctable,\
+     remapped_rows.uncorrectable,remapped_rows.pending,remapped_rows.failure --format=csv",
+    "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv",
+];
+
+// nvidia-smi views of hardware that not every GPU has (NVLink, the Grace C2C
+// link, MIG, confidential computing). Without the hardware, or with an older
+// nvidia-smi, they exit non-zero; they must still report no "Unknown Error".
+pub const NVIDIA_SMI_HARDWARE_VIEWS: &[&str] = &[
+    "nvidia-smi nvlink -s",
+    "nvidia-smi nvlink -c",
+    "nvidia-smi nvlink -e",
+    "nvidia-smi nvlink -R",
+    "nvidia-smi nvlink -p",
+    "nvidia-smi c2c -s",
+    "nvidia-smi mig -lgip",
+    "nvidia-smi conf-compute -grs",
+];
+
+// Queries every --query-gpu property on its own, so that one failing
+// property cannot fail a whole batch. Prints one line per property and GPU:
+// "CH_SWEEP <property> <gpu> <value>", or "CH_SWEEP_FAILED <property>
+// <first line of output>" when nvidia-smi rejects the query.
+pub const NVIDIA_SMI_SWEEP: &str = r#"nvidia-smi --help-query-gpu | sed -n 's/^"\([a-z0-9_.]*\)".*/\1/p' | sort -u | while read -r p; do if out=$(nvidia-smi --query-gpu=index,"$p" --format=csv,noheader,nounits 2>&1); then printf '%s\n' "$out" | while IFS=, read -r i v; do printf 'CH_SWEEP\t%s\t%s\t%s\n' "$p" "$i" "$v"; done; else printf 'CH_SWEEP_FAILED\t%s\t%s\n' "$p" "$(printf '%s' "$out" | head -n 1)"; fi; done"#;
+
+/// How nvidia-smi reported one property of one GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaSmiValue {
+    Value,
+    NotAvailable,
+    NotSupported,
+    InsufficientPermissions,
+    UnknownError,
+    Empty,
+    // nvidia-smi rejected the query itself (non-zero exit).
+    QueryFailed,
+}
+
+impl NvidiaSmiValue {
+    pub fn classify(value: &str) -> Self {
+        match value.trim() {
+            "" => Self::Empty,
+            "[N/A]" | "N/A" => Self::NotAvailable,
+            "[Not Supported]" => Self::NotSupported,
+            "[Insufficient Permissions]" => Self::InsufficientPermissions,
+            "[Unknown Error]" => Self::UnknownError,
+            _ => Self::Value,
+        }
+    }
+
+    /// A value that a working GPU never reports.
+    pub fn is_error(self) -> bool {
+        matches!(self, Self::UnknownError | Self::QueryFailed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NvidiaSmiProperty {
+    pub property: String,
+    // nvidia-smi GPU index, or "-" when the query failed.
+    pub gpu: String,
+    pub value: String,
+    pub class: NvidiaSmiValue,
+}
+
+/// Parses the output of [`NVIDIA_SMI_SWEEP`].
+pub fn parse_nvidia_smi_sweep(output: &str) -> Vec<NvidiaSmiProperty> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, '\t');
+            match (fields.next()?, fields.next()?, fields.next()?) {
+                ("CH_SWEEP", property, gpu) => {
+                    let value = fields.next().unwrap_or_default().trim().to_string();
+                    Some(NvidiaSmiProperty {
+                        property: property.to_string(),
+                        gpu: gpu.trim().to_string(),
+                        class: NvidiaSmiValue::classify(&value),
+                        value,
+                    })
+                }
+                ("CH_SWEEP_FAILED", property, message) => Some(NvidiaSmiProperty {
+                    property: property.to_string(),
+                    gpu: "-".to_string(),
+                    value: message.trim().to_string(),
+                    class: NvidiaSmiValue::QueryFailed,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 pub struct Guest {
     pub tmp_dir: TempDir,
     pub disk_config: Box<dyn DiskConfig>,
@@ -1667,7 +1818,23 @@ impl Guest {
             .unwrap_or_else(|e| format!("failed to run nvidia-smi: {e:?}"));
 
         if output.contains("NVIDIA L40S") {
-            return true;
+            let problems = self.nvidia_smi_problems(
+                &[
+                    &format!("nvidia-smi --query-gpu={NVIDIA_SMI_CHECK_QUERY} --format=csv"),
+                    "nvidia-smi -q",
+                ],
+                true,
+            );
+            if problems.is_empty() {
+                return true;
+            }
+
+            eprintln!(
+                "\n\n==== nvidia-smi reports errors ====\n\n{}\n\
+                 \n==== End nvidia-smi errors ====\n\n",
+                problems.join("\n")
+            );
+            return false;
         }
 
         let dmesg = self
@@ -1682,6 +1849,45 @@ impl Guest {
         eprintln!("nvidia-smi diagnostic output: {output}");
 
         false
+    }
+
+    /// Runs each nvidia-smi command in the guest and returns one line per
+    /// problem: a field reported as "Unknown Error", or, when `require_success`
+    /// is set, a non-zero exit code.
+    #[cfg(target_arch = "x86_64")]
+    pub fn nvidia_smi_problems(&self, commands: &[&str], require_success: bool) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        for command in commands {
+            let output = match self.ssh_command(&guest_command_with_exit_code(command)) {
+                Ok(output) => output,
+                Err(e) => {
+                    problems.push(format!("{command}: ssh failed: {e:?}"));
+                    continue;
+                }
+            };
+
+            let (output, exit_code) = split_guest_exit_code(&output);
+            if exit_code.is_none() || (require_success && exit_code != Some(0)) {
+                problems.push(format!(
+                    "{command}: exit code {exit_code:?}: {}",
+                    output.lines().next().unwrap_or_default()
+                ));
+            }
+            for line in nvidia_smi_error_lines(output) {
+                problems.push(format!("{command}: {}", line.trim()));
+            }
+        }
+
+        problems
+    }
+
+    /// Queries every property nvidia-smi lists in --help-query-gpu, one
+    /// property per call, for every GPU in the guest.
+    #[cfg(target_arch = "x86_64")]
+    pub fn nvidia_smi_sweep(&self) -> Result<Vec<NvidiaSmiProperty>, SshCommandError> {
+        let output = self.ssh_command(&guest_command_with_exit_code(NVIDIA_SMI_SWEEP))?;
+        Ok(parse_nvidia_smi_sweep(split_guest_exit_code(&output).0))
     }
 
     pub fn reboot_linux(&self, current_reboot_count: u32) {
@@ -2873,5 +3079,133 @@ mod tests {
 
         ProcessRegistry::cleanup(name).unwrap();
         assert!(!is_alive(pid2));
+    }
+
+    #[test]
+    fn guest_exit_code_round_trip() {
+        let command = guest_command_with_exit_code("nvidia-smi -q");
+        assert!(command.ends_with("echo CH_GUEST_EXIT_CODE:$?"));
+
+        assert_eq!(
+            split_guest_exit_code("line 1\nline 2\nCH_GUEST_EXIT_CODE:2\n"),
+            ("line 1\nline 2\n", Some(2))
+        );
+        assert_eq!(split_guest_exit_code("CH_GUEST_EXIT_CODE:0"), ("", Some(0)));
+        // No marker: the command never got to report, which is not success.
+        assert_eq!(split_guest_exit_code("no marker"), ("no marker", None));
+    }
+
+    #[test]
+    fn nvidia_smi_errors_are_found_in_csv_and_q_output() {
+        // GB200 behind a VMM that cleared Link Status, then after the fix.
+        let broken_csv = "pci.bus_id, pcie.link.gen.current, pcie.link.width.current\n\
+                          00000008:00:00.0, 1, [Unknown Error]\n";
+        let fixed_csv = "pci.bus_id, pcie.link.gen.current, pcie.link.width.current\n\
+                         00000008:00:00.0, 4, 1\n";
+        let broken_q = "        GPU Link Info\n\
+                        \x20           Link Width\n\
+                        \x20               Max                       : Unknown Error\n\
+                        \x20               Current                   : Unknown Error\n";
+        // N/A and missing permissions are ordinary in a guest; not errors.
+        let ordinary_q = "    Fan Speed                             : N/A\n\
+                          \x20   Power Smoothing                       : Insufficient Permissions\n";
+
+        assert_eq!(nvidia_smi_error_lines(broken_csv).len(), 1);
+        assert!(nvidia_smi_error_lines(fixed_csv).is_empty());
+        assert_eq!(nvidia_smi_error_lines(broken_q).len(), 2);
+        assert!(nvidia_smi_error_lines(ordinary_q).is_empty());
+    }
+
+    #[test]
+    fn nvidia_smi_values_are_classified() {
+        assert_eq!(NvidiaSmiValue::classify(" 4"), NvidiaSmiValue::Value);
+        assert_eq!(
+            NvidiaSmiValue::classify("[N/A]"),
+            NvidiaSmiValue::NotAvailable
+        );
+        assert_eq!(
+            NvidiaSmiValue::classify("[Not Supported]"),
+            NvidiaSmiValue::NotSupported
+        );
+        assert_eq!(
+            NvidiaSmiValue::classify("[Insufficient Permissions]"),
+            NvidiaSmiValue::InsufficientPermissions
+        );
+        assert_eq!(
+            NvidiaSmiValue::classify("[Unknown Error]"),
+            NvidiaSmiValue::UnknownError
+        );
+        assert_eq!(NvidiaSmiValue::classify(" "), NvidiaSmiValue::Empty);
+
+        assert!(NvidiaSmiValue::UnknownError.is_error());
+        assert!(NvidiaSmiValue::QueryFailed.is_error());
+        assert!(!NvidiaSmiValue::NotAvailable.is_error());
+        assert!(!NvidiaSmiValue::InsufficientPermissions.is_error());
+    }
+
+    // Runs the sweep script itself against a fake nvidia-smi with two GPUs:
+    // one property with values, one with a comma in its value, one N/A, one
+    // "[Unknown Error]" and one nvidia-smi rejects.
+    #[test]
+    fn nvidia_smi_sweep_script_runs_one_property_per_query() {
+        let dir = TempDir::new_with_prefix("/tmp/ch-nvsmi").unwrap();
+        let fake = dir.as_path().join("nvidia-smi");
+        fs::write(
+            &fake,
+            r#"#!/bin/bash
+if [ "$1" = "--help-query-gpu" ]; then
+    printf '%s\n' 'List of valid properties to query for the switch "--query-gpu=":' \
+        '"pcie.link.gen.current" or "pcie.link.gen.gpucurrent"' 'The current link generation.' \
+        '"pcie.link.width.current"' '"clocks_event_reasons.active"' '"fan.speed"' \
+        '"gone.property"' '"pcie.link.gen.current"'
+    exit 0
+fi
+case "$1" in
+    *pcie.link.gen.current*) printf '0, 4\n1, 4\n' ;;
+    *pcie.link.width.current*) printf '0, [Unknown Error]\n1, 1\n' ;;
+    *clocks_event_reasons.active*) printf '0, 0x1, extra\n1, 0x1\n' ;;
+    *fan.speed*) printf '0, [N/A]\n1, [N/A]\n' ;;
+    *) echo 'Field "gone.property" is not a valid field to query.'; exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code(NVIDIA_SMI_SWEEP))
+            .env(
+                "PATH",
+                format!("{}:{}", dir.as_path().display(), env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        let output = String::from_utf8(output.stdout).unwrap();
+        let (sweep_output, exit_code) = split_guest_exit_code(&output);
+        assert_eq!(exit_code, Some(0), "{output}");
+
+        let rows = parse_nvidia_smi_sweep(sweep_output);
+        let find = |property: &str, gpu: &str| {
+            rows.iter()
+                .find(|r| r.property == property && r.gpu == gpu)
+                .unwrap_or_else(|| panic!("no row for {property} on GPU {gpu}: {rows:#?}"))
+        };
+
+        // Five properties: two GPUs each, except the rejected one. The
+        // duplicate in the help text is queried once.
+        assert_eq!(rows.len(), 9, "{rows:#?}");
+        assert_eq!(find("pcie.link.gen.current", "1").value, "4");
+        assert_eq!(
+            find("pcie.link.width.current", "0").class,
+            NvidiaSmiValue::UnknownError
+        );
+        assert_eq!(find("pcie.link.width.current", "1").value, "1");
+        assert_eq!(find("clocks_event_reasons.active", "0").value, "0x1, extra");
+        assert_eq!(find("fan.speed", "0").class, NvidiaSmiValue::NotAvailable);
+        let failed = find("gone.property", "-");
+        assert_eq!(failed.class, NvidiaSmiValue::QueryFailed);
+        assert!(failed.value.contains("not a valid field"));
+        assert_eq!(rows.iter().filter(|r| r.class.is_error()).count(), 2);
     }
 }
