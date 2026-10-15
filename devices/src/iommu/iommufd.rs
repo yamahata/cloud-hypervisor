@@ -200,14 +200,18 @@ impl PhysicalIommu for IommufdIommu {
         let Some(endpoint) = endpoints.get_mut(&device_id) else {
             return Ok(());
         };
-        endpoint
-            .vdevice
-            .uninstall_s1_hwpt(true)
-            .map_err(Error::UninstallStage1)?;
-        endpoint
-            .vdevice
-            .install_s1_hwpt(&hwpt_data)
-            .map_err(Error::InstallStage1)?;
+        // Replace the stage 1 in place: going through the abort HWPT would
+        // abort the DMA the device issues meanwhile.
+        if let Err(e) = endpoint.vdevice.install_s1_hwpt(&hwpt_data) {
+            // Don't leave the device on the stage 1 the guest replaced.
+            if let Err(e) = endpoint.vdevice.uninstall_s1_hwpt(true) {
+                warn!(
+                    "Failed to attach device {} to the abort HWPT: {e}",
+                    endpoint.bdf
+                );
+            }
+            return Err(Error::InstallStage1(e).into());
+        }
 
         Ok(())
     }

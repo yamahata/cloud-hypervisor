@@ -175,7 +175,7 @@ unreachable_pub = "deny"
 # Temporary: the IOAS and vDevice API changes are not released yet. Drop this
 # once iommufd-ioctls and vfio-ioctls are published with them.
 [patch.crates-io]
-iommufd-bindings = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
-iommufd-ioctls = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
+iommufd-bindings = { git = "https://github.com/yamahata/iommufd", rev = "560f5c906d84ea1e182461ddfe9d22b259b128c7" }
+iommufd-ioctls = { git = "https://github.com/yamahata/iommufd", rev = "560f5c906d84ea1e182461ddfe9d22b259b128c7" }
 vfio-bindings = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }
 vfio-ioctls = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }

@@ -622,12 +622,12 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "iommufd-bindings"
 version = "0.2.0"
-source = "git+https://github.com/sboeuf/iommufd?rev=79232e648b4349476691cf160133379f52dfc387#79232e648b4349476691cf160133379f52dfc387"
+source = "git+https://github.com/yamahata/iommufd?rev=560f5c906d84ea1e182461ddfe9d22b259b128c7#560f5c906d84ea1e182461ddfe9d22b259b128c7"
 
 [[package]]
 name = "iommufd-ioctls"
 version = "0.3.2"
-source = "git+https://github.com/sboeuf/iommufd?rev=79232e648b4349476691cf160133379f52dfc387#79232e648b4349476691cf160133379f52dfc387"
+source = "git+https://github.com/yamahata/iommufd?rev=560f5c906d84ea1e182461ddfe9d22b259b128c7#560f5c906d84ea1e182461ddfe9d22b259b128c7"
 dependencies = [
  "iommufd-bindings",
  "libc",
