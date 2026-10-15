@@ -45,6 +45,13 @@ vmm-sys-util = "0.15.0"
 [workspace]
 members = ["."]
 
+# Temporary: keep in sync with the [patch.crates-io] of the main workspace.
+[patch.crates-io]
+iommufd-bindings = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
+iommufd-ioctls = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
+vfio-bindings = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }
+vfio-ioctls = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }
+
 [[bin]]
 doc = false
 name = "balloon"

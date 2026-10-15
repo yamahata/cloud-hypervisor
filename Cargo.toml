@@ -171,3 +171,11 @@ unnecessary_semicolon = "deny"
 # `level = warn` is irrelevant here but mandatory for rustc/cargo
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
 unreachable_pub = "deny"
+
+# Temporary: the IOAS and vDevice API changes are not released yet. Drop this
+# once iommufd-ioctls and vfio-ioctls are published with them.
+[patch.crates-io]
+iommufd-bindings = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
+iommufd-ioctls = { git = "https://github.com/sboeuf/iommufd", rev = "79232e648b4349476691cf160133379f52dfc387" }
+vfio-bindings = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }
+vfio-ioctls = { git = "https://github.com/sboeuf/vfio", rev = "f566af1dd5e03313e42cb0297552ba36651a8fc3" }

@@ -4152,13 +4152,8 @@ impl DeviceManager {
             .downcast::<VfioIommufd>()
             .map_err(|_| DeviceManagerError::ExpectedIommufdBackend)?;
         let viommu = Arc::new(
-            IommufdVIommu::new(
-                Arc::clone(vfio_iommufd.iommufd()),
-                vfio_iommufd.ioas_id(),
-                dev_id,
-                false,
-            )
-            .map_err(DeviceManagerError::IommufdCreate)?,
+            IommufdVIommu::new(Arc::clone(vfio_iommufd.ioas()), dev_id, false)
+                .map_err(DeviceManagerError::IommufdCreate)?,
         );
 
         let interrupt_manager = self
