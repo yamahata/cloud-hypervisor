@@ -842,6 +842,10 @@ pub enum SshCommandError {
     SendEof(#[source] ssh2::Error),
     #[error("SCP wait EOF failed")]
     WaitEof(#[source] ssh2::Error),
+    #[error("Reading the command's output failed")]
+    Read(#[source] io::Error),
+    #[error("The command did not report its exit code; its output ends with {0:?}")]
+    NoExitCode(String),
 }
 
 #[derive(Error, Debug)]
@@ -990,6 +994,55 @@ pub fn ssh_command_ip_with_auth(
     // Intentionally ignore these results here as their failure
     // does not precipitate a repeat
     let _ = channel.read_to_string(&mut s);
+    let _ = channel.close();
+    let _ = channel.wait_close();
+    let status = channel.exit_status().map_err(SshCommandError::ExitStatus)?;
+    if status != 0 {
+        Err(SshCommandError::NonZeroExitStatus(status))
+    } else {
+        Ok(s)
+    }
+}
+
+/// Runs `command` once: the connection is retried as in
+/// [`ssh_command_ip_with_auth_retry`], the command is not. A blocking SSH
+/// operation idle for `idle_timeout` fails the call.
+fn ssh_command_ip_with_auth_once(
+    command: &str,
+    auth: &PasswordAuth,
+    ip: &str,
+    idle_timeout: Duration,
+) -> Result<String, SshCommandError> {
+    let mut counter = 0;
+    let sess = loop {
+        match ssh_session(auth, ip, Some(idle_timeout)) {
+            Ok(sess) => break sess,
+            Err(e) => {
+                counter += 1;
+                if counter >= DEFAULT_SSH_RETRIES {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_secs((DEFAULT_SSH_TIMEOUT * counter).into()));
+            }
+        }
+    };
+    let mut channel = sess
+        .channel_session()
+        .map_err(SshCommandError::ChannelSession)?;
+    channel.exec(command).map_err(SshCommandError::Command)?;
+    let mut bytes = Vec::new();
+    if let Err(e) = channel.read_to_end(&mut bytes) {
+        let partial = String::from_utf8_lossy(&bytes);
+        let tail = partial.lines().rev().take(20).collect::<Vec<_>>();
+        eprintln!(
+            "\n==== Output of {command:?} before reading it failed ({e}) ====\n{}\n\
+             ==== End ====\n",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
+        return Err(SshCommandError::Read(e));
+    }
+    // A kernel log can hold bytes that are not UTF-8.
+    let s = String::from_utf8_lossy(&bytes).into_owned();
     let _ = channel.close();
     let _ = channel.wait_close();
     let status = channel.exit_status().map_err(SshCommandError::ExitStatus)?;
@@ -1199,6 +1252,34 @@ impl MetaEvent {
 
 pub const PIPE_SIZE: i32 = 32 << 20;
 
+// Appended to a guest command's output to carry its exit code.
+const GUEST_EXIT_CODE_MARKER: &str = "CH_GUEST_EXIT_CODE:";
+
+/// How long a guest command's output may make no progress before the call
+/// fails.
+const GUEST_COMMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Wraps `command` in a subshell that exits 0 and prints the command's exit
+/// code on a marker line after its output, stderr merged in. The subshell
+/// closes on its own line, so a trailing `#` comment cannot eat it.
+pub(crate) fn guest_command_with_exit_code(command: &str) -> String {
+    format!("( {command}\n) 2>&1; echo {GUEST_EXIT_CODE_MARKER}$?")
+}
+
+/// Splits a wrapped command's output into its own output and its exit code.
+pub(crate) fn split_guest_exit_code(output: &str) -> (&str, Option<i32>) {
+    match output.rfind(GUEST_EXIT_CODE_MARKER) {
+        Some(index) => (
+            &output[..index],
+            output[index + GUEST_EXIT_CODE_MARKER.len()..]
+                .trim()
+                .parse()
+                .ok(),
+        ),
+        None => (output, None),
+    }
+}
+
 pub struct Guest {
     pub tmp_dir: TempDir,
     pub disk_config: Box<dyn DiskConfig>,
@@ -1348,6 +1429,33 @@ impl Guest {
             DEFAULT_SSH_RETRIES,
             DEFAULT_SSH_TIMEOUT,
         )
+    }
+
+    /// Runs `command` once and returns its output (stderr merged) and exit
+    /// code. A non-zero exit code is a result, not a reason to retry, and the
+    /// command is never re-run; output idle for five minutes fails the call.
+    pub fn ssh_command_exit_code(&self, command: &str) -> Result<(String, i32), SshCommandError> {
+        self.ssh_command_exit_code_timeout(command, GUEST_COMMAND_IDLE_TIMEOUT)
+    }
+
+    /// [`Guest::ssh_command_exit_code`] for a command that may be silent for
+    /// longer, such as a diagnostic.
+    pub(crate) fn ssh_command_exit_code_timeout(
+        &self,
+        command: &str,
+        idle_timeout: Duration,
+    ) -> Result<(String, i32), SshCommandError> {
+        let output = ssh_command_ip_with_auth_once(
+            &guest_command_with_exit_code(command),
+            &default_guest_auth(),
+            &self.network.guest_ip0,
+            idle_timeout,
+        )?;
+        let (output, exit_code) = split_guest_exit_code(&output);
+        let exit_code = exit_code.ok_or_else(|| {
+            SshCommandError::NoExitCode(output.lines().last().unwrap_or_default().to_string())
+        })?;
+        Ok((output.to_string(), exit_code))
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2866,5 +2974,68 @@ mod tests {
 
         ProcessRegistry::cleanup(name).unwrap();
         assert!(!is_alive(pid2));
+    }
+
+    #[test]
+    fn guest_exit_code_round_trip() {
+        let command = guest_command_with_exit_code("uname -a");
+        assert!(command.ends_with("echo CH_GUEST_EXIT_CODE:$?"));
+
+        assert_eq!(
+            split_guest_exit_code("line 1\nline 2\nCH_GUEST_EXIT_CODE:2\n"),
+            ("line 1\nline 2\n", Some(2))
+        );
+        assert_eq!(split_guest_exit_code("CH_GUEST_EXIT_CODE:0"), ("", Some(0)));
+        assert_eq!(split_guest_exit_code("no marker"), ("no marker", None));
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code(
+                "echo out; echo err >&2; exit 3",
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(split_guest_exit_code(&output), ("out\nerr\n", Some(3)));
+
+        // A non-existing command reports 127 exit code with the shell's message
+        // in the output.
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code("ch-no-such-command"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let (message, exit_code) = split_guest_exit_code(&output);
+        assert_eq!(exit_code, Some(127), "{output}");
+        assert!(message.contains("ch-no-such-command"), "{output}");
+
+        // A command that ends in a comment does not comment the subshell's
+        // closing parenthesis out.
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code("echo commented # the rest"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(split_guest_exit_code(&output), ("commented\n", Some(0)));
+
+        // Output read lossily, as the SSH path reads bytes that are not
+        // UTF-8, splits like any other.
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code("printf 'a\\377b\\n'; exit 5"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            split_guest_exit_code(&output),
+            ("a\u{fffd}b\n", Some(5)),
+            "{output:?}"
+        );
     }
 }
