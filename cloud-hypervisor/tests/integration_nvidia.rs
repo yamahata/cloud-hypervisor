@@ -241,4 +241,169 @@ mod nvidia_gpu {
 
         handle_child_output(r, &output);
     }
+
+    // "dcgmi diag" selectors with the tests that must run and pass: level 2
+    // (software, memory, pcie) and context_create, which is in no level.
+    const DCGM_DIAG_SELECTORS: &[(&str, &[&str])] = &[
+        ("2", DCGM_DIAG_CORE_TESTS),
+        ("context_create", &["context_create"]),
+    ];
+    // A "dcgmi diag" level 2 run takes a few minutes; one still running after
+    // this has hung (seen in nvvs's memory plugin on GH200).
+    const DCGM_DIAG_TIMEOUT_SECS: u32 = 1800;
+    // The level-2 tests that must pass: the ones that exercise what the VMM
+    // presents (the PCIe link, the memory BAR, the driver).
+    const DCGM_DIAG_CORE_TESTS: &[&str] = &["software", "memory", "pcie"];
+
+    // Collects the failures of a sequence of guest checks, so that one run
+    // reports all of them rather than stopping at the first.
+    struct GuestSteps<'a> {
+        guest: &'a Guest,
+        // The GPUs passed through, which every check must see.
+        gpus: usize,
+        failures: Vec<String>,
+    }
+
+    impl GuestSteps<'_> {
+        // Runs `command`, which must exit 0, and returns its output.
+        fn run(&mut self, command: &str) -> String {
+            match self.guest.ssh_command_exit_code(command) {
+                Ok((output, 0)) => output,
+                Ok((output, exit_code)) => {
+                    self.fail(format!("{command}: exit code {exit_code}:\n{output}"));
+                    output
+                }
+                Err(e) => {
+                    self.fail(format!("{command}: {e}"));
+                    String::new()
+                }
+            }
+        }
+
+        fn fail(&mut self, failure: String) {
+            eprintln!("FAILED: {failure}");
+            self.failures.push(failure);
+        }
+    }
+
+    // Persistence mode onlines a Grace GPU's memory, which CUDA needs; every
+    // GPU's numa_status must read "online" within a minute.
+    fn online_gpu_memory(steps: &mut GuestSteps) {
+        steps.run("sudo nvidia-smi -pm 1");
+        let numa_status = steps.run(
+            "for i in $(seq 60); do s=$(cat /proc/driver/nvidia/gpus/*/numa_status 2>/dev/null); \
+             printf '%s\\n' \"$s\" | grep -qE 'Status: +(offline|[a-z_]+_in_progress)$' || break; \
+             sleep 1; done; echo \"$s\"",
+        );
+        println!("GPU memory NUMA status: {}", numa_status.trim());
+        let online = numa_status
+            .lines()
+            .filter_map(|line| line.strip_prefix("Status:"))
+            .filter(|status| status.trim() == "online")
+            .count();
+        if online != steps.gpus {
+            steps.fail(format!(
+                "{online} of {} GPUs have their memory online after 60 s: {}",
+                steps.gpus,
+                numa_status.trim()
+            ));
+        }
+    }
+
+    // Runs "dcgmi diag -r <selector>": no test may fail, and the `required`
+    // ones must run and pass on every GPU.
+    fn run_dcgm_diag(steps: &mut GuestSteps, selector: &str, required: &[&str]) {
+        match steps
+            .guest
+            .dcgm_diag(&format!("-r {selector}"), DCGM_DIAG_TIMEOUT_SECS)
+        {
+            Ok(tests) if tests.is_empty() => {
+                steps.fail(format!("dcgmi diag -r {selector} ran no test"));
+            }
+            Ok(tests) => {
+                for test in &tests {
+                    println!(
+                        "dcgmi diag -r {selector}: {} / {}: {}",
+                        test.category, test.name, test.status
+                    );
+                    if test.failed() {
+                        steps.fail(format!("dcgmi diag -r {selector}: {test:?}"));
+                    }
+                }
+                for name in required {
+                    match tests.iter().find(|test| test.name == *name) {
+                        Some(test) if test.passed() || test.failed() => {}
+                        Some(test) => steps.fail(format!(
+                            "dcgmi diag -r {selector}: {name} must pass on every GPU, \
+                             reported {} {:?}",
+                            test.status, test.results
+                        )),
+                        None => {
+                            steps.fail(format!("dcgmi diag -r {selector}: {name} did not run"));
+                        }
+                    }
+                }
+            }
+            Err(e) => steps.fail(format!("dcgmi diag -r {selector}: {e}")),
+        }
+    }
+
+    // The DCGM checks: every "dcgmi diag" selector runs its tests, none may
+    // report Fail and the required ones must pass.
+    fn dcgm_test_steps(steps: &mut GuestSteps) {
+        for (selector, required) in DCGM_DIAG_SELECTORS {
+            run_dcgm_diag(steps, selector, required);
+        }
+    }
+
+    // Boots the guest, starts DCGM's host engine, which must see every GPU,
+    // onlines the GPU memory and runs the DCGM steps.
+    fn dcgm_guest_test() {
+        let Some(target) = GpuTarget::discover() else {
+            return;
+        };
+        let guest = Guest::new(Box::new(UbuntuDiskConfig::new(
+            NVIDIA_IMAGE_NAME.to_string(),
+        )));
+        let mut child = target.command(&guest).spawn().unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            check_gpus(&guest, target.devices.len());
+
+            // The image is built with DCGM: a guest without it is broken.
+            assert!(
+                guest.dcgm_installed().unwrap(),
+                "dcgmi not found in the guest image"
+            );
+            guest.start_dcgm(target.devices.len()).unwrap();
+
+            let mut steps = GuestSteps {
+                guest: &guest,
+                gpus: target.devices.len(),
+                failures: Vec::new(),
+            };
+            online_gpu_memory(&mut steps);
+            dcgm_test_steps(&mut steps);
+
+            assert!(
+                steps.failures.is_empty(),
+                "{} DCGM checks failed:\n{}",
+                steps.failures.len(),
+                steps.failures.join("\n")
+            );
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    // Every DCGM check of dcgm_test_steps() passes.
+    #[test]
+    #[ignore = "experimental: needs a Grace GPU bound to nvgrace_gpu_vfio_pci and the NVIDIA image with DCGM in ~/workloads; run with --ignored; #9139"]
+    fn test_nvidia_card_dcgm() {
+        dcgm_guest_test();
+    }
 }

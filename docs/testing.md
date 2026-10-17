@@ -338,6 +338,10 @@ Under nextest (`cargo nextest run --run-ignored only --test
 integration_nvidia`), `.config/nextest.toml` runs the binary's tests one at a
 time with an hour each instead of the default ten minutes.
 
+`test_nvidia_card_dcgm` exercises the GPU through DCGM as well: the host
+engine must list every GPU, and `dcgmi diag` level 2 and context_create must
+pass on every GPU. It fails without `dcgmi` in the image.
+
 ### Windows guests
 
 ```shell

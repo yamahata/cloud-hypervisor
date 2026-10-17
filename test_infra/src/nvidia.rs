@@ -4,7 +4,12 @@
 //
 
 //! Checks of an NVIDIA GPU passed through to a guest: nvidia-smi views and
-//! properties.
+//! properties, and DCGM's diagnostic.
+
+use std::time::{Duration, Instant};
+use std::{fmt, thread};
+
+use serde_json::Value;
 
 use crate::{Guest, SshCommandError};
 
@@ -147,6 +152,166 @@ fn parse_nvidia_smi_sweep(output: &str) -> NvidiaSmiSweep {
     NvidiaSmiSweep { listed, properties }
 }
 
+/// The status DCGM gives a diagnostic test, in its summary and per entity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DcgmDiagStatus {
+    Pass,
+    Fail,
+    Skip,
+    Warn,
+    /// A status this parser does not know, as DCGM printed it.
+    Other(String),
+}
+
+impl DcgmDiagStatus {
+    fn parse(status: &str) -> Self {
+        match status {
+            "Pass" => Self::Pass,
+            "Fail" => Self::Fail,
+            "Skip" => Self::Skip,
+            "Warn" => Self::Warn,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for DcgmDiagStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pass => f.write_str("Pass"),
+            Self::Fail => f.write_str("Fail"),
+            Self::Skip => f.write_str("Skip"),
+            Self::Warn => f.write_str("Warn"),
+            Self::Other(status) => f.write_str(status),
+        }
+    }
+}
+
+/// One test of a "dcgmi diag -j" run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DcgmDiagTest {
+    pub category: String,
+    pub name: String,
+    // From the test's summary.
+    pub status: DcgmDiagStatus,
+    // The status of each entity (a GPU, in a guest) the test ran on, by ID.
+    pub results: Vec<(u64, DcgmDiagStatus)>,
+    // Warnings DCGM attached to the test's per-GPU results.
+    pub messages: Vec<String>,
+}
+
+impl DcgmDiagTest {
+    pub fn failed(&self) -> bool {
+        self.status == DcgmDiagStatus::Fail
+            || self
+                .results
+                .iter()
+                .any(|(_, status)| *status == DcgmDiagStatus::Fail)
+    }
+
+    /// The test ran on at least one GPU and passed on every one: a summary
+    /// "Pass" over a GPU the test skipped is not a pass.
+    pub fn passed(&self) -> bool {
+        self.status == DcgmDiagStatus::Pass
+            && !self.results.is_empty()
+            && self
+                .results
+                .iter()
+                .all(|(_, status)| *status == DcgmDiagStatus::Pass)
+    }
+}
+
+/// Parses the JSON that "dcgmi diag -j" prints (DCGM 4.x).
+fn parse_dcgm_diag(output: &str) -> Result<Vec<DcgmDiagTest>, String> {
+    // The JSON starts on a line of its own; stderr, merged into the output,
+    // may hold a brace before it.
+    let json = output
+        .lines()
+        .scan(0, |offset, line| {
+            let at = *offset;
+            *offset += line.len() + 1;
+            Some((at, line))
+        })
+        .find(|(_, line)| line.trim_start().starts_with('{'))
+        .map(|(at, _)| &output[at..])
+        .ok_or_else(|| format!("no JSON in dcgmi output: {output}"))?;
+    // stderr is merged into the output, so only the first JSON value is read
+    // and whatever follows it is left alone.
+    let json: Value = serde_json::Deserializer::from_str(json)
+        .into_iter::<Value>()
+        .next()
+        .ok_or_else(|| format!("no JSON in dcgmi output: {output}"))?
+        .map_err(|e| format!("bad dcgmi JSON ({e}): {output}"))?;
+    let categories = json["DCGM Diagnostic"]["test_categories"]
+        .as_array()
+        .ok_or_else(|| format!("no test categories in dcgmi JSON: {output}"))?;
+
+    let mut tests = Vec::new();
+    for category in categories {
+        for test in category["tests"].as_array().into_iter().flatten() {
+            let results = test["results"].as_array().into_iter().flatten();
+            let statuses = results
+                .clone()
+                .map(|result| {
+                    (
+                        result["entity_id"].as_u64().unwrap_or_default(),
+                        DcgmDiagStatus::parse(result["status"].as_str().unwrap_or_default()),
+                    )
+                })
+                .collect();
+            let messages = results
+                .flat_map(|result| {
+                    let entity = result["entity_id"].as_u64().unwrap_or_default();
+                    result["warnings"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(move |w| {
+                            Some(format!("GPU {entity}: {}", w["warning"].as_str()?))
+                        })
+                })
+                .collect();
+            tests.push(DcgmDiagTest {
+                category: category["category"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                name: test["name"].as_str().unwrap_or_default().to_string(),
+                status: DcgmDiagStatus::parse(
+                    test["test_summary"]["status"].as_str().unwrap_or_default(),
+                ),
+                results: statuses,
+                messages,
+            });
+        }
+    }
+
+    Ok(tests)
+}
+
+/// The count in a "dcgmi discovery -l" heading for `entity`: "4 GPUs found."
+/// or, since DCGM 4.7, "1 GPU found (Active).".
+fn dcgmi_found_count(line: &str, entity: &str) -> Option<u32> {
+    let (count, rest) = line.trim().split_once(' ')?;
+    let rest = rest.strip_prefix(entity)?;
+    let rest = rest.strip_prefix('s').unwrap_or(rest);
+    if !rest.starts_with(" found") {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// GPU IDs listed by "dcgmi discovery -l".
+pub fn dcgmi_gpu_ids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .skip_while(|line| dcgmi_found_count(line, "GPU").is_none())
+        .skip(1)
+        .take_while(|line| !line.contains(" found"))
+        .filter_map(|line| line.split('|').nth(1)?.trim().parse().ok())
+        .collect()
+}
+
 impl Guest {
     /// Runs each command; a non-zero exit code or an "Unknown Error" line is
     /// a problem.
@@ -194,6 +359,68 @@ impl Guest {
     pub fn nvidia_smi_sweep(&self) -> Result<NvidiaSmiSweep, SshCommandError> {
         let (output, _) = self.ssh_command_exit_code(NVIDIA_SMI_SWEEP)?;
         Ok(parse_nvidia_smi_sweep(&output))
+    }
+
+    /// Whether the guest has dcgmi. "command -v" exits 1 (127 under dash)
+    /// when it does not; anything else is a failure of the guest or of the
+    /// connection, not a missing DCGM.
+    pub fn dcgm_installed(&self) -> Result<bool, String> {
+        match self.ssh_command_exit_code("command -v dcgmi") {
+            Ok((_, 0)) => Ok(true),
+            Ok((_, 1 | 127)) => Ok(false),
+            Ok((output, exit_code)) => Err(format!(
+                "command -v dcgmi exited with {exit_code}: {output}"
+            )),
+            Err(e) => Err(format!("command -v dcgmi: {e}")),
+        }
+    }
+
+    /// Starts DCGM's host engine (the packaged service if there is one) and
+    /// waits up to 30 s for it to list every one of the `gpus` passed
+    /// through. The error carries what the start and the last listing said.
+    pub fn start_dcgm(&self, gpus: usize) -> Result<(), String> {
+        let (started, _) = self
+            .ssh_command_exit_code("sudo systemctl start nvidia-dcgm || sudo nv-hostengine")
+            .map_err(|e| format!("starting the host engine: {e}"))?;
+
+        let start = Instant::now();
+        let mut listing = String::new();
+        while start.elapsed() < Duration::from_secs(30) {
+            match self.ssh_command_exit_code("dcgmi discovery -l") {
+                Ok((output, 0)) if dcgmi_gpu_ids(&output).len() == gpus => return Ok(()),
+                Ok((output, _)) => listing = output,
+                Err(e) => listing = format!("ssh failed: {e}"),
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Err(format!(
+            "DCGM lists {} of {gpus} GPUs after 30 s\nstart: {}\nlast listing: {listing}",
+            dcgmi_gpu_ids(&listing).len(),
+            started.trim()
+        ))
+    }
+
+    /// Runs `dcgmi diag <options> -j`. dcgmi exits non-zero when a test fails,
+    /// so only a run still going after `timeout_secs` is an error.
+    pub fn dcgm_diag(&self, options: &str, timeout_secs: u32) -> Result<Vec<DcgmDiagTest>, String> {
+        // The diagnostic prints nothing until it is done, so the connection
+        // may be silent for the whole timeout.
+        let (output, exit_code) = self
+            .ssh_command_exit_code_timeout(
+                &format!("sudo timeout --kill-after=60 {timeout_secs} dcgmi diag {options} -j"),
+                Duration::from_secs(u64::from(timeout_secs) + 120),
+            )
+            .map_err(|e| format!("ssh failed: {e}"))?;
+        // timeout(1) exits 124 after SIGTERM, 137 after the SIGKILL.
+        if exit_code == 124 || exit_code == 137 {
+            return Err(format!("timed out after {timeout_secs} s: {output}"));
+        }
+        // dcgmi killed by a signal prints nothing; the shell's exit code
+        // names the signal (132 for SIGILL).
+        if output.trim().is_empty() {
+            return Err(format!("dcgmi exited with {exit_code} and printed nothing"));
+        }
+        parse_dcgm_diag(&output)
     }
 }
 
@@ -332,5 +559,135 @@ esac
         assert_eq!(failed.class, NvidiaSmiValue::QueryFailed);
         assert!(failed.value.contains("not a valid field"));
         assert_eq!(rows.iter().filter(|r| r.class.is_error()).count(), 2);
+    }
+
+    // Shortened from real "dcgmi diag -j" output (DCGM 4.4.2, GB200 guests):
+    // a passing level 1 run, and a level 3 run whose nvbandwidth test failed.
+    const DCGM_DIAG_PASS: &str = r#"{"DCGM Diagnostic": {"test_categories": [
+        {"category": "Deployment", "tests": [{"name": "software",
+         "results": [{"entity_group": "GPU", "entity_group_id": 1, "entity_id": 0, "status": "Pass"},
+                     {"entity_group": "GPU", "entity_group_id": 1, "entity_id": 1, "status": "Pass"}],
+         "test_summary": {"status": "Pass"}}]}]},
+        "metadata": {"Driver Version Detected": "580.95.05", "version": "4.4.2"}}"#;
+    const DCGM_DIAG_FAIL: &str = r#"{"DCGM Diagnostic": {"test_categories": [
+        {"category": "Hardware", "tests": [
+         {"name": "memory", "results": [{"entity_id": 0, "status": "Pass"}], "test_summary": {"status": "Pass"}},
+         {"name": "nvbandwidth", "results": [
+            {"entity_id": 0, "status": "Fail", "warnings": [{"error_category": 10, "error_id": 38,
+             "error_severity": 2, "warning": "The memory copy utilization for the GPU: 0 is greater than 10%."}]},
+            {"entity_id": 1, "status": "Fail"}],
+          "test_summary": {"status": "Fail"}}]},
+        {"category": "Integration", "tests": [
+         {"name": "pcie", "results": [{"entity_id": 0, "status": "Skip"}], "test_summary": {"status": "Skip"}}]}]}}"#;
+
+    #[test]
+    fn dcgm_diag_results_are_parsed() {
+        let tests = parse_dcgm_diag(DCGM_DIAG_PASS).unwrap();
+        assert_eq!(
+            tests,
+            vec![DcgmDiagTest {
+                category: "Deployment".to_string(),
+                name: "software".to_string(),
+                status: DcgmDiagStatus::Pass,
+                results: vec![(0, DcgmDiagStatus::Pass), (1, DcgmDiagStatus::Pass)],
+                messages: vec![],
+            }]
+        );
+        assert!(!tests[0].failed());
+        assert!(tests[0].passed());
+
+        // Text before the JSON (a warning from dcgmi) is skipped.
+        let tests = parse_dcgm_diag(&format!("Warning: foo\n{DCGM_DIAG_FAIL}")).unwrap();
+        let failed = tests.iter().filter(|t| t.failed()).collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].name, "nvbandwidth");
+        assert_eq!(failed[0].category, "Hardware");
+        assert_eq!(
+            failed[0].messages,
+            vec!["GPU 0: The memory copy utilization for the GPU: 0 is greater than 10%."]
+        );
+        // A skipped test is reported but is not a failure.
+        let pcie = tests.iter().find(|t| t.name == "pcie").unwrap();
+        assert_eq!(pcie.status, DcgmDiagStatus::Skip);
+        assert!(!pcie.failed());
+        assert!(!pcie.passed());
+
+        // Shortened from "dcgmi diag -r 2 -j" in a GB200 guest with four GPUs
+        // (DCGM 4.4.2): the summary and every GPU pass.
+        let four_gpus = r#"{"DCGM Diagnostic": {"test_categories": [
+            {"category": "Hardware", "tests": [{"name": "memory", "results": [
+                {"entity_group": "GPU", "entity_group_id": 1, "entity_id": 0, "status": "Pass",
+                 "info": ["Allocated 194863357557 bytes (98.6%)"]},
+                {"entity_group": "GPU", "entity_group_id": 1, "entity_id": 1, "status": "Pass"},
+                {"entity_group": "GPU", "entity_group_id": 1, "entity_id": 2, "status": "Pass"},
+                {"entity_group": "GPU", "entity_group_id": 1, "entity_id": 3, "status": "Pass"}],
+             "test_summary": {"status": "Pass"}}]}]},
+            "metadata": {"Driver Version Detected": "580.95.05", "version": "4.4.2"}}"#;
+        let tests = parse_dcgm_diag(four_gpus).unwrap();
+        assert_eq!(tests[0].results.len(), 4, "{tests:#?}");
+        assert!(tests[0].passed());
+
+        // A summary "Pass" over a GPU the test skipped is not a pass.
+        let one_skipped = four_gpus.replace(
+            r#""entity_id": 2, "status": "Pass""#,
+            r#""entity_id": 2, "status": "Skip""#,
+        );
+        let tests = parse_dcgm_diag(&one_skipped).unwrap();
+        assert_eq!(tests[0].status, DcgmDiagStatus::Pass);
+        assert!(!tests[0].passed());
+        assert!(!tests[0].failed());
+
+        let error = parse_dcgm_diag("Error: Unable to connect to host engine").unwrap_err();
+        assert!(error.contains("no JSON"), "{error}");
+        let error = parse_dcgm_diag("{\"unexpected\": 1}").unwrap_err();
+        assert!(error.contains("no test categories"), "{error}");
+    }
+
+    // Shortened from real dcgmi 4.4.2 output in a GB200 guest.
+    const DCGMI_DISCOVERY: &str = "4 GPUs found.
++--------+----------------------------------------------------------------------+
+| GPU ID | Device Information                                                   |
++--------+----------------------------------------------------------------------+
+| 0      | Name: NVIDIA GB200                                                   |
+|        | PCI Bus ID: 00000008:00:00.0                                         |
++--------+----------------------------------------------------------------------+
+| 3      | Name: NVIDIA GB200                                                   |
+|        | PCI Bus ID: 0000000B:00:00.0                                         |
++--------+----------------------------------------------------------------------+
+0 NvSwitches found.
++-----------+
+| Switch ID |
++-----------+
++-----------+
+2 CPUs found.
++--------+----------------------------------------------------------------------+
+| CPU ID | Device Information                                                   |
++--------+----------------------------------------------------------------------+
+| 0      | Name: Grace TH500                                                    |
+| 1      | Name: Grace TH500                                                    |
++--------+----------------------------------------------------------------------+
+";
+
+    #[test]
+    fn dcgmi_gpu_ids_are_parsed() {
+        assert_eq!(dcgmi_gpu_ids(DCGMI_DISCOVERY), vec![0, 3]);
+        let one_gpu = "1 GPU found.\n| 0      | Name: NVIDIA L40S |\n0 CPUs found.\n";
+        assert_eq!(dcgmi_gpu_ids(one_gpu), vec![0]);
+        // DCGM 4.7 in a GH200 guest qualifies the GPU heading.
+        let dcgm_4_7 = "1 GPU found (Active).\n\
+                        | 0      | Name: NVIDIA GH200 480GB |\n\
+                        0 NvSwitches found.\n\
+                        0 CPUs found.\n";
+        assert_eq!(dcgmi_gpu_ids(dcgm_4_7), vec![0]);
+        // Ten GPUs: the heading contains "0 GPUs".
+        let ten_gpus = format!(
+            "10 GPUs found.\n{}0 NvSwitches found.\n",
+            (0..10)
+                .map(|gpu| format!("| {gpu}      | Name: NVIDIA GB200 |\n"))
+                .collect::<String>()
+        );
+        assert_eq!(dcgmi_gpu_ids(&ten_gpus), (0..10).collect::<Vec<_>>());
+        assert!(dcgmi_gpu_ids("0 GPUs found.\n0 NvSwitches found.\n").is_empty());
+        assert!(dcgmi_gpu_ids("Error: unable to connect").is_empty());
     }
 }
