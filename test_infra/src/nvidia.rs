@@ -4,7 +4,7 @@
 //
 
 //! Checks of an NVIDIA GPU passed through to a guest: nvidia-smi views and
-//! properties, and DCGM's diagnostic.
+//! properties, DCGM's diagnostic and tools.
 
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
@@ -310,6 +310,49 @@ pub fn dcgmi_gpu_ids(output: &str) -> Vec<u32> {
         .take_while(|line| !line.contains(" found"))
         .filter_map(|line| line.split('|').nth(1)?.trim().parse().ok())
         .collect()
+}
+
+/// The group ID that "dcgmi group -c" or "dcgmi fieldgroup -c" printed
+/// ("... with a group ID of 3").
+pub fn dcgmi_created_id(output: &str) -> Option<u32> {
+    let (_, id) = output.split_once("ID of ")?;
+    id.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// The number of NVIDIA CPUs (Grace) that "dcgmi discovery -l" lists.
+pub fn dcgmi_cpu_count(output: &str) -> u32 {
+    output
+        .lines()
+        .find_map(|line| dcgmi_found_count(line, "CPU"))
+        .unwrap_or_default()
+}
+
+/// The "Current" column of `setting` in "dcgmi config --get" output, e.g.
+/// "Unrestricted" for "Compute Mode"; "****" when the GPUs of the group
+/// differ.
+pub fn dcgmi_config_current(output: &str, setting: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let columns = line.split('|').collect::<Vec<_>>();
+        if columns.len() < 5 || !columns[1].trim().eq_ignore_ascii_case(setting) {
+            return None;
+        }
+        Some(columns[columns.len() - 2].trim().to_string())
+    })
+}
+
+/// The (min, max) power limit in watts from "dcgmi discovery -i p".
+pub fn dcgmi_power_range(output: &str) -> Option<(u32, u32)> {
+    let limit = |name: &str| {
+        output.lines().find_map(|line| {
+            let mut columns = line.split('|').skip(1);
+            if !columns.next()?.trim().starts_with(name) {
+                return None;
+            }
+            columns.next()?.trim().parse::<u32>().ok()
+        })
+    };
+    let (min, max) = (limit("Min Power Limit")?, limit("Max Power Limit")?);
+    (min <= max).then_some((min, max))
 }
 
 impl Guest {
@@ -689,5 +732,67 @@ esac
         assert_eq!(dcgmi_gpu_ids(&ten_gpus), (0..10).collect::<Vec<_>>());
         assert!(dcgmi_gpu_ids("0 GPUs found.\n0 NvSwitches found.\n").is_empty());
         assert!(dcgmi_gpu_ids("Error: unable to connect").is_empty());
+    }
+
+    // Shortened from real dcgmi 4.4.2 output in a GB200 guest.
+    const DCGMI_CONFIG: &str = "\
++------------------------------+------------------------------+------------------------------+
+| dcgmi_test_group                                                                           |
+| Group of 4 GPUs                                                                            |
++==============================+==============================+==============================+
+| Field                        | Target                       | Current                      |
++------------------------------+------------------------------+------------------------------+
+| Compute Mode                 | Not Specified                | Unrestricted                 |
+| ECC Mode                     | Not Specified                | Enabled                      |
+| Sync Boost                   | Not Specified                | Not Supported                |
+| Power Limit                  | Not Specified                | 1200                         |
++------------------------------+------------------------------+------------------------------+
+**** Non-homogenous settings across group. Use with -v flag to see details.
+";
+    const DCGMI_POWER: &str = "\
++--------------------------+-------------------------------------------------+
+| GPU ID: 0                | Device Information                              |
++==========================+=================================================+
+| Current Power Limit (W)  | 1200                                            |
+| Default Power Limit (W)  | 1200                                            |
+| Max Power Limit (W)      | 1200                                            |
+| Min Power Limit (W)      | 200                                             |
++--------------------------+-------------------------------------------------+
+";
+
+    #[test]
+    fn dcgmi_output_is_parsed() {
+        assert_eq!(dcgmi_cpu_count(DCGMI_DISCOVERY), 2);
+        assert_eq!(dcgmi_cpu_count("1 GPU found (Active).\n0 CPUs found.\n"), 0);
+        assert_eq!(dcgmi_cpu_count("1 GPU found.\n"), 0);
+
+        assert_eq!(
+            dcgmi_created_id(
+                "Successfully created group \"ch_dcgm_group\" with a group ID of 19\n"
+            ),
+            Some(19)
+        );
+        assert_eq!(
+            dcgmi_created_id("Successfully created field group \"f\" with a field group ID of 492"),
+            Some(492)
+        );
+        assert_eq!(dcgmi_created_id("Error: group exists"), None);
+
+        assert_eq!(
+            dcgmi_config_current(DCGMI_CONFIG, "Compute Mode").as_deref(),
+            Some("Unrestricted")
+        );
+        assert_eq!(
+            dcgmi_config_current(DCGMI_CONFIG, "sync boost").as_deref(),
+            Some("Not Supported")
+        );
+        assert_eq!(
+            dcgmi_config_current(DCGMI_CONFIG, "Power Limit").as_deref(),
+            Some("1200")
+        );
+        assert_eq!(dcgmi_config_current(DCGMI_CONFIG, "Power Profile"), None);
+
+        assert_eq!(dcgmi_power_range(DCGMI_POWER), Some((200, 1200)));
+        assert_eq!(dcgmi_power_range(DCGMI_CONFIG), None);
     }
 }

@@ -254,6 +254,10 @@ mod nvidia_gpu {
     // The level-2 tests that must pass: the ones that exercise what the VMM
     // presents (the PCIe link, the memory BAR, the driver).
     const DCGM_DIAG_CORE_TESTS: &[&str] = &["software", "memory", "pcie"];
+    // GPU temperature, power usage, GPU and memory copy utilization, and
+    // framebuffer used.
+    const DCGM_TEST_FIELDS: &str = "150,155,203,204,252";
+    const DCGM_HOST_ENGINE_LOG: &str = "/var/log/nv-hostengine.log";
 
     // Collects the failures of a sequence of guest checks, so that one run
     // reports all of them rather than stopping at the first.
@@ -280,9 +284,139 @@ mod nvidia_gpu {
             }
         }
 
+        fn run_must_fail(&mut self, command: &str) {
+            match self.guest.ssh_command_exit_code(command) {
+                Ok((output, 0)) => {
+                    self.fail(format!("{command}: succeeded, must fail:\n{output}"));
+                }
+                Ok(_) => {}
+                Err(e) => self.fail(format!("{command}: {e}")),
+            }
+        }
+
+        // Whether "dcgmi <subcommand>" accepts `option`; it differs between
+        // DCGM releases.
+        fn dcgmi_has_option(&self, subcommand: &str, option: &str) -> bool {
+            self.guest
+                .ssh_command_exit_code(&format!("dcgmi {subcommand} --help"))
+                .is_ok_and(|(help, _)| help.contains(option))
+        }
+
         fn fail(&mut self, failure: String) {
             eprintln!("FAILED: {failure}");
             self.failures.push(failure);
+        }
+    }
+
+    fn dcgm_config_steps(steps: &mut GuestSteps, group: u32, gpu: u32) {
+        let get = format!("dcgmi config -g {group} --get");
+        let set = format!("dcgmi config -g {group} --set");
+
+        let baseline = steps.run(&get);
+        let power_info = steps.run(&format!("dcgmi discovery -i p --gpuid {gpu}"));
+        steps.run(&format!("dcgmi discovery -i c --gpuid {gpu}"));
+
+        let current = |setting| {
+            dcgmi_config_current(&baseline, setting)
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+        let compute_mode = match current("Compute Mode").as_str() {
+            "unrestricted" | "default" => Some(0),
+            "prohibited" => Some(1),
+            mode if mode.contains("process") || mode.contains("exclusive") => Some(2),
+            _ => None,
+        };
+        let sync_boost = current("Sync Boost");
+        let sync_boost_supported = !sync_boost.contains("not supported");
+        let base_sync_boost = match sync_boost.as_str() {
+            "enabled" | "on" => Some(1),
+            "disabled" | "off" => Some(0),
+            _ => None,
+        };
+        let base_power = current("Power Limit")
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|power| power.parse::<u32>().ok());
+        let power_range = dcgmi_power_range(&power_info);
+        // Values that could not be read (for example "****" when the GPUs of
+        // the group differ) are not restored.
+        println!(
+            "dcgmi config baseline: compute mode {compute_mode:?}, sync boost \
+             {sync_boost:?}, power limit {base_power:?}, power range {power_range:?}"
+        );
+
+        for mode in 0..3 {
+            steps.run(&format!("{set} -c {mode}"));
+            steps.run(&get);
+        }
+
+        if sync_boost_supported {
+            for sync_boost in 0..2 {
+                steps.run(&format!("{set} -s {sync_boost}"));
+                steps.run(&get);
+            }
+        }
+
+        let mut power_limits = Vec::new();
+        if let Some((min, max)) = power_range {
+            power_limits.extend([min, (min + max) / 2, max]);
+        }
+        power_limits.extend(base_power);
+        let mut tested = Vec::new();
+        for power in power_limits {
+            if tested.contains(&power) {
+                continue;
+            }
+            tested.push(power);
+            steps.run(&format!("{set} -P {power}"));
+            steps.run(&get);
+        }
+        if let Some((_, max)) = power_range {
+            steps.run_must_fail(&format!("{set} -P {}", max + 50));
+        }
+
+        steps.run(&format!("dcgmi config -g {group} --enforce"));
+        steps.run(&get);
+
+        if let Some(mode) = compute_mode {
+            steps.run(&format!("{set} -c {mode}"));
+        }
+        if let Some(sync_boost) = base_sync_boost.filter(|_| sync_boost_supported) {
+            steps.run(&format!("{set} -s {sync_boost}"));
+        }
+        if let Some(power) = base_power {
+            steps.run(&format!("{set} -P {power}"));
+        }
+        steps.run(&get);
+    }
+
+    fn dcgm_dmon_steps(steps: &mut GuestSteps, group: u32, gpu: u32) {
+        steps.run("dcgmi fieldgroup -l");
+        steps.run("dcgmi dmon -l");
+
+        let created = steps.run(&format!(
+            "dcgmi fieldgroup -c ch_dcgm_fields -f {DCGM_TEST_FIELDS}"
+        ));
+        let field_group = dcgmi_created_id(&created);
+        match field_group {
+            Some(field_group) => {
+                steps.run(&format!("dcgmi fieldgroup -i -g {field_group}"));
+                steps.run(&format!("dcgmi dmon -f {field_group} -c 1 -d 1"));
+            }
+            None => steps.fail(format!("no field group ID in: {created}")),
+        }
+        steps.run(&format!(
+            "dcgmi dmon -e {DCGM_TEST_FIELDS} -i gpu:{gpu} -c 1 -d 1"
+        ));
+        steps.run(&format!(
+            "dcgmi dmon -e {DCGM_TEST_FIELDS} -g all_gpus -c 1 -d 1"
+        ));
+        steps.run(&format!(
+            "dcgmi dmon -e {DCGM_TEST_FIELDS} -g {group} -c 1 -d 1"
+        ));
+        if let Some(field_group) = field_group {
+            steps.run(&format!("dcgmi fieldgroup -d -g {field_group}"));
         }
     }
 
@@ -348,12 +482,88 @@ mod nvidia_gpu {
         }
     }
 
-    // The DCGM checks: every "dcgmi diag" selector runs its tests, none may
-    // report Fail and the required ones must pass.
+    // Every dcgmi command a manual check of a GPU runs; each must exit 0,
+    // and the diagnostic's required tests must pass.
     fn dcgm_test_steps(steps: &mut GuestSteps) {
+        // Log everything during the run; the ERROR lines are printed at the
+        // end.
+        steps.run("dcgmi set --logging-severity DEBUG --target-logger BASE");
+        steps.run("dcgmi --version");
+
+        let list = steps.run("dcgmi discovery -l");
+        let gpus = dcgmi_gpu_ids(&list);
+        let Some(&gpu) = gpus.first() else {
+            steps.fail(format!("no GPU in dcgmi discovery -l: {list}"));
+            return;
+        };
+        if steps.dcgmi_has_option("discovery", "--all") {
+            steps.run("dcgmi discovery -l -a");
+        }
+        for info in ["a", "p", "t", "c", "w", "aptcw"] {
+            steps.run(&format!("dcgmi discovery -i {info} --gpuid {gpu}"));
+        }
+        steps.run("dcgmi discovery -i aptcw -v");
+        // NVIDIA CPUs (Grace) are listed on bare metal only.
+        if dcgmi_cpu_count(&list) > 0 {
+            steps.run("dcgmi discovery -i a --cpuid 0");
+        }
+        steps.run("dcgmi discovery -c");
+
+        let created = steps.run("dcgmi group -c ch_dcgm_group --default");
+        let Some(group) = dcgmi_created_id(&created) else {
+            steps.fail(format!("no group ID in: {created}"));
+            return;
+        };
+        steps.run("dcgmi group -l");
+        steps.run(&format!("dcgmi group -g {group} -i"));
+
+        steps.run(&format!("dcgmi health -g {group} -s mpi"));
+        let health = steps.run(&format!("dcgmi health -g {group} -c"));
+        if health
+            .lines()
+            .any(|line| line.contains("Overall Health") && line.contains("Failure"))
+        {
+            steps.fail(format!("dcgmi health: {health}"));
+        }
+
         for (selector, required) in DCGM_DIAG_SELECTORS {
             run_dcgm_diag(steps, selector, required);
         }
+
+        dcgm_config_steps(steps, group, gpu);
+
+        steps.run(&format!("dcgmi policy -g {group} --get"));
+
+        steps.run(&format!("dcgmi stats -g {group} -e"));
+        steps.run(&format!("dcgmi stats -g {group} -s ch_dcgm_job"));
+        thread::sleep(Duration::from_secs(5));
+        steps.run("dcgmi stats -x ch_dcgm_job");
+        steps.run("dcgmi stats -j ch_dcgm_job -v");
+
+        dcgm_dmon_steps(steps, group, gpu);
+
+        // Group topology describes the links between GPUs: DCGM reports it
+        // as not supported for a group of one.
+        if gpus.len() > 1 {
+            steps.run(&format!("dcgmi topo -g {group}"));
+        } else {
+            println!("dcgmi topo: skipped, one GPU");
+        }
+
+        steps.run("dcgmi nvlink -s");
+        if steps.dcgmi_has_option("nvlink", "--show-entity-ids") {
+            steps.run("dcgmi nvlink -s --show-entity-ids");
+        }
+        for gpu in &gpus {
+            steps.run(&format!("dcgmi nvlink -e -g {gpu}"));
+        }
+
+        steps.run(&format!("dcgmi profile --list -g {group}"));
+        steps.run("dcgmi introspect --show -H");
+        steps.run("dcgmi modules -l");
+
+        steps.run(&format!("dcgmi group -d {group}"));
+        steps.run("dcgmi set --logging-severity ERROR --target-logger BASE");
     }
 
     // Boots the guest, starts DCGM's host engine, which must see every GPU,
@@ -378,6 +588,20 @@ mod nvidia_gpu {
             );
             guest.start_dcgm(target.devices.len()).unwrap();
 
+            let log_offset = guest
+                .ssh_command_exit_code(&format!("sudo stat -c %s {DCGM_HOST_ENGINE_LOG}"))
+                .map(|(size, _)| size.trim().parse::<u64>().unwrap_or_default())
+                .unwrap_or_default();
+            // The host engine's process: if it died during the run, it comes
+            // back under systemd with its groups gone.
+            let engine_pid = || {
+                guest
+                    .ssh_command_exit_code("pgrep -x nv-hostengine")
+                    .map(|(pids, _)| pids.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let engine_before = engine_pid();
+
             let mut steps = GuestSteps {
                 guest: &guest,
                 gpus: target.devices.len(),
@@ -385,6 +609,42 @@ mod nvidia_gpu {
             };
             online_gpu_memory(&mut steps);
             dcgm_test_steps(&mut steps);
+
+            let engine_after = engine_pid();
+            if engine_after != engine_before {
+                steps.fail(format!(
+                    "DCGM host engine restarted during the run: pid {engine_before} -> \
+                     {engine_after}"
+                ));
+            }
+
+            // Shown for diagnosis, not judged: the wording changes between
+            // DCGM releases.
+            match guest.ssh_command_exit_code(&format!(
+                "sudo tail -c +{} {DCGM_HOST_ENGINE_LOG}",
+                log_offset + 1
+            )) {
+                Ok((log, 0)) => {
+                    // syslog format: "<date> <time> <LEVEL> [pid:tid] message".
+                    let errors = log
+                        .lines()
+                        .filter(|line| {
+                            matches!(line.split_whitespace().nth(2), Some("ERROR" | "FATAL"))
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "nv-hostengine: {} ERROR lines during the run\n{}",
+                        errors.len(),
+                        errors.join("\n")
+                    );
+                }
+                Ok((output, exit_code)) => println!(
+                    "nv-hostengine: {DCGM_HOST_ENGINE_LOG} could not be read (exit code \
+                     {exit_code}): {}",
+                    output.trim()
+                ),
+                Err(e) => println!("nv-hostengine: {DCGM_HOST_ENGINE_LOG} could not be read: {e}"),
+            }
 
             assert!(
                 steps.failures.is_empty(),
