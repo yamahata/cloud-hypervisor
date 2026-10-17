@@ -395,6 +395,60 @@ mod nvidia_gpu {
         steps.run("dcgmi fieldgroup -l");
         steps.run("dcgmi dmon -l");
 
+        match steps.guest.dcgm_dmon_sweep() {
+            Ok(sweep) => {
+                let fields = sweep
+                    .fields
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                // Every field "dcgmi dmon -l" lists was sampled.
+                if sweep.listed == 0 {
+                    steps.fail("dcgmi dmon -l listed no field".to_string());
+                } else if fields.len() != sweep.listed {
+                    steps.fail(format!(
+                        "dcgmi dmon: {} of {} listed fields swept",
+                        fields.len(),
+                        sweep.listed
+                    ));
+                }
+                for field in sweep
+                    .fields
+                    .iter()
+                    .filter(|f| f.result == DcgmFieldResult::Failed)
+                {
+                    steps.fail(format!(
+                        "dcgmi dmon -e {} ({}): {}",
+                        field.id, field.name, field.value
+                    ));
+                }
+
+                // Fields with no sample or N/A, printed for diagnosis.
+                let no_sample = sweep
+                    .fields
+                    .iter()
+                    .filter(|f| f.result == DcgmFieldResult::NoSample)
+                    .map(|f| format!("{} ({})", f.id, f.name))
+                    .collect::<Vec<_>>();
+                let not_available = sweep
+                    .fields
+                    .iter()
+                    .filter(|f| {
+                        f.result == DcgmFieldResult::Sampled
+                            && (f.value.is_empty() || f.value == "N/A")
+                    })
+                    .count();
+                println!(
+                    "dcgmi dmon: {} fields, {} values, {not_available} N/A, {} with no sample: \
+                     {no_sample:?}",
+                    fields.len(),
+                    sweep.fields.len(),
+                    no_sample.len()
+                );
+            }
+            Err(e) => steps.fail(format!("dcgmi dmon sweep: {e}")),
+        }
+
         let created = steps.run(&format!(
             "dcgmi fieldgroup -c ch_dcgm_fields -f {DCGM_TEST_FIELDS}"
         ));

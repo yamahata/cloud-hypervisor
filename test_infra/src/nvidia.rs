@@ -355,6 +355,78 @@ pub fn dcgmi_power_range(output: &str) -> Option<(u32, u32)> {
     (min <= max).then_some((min, max))
 }
 
+// Samples every field of "dcgmi dmon -l" once, one per call; see the file.
+const DCGM_DMON_SWEEP: &str = include_str!("nvidia/dcgm-dmon-sweep.sh");
+
+/// How `DCGM_DMON_SWEEP` fared with one field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DcgmFieldResult {
+    /// dcgmi printed a sample row for the entity; the value may be "N/A".
+    Sampled,
+    /// dcgmi exited 0 but printed no sample row for any entity.
+    NoSample,
+    /// dcgmi could not watch the field; the value is its first line.
+    Failed,
+}
+
+/// One field of one entity in a `DCGM_DMON_SWEEP`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DcgmFieldValue {
+    pub id: String,
+    pub name: String,
+    // "GPU 0", or "-" when the field was not sampled.
+    pub entity: String,
+    // The sampled value ("N/A" when DCGM has none), dcgmi's error, or
+    // nothing.
+    pub value: String,
+    pub result: DcgmFieldResult,
+}
+
+/// The result of `DCGM_DMON_SWEEP`: how many fields were listed, and one
+/// entry per field and entity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DcgmDmonSweep {
+    pub listed: usize,
+    pub fields: Vec<DcgmFieldValue>,
+}
+
+fn parse_dcgm_dmon_sweep(output: &str) -> DcgmDmonSweep {
+    let listed = output
+        .lines()
+        .find_map(|line| line.strip_prefix("CH_DMON_LISTED\t"))
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or_default();
+    let fields = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(5, '\t');
+            let (tag, id, name) = (fields.next()?, fields.next()?, fields.next()?);
+            let (entity, value, result) = match tag {
+                "CH_DMON" => (
+                    fields.next()?,
+                    fields.next().unwrap_or_default(),
+                    DcgmFieldResult::Sampled,
+                ),
+                "CH_DMON_NOSAMPLE" => ("-", "", DcgmFieldResult::NoSample),
+                "CH_DMON_FAILED" => (
+                    "-",
+                    fields.next().unwrap_or_default(),
+                    DcgmFieldResult::Failed,
+                ),
+                _ => return None,
+            };
+            Some(DcgmFieldValue {
+                id: id.to_string(),
+                name: name.to_string(),
+                entity: entity.to_string(),
+                value: value.trim().to_string(),
+                result,
+            })
+        })
+        .collect();
+    DcgmDmonSweep { listed, fields }
+}
+
 impl Guest {
     /// Runs each command; a non-zero exit code or an "Unknown Error" line is
     /// a problem.
@@ -464,6 +536,12 @@ impl Guest {
             return Err(format!("dcgmi exited with {exit_code} and printed nothing"));
         }
         parse_dcgm_diag(&output)
+    }
+
+    /// Samples every field "dcgmi dmon -l" lists once, one per call.
+    pub fn dcgm_dmon_sweep(&self) -> Result<DcgmDmonSweep, SshCommandError> {
+        let (output, _) = self.ssh_command_exit_code(DCGM_DMON_SWEEP)?;
+        Ok(parse_dcgm_dmon_sweep(&output))
     }
 }
 
@@ -794,5 +872,85 @@ esac
 
         assert_eq!(dcgmi_power_range(DCGMI_POWER), Some((200, 1200)));
         assert_eq!(dcgmi_power_range(DCGMI_CONFIG), None);
+    }
+
+    // Runs the dmon sweep script itself against a fake dcgmi with two GPUs.
+    #[test]
+    fn dcgm_dmon_sweep_script_runs_one_field_per_call() {
+        let dir = TempDir::new_with_prefix("/tmp/ch-dcgmi").unwrap();
+        let fake = dir.as_path().join("dcgmi");
+        fs::write(
+            &fake,
+            r#"#!/bin/bash
+if [ "$1 $2" = "dmon -l" ]; then
+    printf '%s\n' '___________________________________________' \
+        'Long Name                 Short Name          Field ID' \
+        '___________________________________________' \
+        'name                      DVNAM               50' \
+        'gpu_temp                  TMPTR               150' \
+        'fan_speed                 FANSP               160' \
+        'pcie_tx_throughput        TXPCI               200' \
+        'pcie_link_width           PCIWD               238' \
+        'header_only               HDRON               300' \
+        'gone_field                GONE                999' \
+        'gpu_temp                  TMPTR               150'
+    exit 0
+fi
+case "$3" in
+    50) printf '#Entity   DVNAM\nID\nGPU 0     NVIDIA GB200\nGPU 1     NVIDIA GB200\n' ;;
+    150) printf '#Entity   TMPTR\nID        C\nGPU 0     33\nGPU 1     34\n' ;;
+    160) echo '  Error: Unable to watch field 160' ;;
+    238) printf '#Entity   PCIWD\nID\nGPU 0     N/A\nGPU 1     16\n' ;;
+    300) printf '#Entity   HDRON\nID\n' ;;
+    *) echo "Error: field $3 queried"; exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(guest_command_with_exit_code(DCGM_DMON_SWEEP))
+            .env(
+                "PATH",
+                format!("{}:{}", dir.as_path().display(), env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        let output = String::from_utf8(output.stdout).unwrap();
+        let (sweep_output, exit_code) = split_guest_exit_code(&output);
+        assert_eq!(exit_code, Some(0), "{output}");
+
+        let sweep = parse_dcgm_dmon_sweep(sweep_output);
+        assert_eq!(sweep.listed, 6, "{sweep:#?}");
+        let rows = sweep.fields;
+        let find = |id: &str, entity: &str| {
+            rows.iter()
+                .find(|r| r.id == id && r.entity == entity)
+                .unwrap_or_else(|| panic!("no row for field {id} of {entity}: {rows:#?}"))
+        };
+
+        assert_eq!(rows.len(), 9, "{rows:#?}");
+        assert_eq!(find("300", "-").result, DcgmFieldResult::NoSample);
+        assert_eq!(find("300", "-").value, "");
+        let mut ids = rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), sweep.listed, "{rows:#?}");
+        assert_eq!(find("50", "GPU 1").value, "NVIDIA GB200");
+        assert_eq!(find("150", "GPU 0").value, "33");
+        assert_eq!(find("150", "GPU 0").name, "gpu_temp");
+        assert_eq!(find("238", "GPU 0").value, "N/A");
+        assert_eq!(find("238", "GPU 0").result, DcgmFieldResult::Sampled);
+        assert_eq!(find("160", "-").result, DcgmFieldResult::Failed);
+        assert!(find("999", "-").value.contains("field 999 queried"));
+        assert!(!rows.iter().any(|r| r.id == "200"), "{rows:#?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.result == DcgmFieldResult::Failed)
+                .count(),
+            2
+        );
     }
 }
