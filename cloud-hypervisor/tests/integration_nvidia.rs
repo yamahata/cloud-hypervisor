@@ -12,6 +12,7 @@
 // Every GPU bound to nvgrace_gpu_vfio_pci is tested; without one the tests
 // print SKIPPED. The guest image is NVIDIA_IMAGE_NAME in ~/workloads.
 mod nvidia_gpu {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use std::{fs, panic, thread};
@@ -177,6 +178,62 @@ mod nvidia_gpu {
             let mut problems = guest.nvidia_smi_problems(NVIDIA_SMI_VIEWS);
             problems.extend(guest.nvidia_smi_field_errors(NVIDIA_SMI_HARDWARE_VIEWS));
             assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+            let sweep = guest.nvidia_smi_sweep().unwrap();
+            let properties = sweep
+                .properties
+                .iter()
+                .map(|p| p.property.as_str())
+                .collect::<BTreeSet<_>>();
+            // Queried all properties --help-query-gpu listed, and the list was
+            // not empty.
+            assert!(
+                sweep.listed > 0,
+                "nvidia-smi --help-query-gpu listed no property"
+            );
+            assert_eq!(
+                properties.len(),
+                sweep.listed,
+                "{} of {} listed properties swept",
+                properties.len(),
+                sweep.listed
+            );
+
+            let errors = sweep
+                .properties
+                .iter()
+                .filter(|p| p.class.is_error())
+                .collect::<Vec<_>>();
+            assert!(errors.is_empty(), "{errors:#?}");
+            // Every GPU answered every property.
+            let gpus = target.devices.len();
+            let short = properties
+                .iter()
+                .filter(|property| {
+                    sweep
+                        .properties
+                        .iter()
+                        .filter(|p| p.property == **property && p.gpu != "-")
+                        .count()
+                        != gpus
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                short.is_empty(),
+                "properties not answered for all {gpus} GPUs: {short:?}"
+            );
+
+            let not_available = sweep
+                .properties
+                .iter()
+                .filter(|p| !matches!(p.class, NvidiaSmiValue::Value))
+                .map(|p| format!("{}={}", p.property, p.value))
+                .collect::<BTreeSet<_>>();
+            println!(
+                "nvidia-smi: {} properties, {} values, without a value: {not_available:?}",
+                properties.len(),
+                sweep.properties.len()
+            );
         });
 
         let _ = child.kill();

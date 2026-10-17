@@ -310,7 +310,8 @@ hardware with an Nvidia GPU (Tesla T4) for VFIO passthrough testing.
 ### NVIDIA GPU (experimental)
 
 `cloud-hypervisor/tests/integration_nvidia.rs`, aarch64 only, `#[ignore]`d:
-every nvidia-smi view of a passed-through Grace GPU (GH200, GB200, GB300).
+every nvidia-smi view and property of a passed-through Grace GPU (GH200,
+GB200, GB300).
 CI has no runner with such a GPU, so the tests are run by hand; see #9139.
 Every GPU of the host bound to `nvgrace_gpu_vfio_pci` is passed through, the
 way a Grace GPU needs. Without such a GPU the tests print `SKIPPED`; with
