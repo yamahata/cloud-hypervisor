@@ -14,6 +14,7 @@
     - [x86\_64](#x86_64)
     - [ARM64](#arm64)
     - [VFIO](#vfio)
+    - [NVIDIA GPU (experimental)](#nvidia-gpu-experimental)
     - [Windows guests](#windows-guests)
     - [Rate limiter](#rate-limiter)
     - [Confidential VMs](#confidential-vms)
@@ -305,6 +306,36 @@ hardware with an Nvidia GPU (Tesla T4) for VFIO passthrough testing.
 |----------------------|-------------------------------------------|
 | `vfio::test_nvidia`  | Legacy VFIO with container/group interface.|
 | `vfio::test_iommufd` | VFIO with cdev interface via iommufd.      |
+
+### NVIDIA GPU (experimental)
+
+`cloud-hypervisor/tests/integration_nvidia.rs`, aarch64 only, `#[ignore]`d:
+every nvidia-smi view of a passed-through Grace GPU (GH200, GB200, GB300).
+CI has no runner with such a GPU, so the tests are run by hand; see #9139.
+Every GPU of the host bound to `nvgrace_gpu_vfio_pci` is passed through, the
+way a Grace GPU needs. Without such a GPU the tests print `SKIPPED`; with
+one, the guest image must be present or the test fails. The firmware is the
+one the other tests boot.
+
+The image is a fixed name in `~/workloads`, the `NVIDIA_IMAGE_NAME` constant
+in the test file: an Ubuntu 24.04 image with Ubuntu's NVIDIA kernel, the open
+driver and DCGM, built on an arm64 host by
+
+```shell
+IMAGE_ARCH=arm64 NVIDIA_CUSTOM_IMAGE=-nvidia scripts/build-custom-image.sh
+```
+
+and copied to `~/workloads` under that name. Run the tests as root after a
+release build, with `BUILD_TARGET` set to its target:
+
+```shell
+RUSTFLAGS='--cfg devcli_testenv' cargo test -p cloud-hypervisor \
+    --test integration_nvidia -- --ignored --test-threads=1
+```
+
+Under nextest (`cargo nextest run --run-ignored only --test
+integration_nvidia`), `.config/nextest.toml` runs the binary's tests one at a
+time with an hour each instead of the default ten minutes.
 
 ### Windows guests
 

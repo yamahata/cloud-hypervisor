@@ -30,6 +30,8 @@ use thiserror::Error;
 use vmm_sys_util::tempdir::TempDir;
 use wait_timeout::ChildExt;
 
+pub mod nvidia;
+
 // ---------------------------------------------------------------------------
 // Process group registry, one group per test.
 //
