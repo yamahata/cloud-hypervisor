@@ -4,7 +4,7 @@
 //
 
 //! Checks of an NVIDIA GPU passed through to a guest: nvidia-smi views and
-//! properties, DCGM's diagnostic and tools.
+//! properties, DCGM's diagnostic and tools, and the GPU's fault counters.
 
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
@@ -427,6 +427,27 @@ fn parse_dcgm_dmon_sweep(output: &str) -> DcgmDmonSweep {
     DcgmDmonSweep { listed, fields }
 }
 
+fn gpu_kernel_error_lines(dmesg: &str) -> Vec<&str> {
+    // "Correctable" and "Uncorrectable" since kernel 6.8, "Corrected" and
+    // "Uncorrected" before.
+    const ERRORS: &[&str] = &[
+        "NVRM: Xid",
+        "AER: Correctable",
+        "AER: Corrected",
+        "AER: Uncorrectable",
+        "AER: Uncorrected",
+        "AER: Multiple",
+        "DPC: containment",
+        "DPC: unmasked",
+    ];
+    dmesg
+        .lines()
+        .filter(|line| ERRORS.iter().any(|error| line.contains(error)))
+        .collect()
+}
+
+const GPU_ERROR_COUNTERS: &str = include_str!("nvidia/gpu-error-counters.sh");
+
 impl Guest {
     /// Runs each command; a non-zero exit code or an "Unknown Error" line is
     /// a problem.
@@ -542,6 +563,38 @@ impl Guest {
     pub fn dcgm_dmon_sweep(&self) -> Result<DcgmDmonSweep, SshCommandError> {
         let (output, _) = self.ssh_command_exit_code(DCGM_DMON_SWEEP)?;
         Ok(parse_dcgm_dmon_sweep(&output))
+    }
+
+    /// The Xid, AER and DPC error lines of the guest kernel log since boot.
+    pub fn gpu_kernel_errors(&self) -> Result<Vec<String>, String> {
+        let (dmesg, exit_code) = self
+            .ssh_command_exit_code("sudo dmesg")
+            .map_err(|e| format!("ssh failed: {e}"))?;
+        if exit_code != 0 {
+            return Err(format!(
+                "dmesg exited with {exit_code}: {}",
+                dmesg.lines().next().unwrap_or_default()
+            ));
+        }
+        Ok(gpu_kernel_error_lines(&dmesg)
+            .into_iter()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The GPUs' error counters, one line each, named by GPU and section; a
+    /// line that appears between two readings is a counter that moved.
+    pub fn gpu_error_counters(&self) -> Result<Vec<String>, String> {
+        let (output, exit_code) = self
+            .ssh_command_exit_code(GPU_ERROR_COUNTERS)
+            .map_err(|e| format!("ssh failed: {e}"))?;
+        if exit_code != 0 {
+            return Err(format!(
+                "the counter script exited with {exit_code}: {}",
+                output.lines().last().unwrap_or_default()
+            ));
+        }
+        Ok(output.lines().map(str::to_string).collect())
     }
 }
 
@@ -951,6 +1004,96 @@ esac
                 .filter(|r| r.result == DcgmFieldResult::Failed)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn gpu_kernel_errors_are_found() {
+        let dmesg = "\
+[    5.1] nvidia: loading out-of-tree module taints kernel.
+[    6.2] NVRM: loading NVIDIA UNIX Open Kernel Module for aarch64  580.95.05
+[    7.0] pcieport 0000:00:01.0: AER: enabled with IRQ 24
+[    7.1] pcieport 0000:00:01.0: DPC: enabled with IRQ 24
+[  120.3] NVRM: Xid (PCI:0008:00:00): 79, pid=1234, GPU has fallen off the bus.
+[  121.0] pcieport 0000:00:01.0: AER: Correctable error message received from 0000:01:00.0
+[  121.5] pcieport 0000:00:01.0: AER: Multiple Uncorrectable (Non-Fatal) error message received from 0000:01:00.0
+[  121.7] pcieport 0000:00:01.0: AER: Uncorrected (Fatal) error received: 0000:01:00.0
+[  122.0] pcieport 0000:00:01.0: DPC: containment event, status:0x1f01
+";
+        let errors = gpu_kernel_error_lines(dmesg);
+        assert_eq!(errors.len(), 5, "{errors:#?}");
+        assert!(errors[0].contains("Xid"));
+        assert!(errors[1].contains("Correctable"));
+    }
+
+    #[test]
+    fn gpu_error_counters_name_their_gpu_and_section() {
+        let dir = TempDir::new_with_prefix("/tmp/ch-nvsmi-q").unwrap();
+        let fake = dir.as_path().join("nvidia-smi");
+        fs::write(
+            &fake,
+            r#"#!/bin/bash
+for gpu in 00000008:00:00.0 00000009:00:00.0; do
+    volatile=0
+    aggregate=0
+    [ "$gpu" = 00000008:00:00.0 ] && volatile=1
+    [ "$gpu" = 00000009:00:00.0 ] && aggregate=1
+    [ "$gpu" = 00000009:00:00.0 ] && [ -n "$CH_AFTER" ] && volatile=1
+    printf '%s\n' "GPU $gpu" \
+        '    Product Name                          : NVIDIA GB200' \
+        '    PCI' \
+        '        Replays Since Reset               : 0' \
+        '    ECC Errors' \
+        '        Volatile' \
+        "            SRAM Correctable              : $volatile" \
+        '        Aggregate' \
+        "            SRAM Correctable              : $aggregate" \
+        '    Remapped Rows' \
+        '        Pending                           : No' \
+        ''
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let counters = |after: bool| {
+            let mut command = Command::new("bash");
+            command.arg("-c").arg(GPU_ERROR_COUNTERS).env(
+                "PATH",
+                format!("{}:{}", dir.as_path().display(), env::var("PATH").unwrap()),
+            );
+            if after {
+                command.env("CH_AFTER", "1");
+            }
+            let output = command.output().unwrap();
+            // Only the nvidia-smi lines: a host with an NVIDIA GPU also
+            // reports its AER counters.
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(" / "))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let before = counters(false);
+        assert_eq!(before.len(), 8, "{before:#?}");
+        let mut unique = before.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), before.len(), "{before:#?}");
+        let aggregate = "00000009:00:00.0 / ECC Errors / Aggregate / SRAM Correctable : 1";
+        assert!(before.iter().any(|line| line == aggregate), "{before:#?}");
+        assert!(!before.iter().any(|line| line.contains("Product Name")));
+
+        let changed = counters(true)
+            .into_iter()
+            .filter(|line| !before.contains(line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            vec!["00000009:00:00.0 / ECC Errors / Volatile / SRAM Correctable : 1".to_string()]
         );
     }
 }

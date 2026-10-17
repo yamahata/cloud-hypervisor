@@ -642,6 +642,15 @@ mod nvidia_gpu {
             );
             guest.start_dcgm(target.devices.len()).unwrap();
 
+            let read_counters = || {
+                let counters = guest.gpu_error_counters().unwrap();
+                assert!(
+                    counters.iter().any(|line| line.contains(" / ")),
+                    "no nvidia-smi counters read:\n{}",
+                    counters.join("\n")
+                );
+                counters
+            };
             let log_offset = guest
                 .ssh_command_exit_code(&format!("sudo stat -c %s {DCGM_HOST_ENGINE_LOG}"))
                 .map(|(size, _)| size.trim().parse::<u64>().unwrap_or_default())
@@ -662,7 +671,40 @@ mod nvidia_gpu {
                 failures: Vec::new(),
             };
             online_gpu_memory(&mut steps);
+            // Read after the GPU memory is online, so that the GPU's own
+            // initialisation does not count as a change.
+            let counters_before = read_counters();
             dcgm_test_steps(&mut steps);
+
+            for line in guest.gpu_kernel_errors().unwrap() {
+                steps.fail(format!("guest kernel: {line}"));
+            }
+            match guest.gpu_error_counters() {
+                Ok(counters_after) if counters_after.iter().any(|line| line.contains(" / ")) => {
+                    let appeared = counters_after
+                        .iter()
+                        .filter(|line| !counters_before.contains(line))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let disappeared = counters_before
+                        .iter()
+                        .filter(|line| !counters_after.contains(line))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !appeared.is_empty() || !disappeared.is_empty() {
+                        steps.fail(format!(
+                            "GPU error counters changed; appeared:\n{}\ndisappeared:\n{}",
+                            appeared.join("\n"),
+                            disappeared.join("\n")
+                        ));
+                    }
+                }
+                Ok(counters_after) => steps.fail(format!(
+                    "no nvidia-smi counters read after the steps:\n{}",
+                    counters_after.join("\n")
+                )),
+                Err(e) => steps.fail(format!("GPU error counters after the steps: {e}")),
+            }
 
             let engine_after = engine_pid();
             if engine_after != engine_before {
