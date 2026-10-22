@@ -952,16 +952,13 @@ pub fn scp_to_guest(
     )
 }
 
-/// Executes a command on a remote host via SSH using password authentication.
-/// Returns the stdout output on success, or an [`SshCommandError`] on any
-/// connection, authentication, or execution failure.
-pub fn ssh_command_ip_with_auth(
-    command: &str,
+/// Connects to `ip` and authenticates. With `timeout`, a blocking SSH
+/// operation that makes no progress for that long fails.
+fn ssh_session(
     auth: &PasswordAuth,
     ip: &str,
     timeout: Option<Duration>,
-) -> Result<String, SshCommandError> {
-    let mut s = String::new();
+) -> Result<Session, SshCommandError> {
     let tcp = TcpStream::connect(format!("{ip}:22")).map_err(SshCommandError::Connection)?;
     let mut sess = Session::new().unwrap();
     sess.set_tcp_stream(tcp);
@@ -972,6 +969,20 @@ pub fn ssh_command_ip_with_auth(
     sess.userauth_password(&auth.username, &auth.password)
         .map_err(SshCommandError::Authentication)?;
     assert!(sess.authenticated());
+    Ok(sess)
+}
+
+/// Executes a command on a remote host via SSH using password authentication.
+/// Returns the stdout output on success, or an [`SshCommandError`] on any
+/// connection, authentication, or execution failure.
+pub fn ssh_command_ip_with_auth(
+    command: &str,
+    auth: &PasswordAuth,
+    ip: &str,
+    timeout: Option<Duration>,
+) -> Result<String, SshCommandError> {
+    let mut s = String::new();
+    let sess = ssh_session(auth, ip, timeout)?;
     let mut channel = sess
         .channel_session()
         .map_err(SshCommandError::ChannelSession)?;
