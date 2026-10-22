@@ -11,6 +11,7 @@
 //       --test integration_nvidia -- --ignored --test-threads=1
 // Every GPU bound to nvgrace_gpu_vfio_pci is tested; without one the tests
 // print SKIPPED. The guest image is NVIDIA_IMAGE_NAME in ~/workloads.
+// "--skip dcgm_level" leaves the long diagnostics (hours) out.
 mod nvidia_gpu {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -251,6 +252,10 @@ mod nvidia_gpu {
     // A "dcgmi diag" level 2 run takes a few minutes; one still running after
     // this has hung (seen in nvvs's memory plugin on GH200).
     const DCGM_DIAG_TIMEOUT_SECS: u32 = 1800;
+    // NVIDIA documents level 3 (long) as taking about half an hour and level 4
+    // (xlong) hours.
+    const DCGM_DIAG_LEVEL3_TIMEOUT_SECS: u32 = 2 * 3600;
+    const DCGM_DIAG_LEVEL4_TIMEOUT_SECS: u32 = 8 * 3600;
     // The level-2 tests that must pass: the ones that exercise what the VMM
     // presents (the PCIe link, the memory BAR, the driver).
     const DCGM_DIAG_CORE_TESTS: &[&str] = &["software", "memory", "pcie"];
@@ -500,10 +505,10 @@ mod nvidia_gpu {
 
     // Runs "dcgmi diag -r <selector>": no test may fail, and the `required`
     // ones must run and pass on every GPU.
-    fn run_dcgm_diag(steps: &mut GuestSteps, selector: &str, required: &[&str]) {
+    fn run_dcgm_diag(steps: &mut GuestSteps, selector: &str, required: &[&str], timeout_secs: u32) {
         match steps
             .guest
-            .dcgm_diag(&format!("-r {selector}"), DCGM_DIAG_TIMEOUT_SECS)
+            .dcgm_diag(&format!("-r {selector}"), timeout_secs)
         {
             Ok(tests) if tests.is_empty() => {
                 steps.fail(format!("dcgmi diag -r {selector} ran no test"));
@@ -581,7 +586,7 @@ mod nvidia_gpu {
         }
 
         for (selector, required) in DCGM_DIAG_SELECTORS {
-            run_dcgm_diag(steps, selector, required);
+            run_dcgm_diag(steps, selector, required, DCGM_DIAG_TIMEOUT_SECS);
         }
 
         dcgm_config_steps(steps, group, gpu);
@@ -622,7 +627,7 @@ mod nvidia_gpu {
 
     // Boots the guest, starts DCGM's host engine, which must see every GPU,
     // onlines the GPU memory and runs the DCGM steps.
-    fn dcgm_guest_test() {
+    fn dcgm_guest_test(steps_fn: fn(&mut GuestSteps)) {
         let Some(target) = GpuTarget::discover() else {
             return;
         };
@@ -674,7 +679,7 @@ mod nvidia_gpu {
             // Read after the GPU memory is online, so that the GPU's own
             // initialisation does not count as a change.
             let counters_before = read_counters();
-            dcgm_test_steps(&mut steps);
+            steps_fn(&mut steps);
 
             for line in guest.gpu_kernel_errors().unwrap() {
                 steps.fail(format!("guest kernel: {line}"));
@@ -760,6 +765,40 @@ mod nvidia_gpu {
     #[test]
     #[ignore = "experimental: needs a Grace GPU bound to nvgrace_gpu_vfio_pci and the NVIDIA image with DCGM in ~/workloads; run with --ignored; #9139"]
     fn test_nvidia_card_dcgm() {
-        dcgm_guest_test();
+        dcgm_guest_test(dcgm_test_steps);
+    }
+
+    fn dcgm_level3_steps(steps: &mut GuestSteps) {
+        run_dcgm_diag(
+            steps,
+            "3",
+            DCGM_DIAG_CORE_TESTS,
+            DCGM_DIAG_LEVEL3_TIMEOUT_SECS,
+        );
+    }
+
+    fn dcgm_level4_steps(steps: &mut GuestSteps) {
+        run_dcgm_diag(
+            steps,
+            "4",
+            DCGM_DIAG_CORE_TESTS,
+            DCGM_DIAG_LEVEL4_TIMEOUT_SECS,
+        );
+    }
+
+    // Level 3: the CUDA diagnostic, nvbandwidth and the memory-bandwidth,
+    // stress and power tests on top of level 2; about half an hour.
+    #[test]
+    #[ignore = "experimental: dcgmi diag level 3, about half an hour, needs a Grace GPU bound to nvgrace_gpu_vfio_pci and the NVIDIA image; --skip dcgm_level leaves it out; #9139"]
+    fn test_nvidia_card_dcgm_level3() {
+        dcgm_guest_test(dcgm_level3_steps);
+    }
+
+    // Level 4: the memory test, the pulse test and, when installed, the EUD
+    // on top of level 3; hours.
+    #[test]
+    #[ignore = "experimental: dcgmi diag level 4, hours, needs a Grace GPU bound to nvgrace_gpu_vfio_pci and the NVIDIA image; --skip dcgm_level leaves it out; #9139"]
+    fn test_nvidia_card_dcgm_level4() {
+        dcgm_guest_test(dcgm_level4_steps);
     }
 }

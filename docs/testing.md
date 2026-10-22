@@ -341,6 +341,9 @@ time with an hour each instead of the default ten minutes.
 `test_nvidia_card_dcgm` exercises the GPU through DCGM as well: the host
 engine must list every GPU, and `dcgmi diag` level 2 and context_create must
 pass on every GPU. It fails without `dcgmi` in the image.
+`test_nvidia_card_dcgm_level3` and `test_nvidia_card_dcgm_level4` run DCGM's
+long diagnostics, about half an hour and hours; `-- --ignored --skip
+dcgm_level` leaves them out, and under nextest they get nine hours each.
 
 ### Windows guests
 
